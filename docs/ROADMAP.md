@@ -25,16 +25,18 @@ provisioned via the dashboard.
 - [x] CI: Go build/vet/test + Next.js build + compose build + Playwright e2e
 - [ ] QUICKSTART verified end-to-end on a fresh machine
 
-## v0.2 — "It's nice" ✅ MOSTLY DONE
+## v0.2 — "It's nice" ✅ DONE
 
 - [x] Personal access tokens (`POST /v1/create_personal_access_token`) + dashboard `/me`
 - [x] Health monitoring worker — reconciles `deployments.status` with Docker reality every 30s
-- [x] Real Go test suite (68 test functions, ~7s, postgres testcontainer)
+- [x] Real Go test suite (72+ test functions, ~7s, postgres testcontainer)
 - [x] Async provisioning (returns 201 immediately; goroutine + 5min timeout + panic recovery + orphan-row sweep at startup)
 - [x] Delete during provisioning is race-free (handler trusts the goroutine for cleanup)
 - [x] `npx convex` CLI compatibility — admin keys now signed by Convex's `generate_key`; `cli_credentials` endpoint + dashboard panel
 - [x] Reverse proxy mode so deployments don't need exposed host ports (`SYNAPSE_PROXY_ENABLED=true`)
-- [ ] Auto-restart for `failed`/`stopped` deployments (manual recovery only in v0.2)
+- [x] Auto-restart for `stopped` deployments (`SYNAPSE_HEALTH_AUTO_RESTART=true`); missing-container is promoted to `failed`
+- [x] Audit log: writer + `GET /v1/teams/{ref}/audit_log` + dashboard `/audit` page (admin-only)
+- [x] Playwright e2e expanded to 16 tests (proxy mode, CLI credentials, multi-deploy, audit)
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
 - [ ] Pagination on team / project listings (PAT list already paginated)
 
@@ -52,7 +54,7 @@ frontend-specialised agent and merged via PR (not direct to main).
 
 ## v1.0 — "Safe to depend on"
 
-- [ ] Audit log (subset of cloud's 66 events)
+- [x] Audit log writer + reader (subset of cloud's vocabulary)
 - [ ] Custom domains with auto-TLS
 - [ ] Volume snapshot backups → S3
 - [ ] RBAC: project-level roles
@@ -81,6 +83,9 @@ OpenAPI v1 endpoint coverage today:
 | Deployments | ~60% — no transfer, no custom domains, no patch |
 | Personal access tokens | ✅ create / list / delete |
 | Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |
+| Audit log | ✅ team-scoped read; admin-only |
+| Reverse proxy | ✅ `/d/{name}/*` (custom — Cloud has dedicated subdomains) |
+| CLI compat | ✅ `cli_credentials` endpoint + signed admin keys |
 | Cloud backups | ❌ v1.0 |
 
 The dashboard fork (when complete) covers data, functions, logs, schedules,
