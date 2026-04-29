@@ -37,6 +37,18 @@ provisioned via the dashboard.
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
 - [ ] Pagination on team / project listings (PAT list already paginated)
 
+## v0.3 — "Looks the part"
+
+UI redesign to match the Convex Cloud dashboard aesthetic. Tracked in
+[docs/DESIGN.md](DESIGN.md). Will be developed on a feature branch by a
+frontend-specialised agent and merged via PR (not direct to main).
+
+- [ ] Top app bar (team picker + tabs + profile menu)
+- [ ] Home page redesign (Projects / Deployments tabs, grid+list toggle, empty state)
+- [ ] Team Settings shell (left sidebar + General / Members / Access Tokens panes)
+- [ ] Avatar component with deterministic gradient + initials
+- [ ] Logo + favicon
+
 ## v1.0 — "Safe to depend on"
 
 - [ ] Audit log (subset of cloud's 66 events)
