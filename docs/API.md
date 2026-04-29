@@ -128,6 +128,26 @@ Convex dashboard against this deployment.
 
 Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
 
+## Reverse proxy
+
+When `SYNAPSE_PROXY_ENABLED=true`, the API server also serves
+`/d/{deploymentName}/*`, forwarding the rest of the path to the
+provisioned Convex backend. Lets you expose a single host port (8080)
+instead of one per deployment.
+
+Example:
+
+```
+http://localhost:8080/d/quiet-cat-1234/api/check_admin_key
+       │              │                │
+       │              │                └─ forwarded as /api/check_admin_key
+       │              └─ deployment name
+       └─ Synapse host
+```
+
+No auth check at the proxy layer — deployments enforce admin-key auth
+themselves.
+
 ## Personal access tokens
 
 User-scoped opaque tokens for CLI / CI / programmatic access. The plaintext
