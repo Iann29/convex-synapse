@@ -32,7 +32,7 @@ provisioned via the dashboard.
 - [x] Real Go test suite (68 test functions, ~7s, postgres testcontainer)
 - [x] Async provisioning (returns 201 immediately; goroutine + 5min timeout + panic recovery + orphan-row sweep at startup)
 - [x] Delete during provisioning is race-free (handler trusts the goroutine for cleanup)
-- [ ] `npx convex` CLI compatibility (auth flow, deploy keys)
+- [x] `npx convex` CLI compatibility — admin keys now signed by Convex's `generate_key`; `cli_credentials` endpoint + dashboard panel
 - [x] Reverse proxy mode so deployments don't need exposed host ports (`SYNAPSE_PROXY_ENABLED=true`)
 - [ ] Auto-restart for `failed`/`stopped` deployments (manual recovery only in v0.2)
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
