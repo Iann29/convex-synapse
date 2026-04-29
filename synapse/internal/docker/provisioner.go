@@ -199,6 +199,32 @@ func (c *Client) Destroy(ctx context.Context, deploymentName string) error {
 	return nil
 }
 
+// Restart starts a stopped Convex backend container without touching the
+// data volume. Useful for recovery flows where the container exited or was
+// killed (OOM, host reboot) but the row is still in the DB.
+//
+// Returns "container not found" as a sentinel `errNotFound` so the caller
+// can decide whether to re-provision from scratch.
+func (c *Client) Restart(ctx context.Context, deploymentName string) error {
+	name := containerName(deploymentName)
+	if err := c.api.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
+		if isNotFound(err) {
+			return ErrContainerNotFound
+		}
+		return fmt.Errorf("start container %s: %w", name, err)
+	}
+	return nil
+}
+
+// ErrContainerNotFound is returned by Restart when the container has been
+// removed (e.g. the operator manually `docker rm`'d it). Callers should
+// treat this as a signal to re-provision rather than retry the restart.
+var ErrContainerNotFound = errNotFound{}
+
+type errNotFound struct{}
+
+func (errNotFound) Error() string { return "container not found" }
+
 // Status reports the docker-side status of a deployment.
 // Returns ("", nil) if the container does not exist.
 func (c *Client) Status(ctx context.Context, deploymentName string) (string, error) {

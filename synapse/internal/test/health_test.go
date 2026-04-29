@@ -2,11 +2,21 @@ package synapsetest
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/Iann29/synapse/internal/health"
 )
+
+// fakeRestarter satisfies health.Restarter for the auto-restart tests.
+type fakeRestarter struct {
+	fn func(ctx context.Context, name string) error
+}
+
+func (f *fakeRestarter) Restart(ctx context.Context, name string) error {
+	return f.fn(ctx, name)
+}
 
 // Worker.sweep against real postgres + the harness's FakeDocker. Verifies
 // that a "running" row whose container is gone gets reconciled to "stopped".
@@ -80,6 +90,85 @@ func TestHealthWorker_ReconcilesExited(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("expected exited→stopped reconciliation")
+}
+
+// AutoRestart on: "exited" container gets restarted, row flips back to running.
+func TestHealthWorker_AutoRestartsStopped(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "AR Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "App")
+	id := h.SeedDeployment(proj.ID, "ar-cat-1234", "dev", "running", false, owner.ID, 4010, "k")
+
+	// Step 1: docker reports exited → worker should mark stopped, then
+	// restart, then mark running.
+	statusCalls := 0
+	h.Docker.StatusFn = func(_ context.Context, _ string) (string, error) {
+		statusCalls++
+		if statusCalls == 1 {
+			return "exited", nil
+		}
+		return "running", nil
+	}
+
+	restartCalls := 0
+	restarter := &fakeRestarter{
+		fn: func(_ context.Context, _ string) error {
+			restartCalls++
+			return nil
+		},
+	}
+
+	w := &health.Worker{
+		DB:        h.DB,
+		Docker:    h.Docker,
+		Restarter: restarter,
+		Config:    health.Config{Interval: time.Hour, StatusTimeout: 2 * time.Second, AutoRestart: true},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	w.Run(ctx)
+
+	if restartCalls != 1 {
+		t.Errorf("expected 1 restart call, got %d", restartCalls)
+	}
+	s, _ := health.LookupRow(context.Background(), h.DB, id)
+	if s != "running" {
+		t.Errorf("expected status=running after restart, got %q", s)
+	}
+}
+
+// AutoRestart on: container not found → restart fails, row promoted to failed.
+func TestHealthWorker_RestartFailedContainerNotFound(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "AR Co 2")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "App")
+	id := h.SeedDeployment(proj.ID, "ar-fox-1234", "dev", "running", false, owner.ID, 4011, "k")
+
+	h.Docker.StatusFn = func(_ context.Context, _ string) (string, error) {
+		return "exited", nil
+	}
+	restarter := &fakeRestarter{
+		fn: func(_ context.Context, _ string) error {
+			return errors.New("container not found")
+		},
+	}
+
+	w := &health.Worker{
+		DB:        h.DB,
+		Docker:    h.Docker,
+		Restarter: restarter,
+		Config:    health.Config{Interval: time.Hour, StatusTimeout: 2 * time.Second, AutoRestart: true},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	w.Run(ctx)
+
+	s, _ := health.LookupRow(context.Background(), h.DB, id)
+	if s != "failed" {
+		t.Errorf("expected status=failed after restart-on-missing-container, got %q", s)
+	}
 }
 
 // "running" → no change; row stays running.

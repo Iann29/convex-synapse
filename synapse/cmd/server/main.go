@@ -93,12 +93,20 @@ func run() error {
 	// API still works for read-only / metadata operations in that case.
 	if dockerClient != nil {
 		worker := &health.Worker{
-			DB:     pool,
-			Docker: dockerClient,
-			Config: health.Config{Interval: 30 * time.Second, StatusTimeout: 5 * time.Second},
+			DB:        pool,
+			Docker:    dockerClient,
+			Restarter: dockerClient,
+			Config: health.Config{
+				Interval:      30 * time.Second,
+				StatusTimeout: 5 * time.Second,
+				AutoRestart:   cfg.HealthAutoRestart,
+			},
 			Logger: logger,
 		}
 		go worker.Run(rootCtx)
+		if cfg.HealthAutoRestart {
+			logger.Info("health worker auto-restart enabled")
+		}
 	}
 
 	// Reverse-proxy mux: route /d/{name}/* to the proxy package, everything
