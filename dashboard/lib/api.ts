@@ -214,6 +214,12 @@ export const api = {
         body: {},
       });
     },
+    rename(id: string, name: string): Promise<Project> {
+      return request<Project>(`/v1/projects/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: { name },
+      });
+    },
     async listEnvVars(id: string): Promise<EnvVar[]> {
       const r = await request<{ configs: EnvVar[] }>(
         `/v1/projects/${encodeURIComponent(id)}/list_default_environment_variables`

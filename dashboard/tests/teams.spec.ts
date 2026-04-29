@@ -46,6 +46,34 @@ test("create team then create project", async ({ page }) => {
   await expect(page.getByRole("link", { name: /my store/i })).toBeVisible();
 });
 
+test("rename project from its detail page", async ({ page }) => {
+  await registerViaUI(page);
+
+  await page.getByRole("button", { name: "Create team" }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.locator("#team-name").fill("Amage");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await page.getByRole("link", { name: /amage/i }).click();
+
+  await page.getByRole("button", { name: "Create project" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.locator("#project-name").fill("Old Name");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await page.getByRole("link", { name: /old name/i }).click();
+
+  // Header has the old name.
+  await expect(page.getByRole("heading", { name: "Old Name" })).toBeVisible();
+
+  // Open rename, enter new name, save.
+  await page.getByRole("button", { name: "Rename project" }).click();
+  const renameDialog = page.getByRole("dialog");
+  await renameDialog.locator("#rename-project").fill("New Name");
+  await renameDialog.getByRole("button", { name: "Save" }).click();
+
+  // Header reflects the new name; dialog is closed.
+  await expect(page.getByRole("heading", { name: "New Name" })).toBeVisible();
+});
+
 test("delete project from its detail page", async ({ page }) => {
   await registerViaUI(page);
 

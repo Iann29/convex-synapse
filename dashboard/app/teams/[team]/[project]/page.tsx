@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ApiError, api, type Deployment, type Project } from "@/lib/api";
 
@@ -31,8 +32,9 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   const { team: teamRef, project: projectId } = use(params);
   const router = useRouter();
 
-  const { data: project } = useSWR<Project>(["/project", projectId], () =>
-    api.projects.get(projectId)
+  const { data: project, mutate: mutateProject } = useSWR<Project>(
+    ["/project", projectId],
+    () => api.projects.get(projectId),
   );
   const {
     data: deployments,
@@ -89,6 +91,27 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
 
   const [deletingName, setDeletingName] = useState<string | null>(null);
   const [deletingProject, setDeletingProject] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const [renamePending, setRenamePending] = useState(false);
+
+  const submitRename = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setActionError(null);
+    setRenamePending(true);
+    try {
+      await api.projects.rename(projectId, renameValue.trim());
+      setRenameOpen(false);
+      // Refresh the project cache so the header updates immediately.
+      await mutateProject();
+    } catch (err) {
+      setActionError(
+        err instanceof ApiError ? err.message : "Could not rename project"
+      );
+    } finally {
+      setRenamePending(false);
+    }
+  };
 
   const deleteProject = async () => {
     if (!confirm(`Delete project "${project?.name ?? projectId}"? All its deployments will be removed.`)) {
@@ -153,6 +176,16 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
           </div>
           <div className="flex gap-2">
             <Button onClick={() => setOpen(true)}>New deployment</Button>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setRenameValue(project?.name ?? "");
+                setRenameOpen(true);
+              }}
+              aria-label="Rename project"
+            >
+              Rename
+            </Button>
             <Button
               variant="danger"
               onClick={deleteProject}
@@ -287,6 +320,40 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? "Creating..." : "Create"}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+
+      <Dialog
+        open={renameOpen}
+        onClose={() => setRenameOpen(false)}
+        title="Rename project"
+      >
+        <form onSubmit={submitRename} className="space-y-4">
+          <div className="space-y-2">
+            <label htmlFor="rename-project" className="block text-xs text-neutral-400">
+              New name
+            </label>
+            <Input
+              id="rename-project"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              required
+              autoFocus
+            />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setRenameOpen(false)}
+              disabled={renamePending}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={renamePending || !renameValue.trim()}>
+              {renamePending ? "Saving…" : "Save"}
             </Button>
           </div>
         </form>
