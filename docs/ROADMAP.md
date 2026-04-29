@@ -57,7 +57,7 @@ Postgres + Docker daemon without surprises. See
   `SELECT FOR UPDATE SKIP LOCKED` shards across nodes and goroutines
   (default concurrency=4). Crashed workers auto-recover via `requeueStale`
   on the next Run.
-- [x] Test counts: 88 → 92 Go integration; 16/16 Playwright in ~1.6 min.
+- [x] Test counts: ~88 → ~101 Go (integration + new unit/race/advisorylock/provisioner); 16/16 Playwright in ~1.6 min.
 
 ## v0.4 — "Looks the part"
 
@@ -70,6 +70,22 @@ frontend-specialised agent and merged via PR (not direct to main).
 - [ ] Team Settings shell (left sidebar + General / Members / Access Tokens panes)
 - [ ] Avatar component with deterministic gradient + initials
 - [ ] Logo + favicon
+
+## v0.5 — "HA-per-deployment"
+
+The control plane is multi-node-safe (v0.3); the Convex backend itself is
+single-writer per deployment by design (lease in `crates/postgres/src/lib.rs`
+of `get-convex/convex-backend`). Active-passive failover is achievable on
+top of upstream as-is — see [docs/DESIGN.md](DESIGN.md). This is the right
+bet for moving the user-perceived reliability needle.
+
+- [ ] Switch the provisioned Convex backend's persistence from SQLite to
+  Postgres (existing flag `--db postgres`)
+- [ ] S3-compatible blob storage for file/exports/snapshots
+- [ ] Run 2 backend containers per deployment behind an HTTP load balancer
+  with `/version` healthcheck
+- [ ] Document the lease takeover characteristics (cold rebuild of in-memory
+  indexes, seconds-not-zero failover)
 
 ## v1.0 — "Safe to depend on"
 

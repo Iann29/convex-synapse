@@ -42,22 +42,28 @@ Synapse fills that gap.
 
 ## Status
 
-**v0.2 — feature-complete for daily use.** A `docker compose up -d` plus a
-register call gets you a control-plane API, a dashboard, and the ability to
-provision real Convex backend containers in about a second per deployment.
+**v0.3 — multi-node ready.** A `docker compose up -d` plus a register call
+gets you a control-plane API, a dashboard, and the ability to provision real
+Convex backend containers in about a second per deployment. The control plane
+is also safe to run with N processes against one Postgres + one Docker daemon
+— resource allocators retry on conflict, periodic workers coordinate via
+Postgres advisory locks, and async provisioning is a persistent queue with
+parallel `SELECT FOR UPDATE SKIP LOCKED` consumers.
 
 What works today:
-- Email + password auth (JWT sessions)
-- Personal access tokens for CLI / CI (`syn_*` opaque, hashed at rest)
+- Email+password auth (JWT) and `syn_*` personal access tokens (hashed at rest)
 - Multi-team membership via opaque invite tokens (`/v1/team_invites/accept`)
-- Project rename/delete, default env vars (set/delete batch)
-- Real Convex backend container per deployment, ~1s provisioning
-- Deployment delete tears down container + data volume idempotently
-- Health worker reconciles `deployments.status` with Docker reality every 30s
-- 55+ automated tests (Go integration + Playwright e2e) green in CI
+- Projects: CRUD, rename, delete, default env vars (set/delete batch)
+- Deployments: real Convex backend container per deployment, ~1s provisioning
+- `npx convex` CLI compatibility (signed admin keys + `cli_credentials` endpoint)
+- Reverse proxy mode (`/d/{name}/*`) so deployments share a single host port
+- Health worker that reconciles `deployments.status` with Docker reality
+- Optional auto-restart for stopped containers
+- Audit log (Cloud-vocabulary actions: `createTeam`, `createProject`, …)
+- 100+ Go integration tests + 16 Playwright e2e green in CI
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's coming in v0.2/v1.0
-and what's deliberately out of scope.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and what's deliberately
+out of scope.
 
 ## Repo layout
 
@@ -87,8 +93,9 @@ For details (manual dev path, curl examples, `npx convex` integration), see
 ## Tests
 
 ```bash
-# Go unit tests
-cd synapse && go test ./...
+# Go integration tests (need a postgres at localhost:5432, or set
+# SYNAPSE_TEST_DB_URL). Each test gets its own isolated DB.
+cd synapse && go test ./... -count=1
 
 # Playwright end-to-end against the live compose stack
 cd dashboard
@@ -97,8 +104,8 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The CI pipeline runs all three (Go, Next.js build, full Playwright suite) on
-every push.
+The CI pipeline runs all four jobs (Go, Next.js build, compose build, full
+Playwright suite) on every push.
 
 ## License
 

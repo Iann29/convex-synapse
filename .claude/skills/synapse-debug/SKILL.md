@@ -17,6 +17,10 @@ Match the symptom, jump to the section.
 - [Playwright "TimeoutError: locator.fill"](#playwright-fill)
 - [Playwright "strict mode violation"](#playwright-strict)
 - [Provision succeeds but deployment URL returns nothing useful](#deployment-url)
+- [`generate_key panicked: attempt to subtract with overflow`](#generate-key-panic)
+- [`401 BadAdminKey` from `npx convex` against a Synapse-provisioned deployment](#bad-admin-key)
+- [Health worker keeps fighting auto-restart with another node](#double-restart)
+- [Provisioning queue not draining; old jobs from a previous test run blocking new ones](#queue-stalled)
 - [Test failures only in CI, not local](#ci-only)
 
 ---
@@ -136,6 +140,70 @@ The host port is the LEFT side of `0.0.0.0:NNN->3210/tcp`.
 
 `/version` itself returns the literal string `unknown` on a healthy Convex
 backend — that's not an error.
+
+## Generate-key panic
+
+Synapse logs an error from `Docker.GenerateAdminKey` containing
+`thread '<unnamed>' panicked at … fastant-0.1.10/src/tsc_now.rs:170:34: attempt to subtract with overflow`.
+
+**Cause:** Convex's bundled `generate_key` binary depends on `fastant`,
+which has a known TSC overflow bug on certain CPUs. It's transient — a
+re-run usually succeeds.
+
+**Fix:** Already handled — `internal/docker/admin_key.go::GenerateAdminKey`
+retries up to 5x. If you still see deployments fail with this, bump the
+retry count (`maxAttempts` constant). Don't try to skip the binary; the
+admin key MUST be signed with `INSTANCE_SECRET` to pass `check_admin_key`.
+
+## Bad admin key
+
+`npx convex dev` against a Synapse-managed deployment returns
+`401 BadAdminKey: The provided admin key was invalid for this instance`.
+
+**Cause:** The admin key in the DB is not actually signed by the running
+backend's `INSTANCE_SECRET`. This happens when the row was seeded by an
+older version of Synapse (random hex) or when `generate_key` was bypassed.
+
+**Fix:**
+1. Confirm the deployment was created on a Synapse build that includes the
+   `generate_key` shell-out. The DB column should look like
+   `<deploymentName>|<long-hex>`, not 64-char raw hex.
+2. If the row is stale, delete + re-create the deployment (its data volume
+   is gone too — there's no in-place fix).
+3. If you need to keep the data: stop the container, manually run
+   `/convex/generate_key <name> <secret>` on the image, UPDATE the DB row,
+   restart.
+
+## Double restart
+
+Two synapse processes both call `Docker.Restart` on the same container
+when auto-restart is enabled.
+
+**Cause:** Periodic worker not wrapped in `db.WithTryAdvisoryLock`. Each
+node sweeps independently and races the post-CAS restart.
+
+**Fix:** This was the v0.3 bug — should be fixed. Verify the latest
+`internal/health/worker.go::tickWithLock` wraps `sweep()` in
+`WithTryAdvisoryLock(LockHealthWorker, ...)`.
+
+## Queue stalled
+
+Tests that provision deployments fail intermittently. Logs show
+`provisioner: deployment no longer provisioning; cleaning up` for
+deployments from a previous test run.
+
+**Cause:** Truncate between tests races with in-flight worker goroutines
+that already claimed jobs. The worker is processing dead orphans while
+new jobs queue behind.
+
+**Fix:**
+1. Verify `Config.Concurrency >= 4` so multiple workers drain in parallel.
+2. The pre-check (`SELECT status FROM deployments`) should short-circuit
+   orphans into a no-op. Confirm it's present in `runJob` before the
+   `Docker.Provision` call.
+3. For test reliability, add `provisioning_jobs` to `truncateAll` (it's
+   already in the helper), and consider `docker compose restart synapse`
+   between full Playwright runs to nuke in-flight goroutines.
 
 ## CI only
 
