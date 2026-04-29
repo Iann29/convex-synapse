@@ -42,6 +42,10 @@ func run() error {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if err := db.Migrate(cfg.DBURL, logger); err != nil {
+		return err
+	}
+
 	pool, err := db.Connect(rootCtx, cfg.DBURL)
 	if err != nil {
 		return err

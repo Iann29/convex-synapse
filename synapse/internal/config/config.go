@@ -31,9 +31,14 @@ type Config struct {
 }
 
 // Load reads environment variables and returns a populated Config.
-// It loads ../.env and ./.env if present (in that order, later overrides earlier).
+// It tries to load a .env file from common locations (cwd, parent, repo root)
+// for local development; in production env should be injected directly.
 func Load() (*Config, error) {
-	_ = godotenv.Load("../.env", ".env")
+	for _, p := range []string{".env", "../.env", "../../.env"} {
+		if err := godotenv.Load(p); err == nil {
+			break
+		}
+	}
 
 	jwtSecret := os.Getenv("SYNAPSE_JWT_SECRET")
 	if len(jwtSecret) < 32 {

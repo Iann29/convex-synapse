@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS deploy_keys;
+DROP TABLE IF EXISTS deployments;
+DROP TABLE IF EXISTS project_env_vars;
+DROP TABLE IF EXISTS projects;
+DROP TABLE IF EXISTS team_invites;
+DROP TABLE IF EXISTS team_members;
+DROP TABLE IF EXISTS teams;
+DROP TABLE IF EXISTS access_tokens;
+DROP TABLE IF EXISTS users;
