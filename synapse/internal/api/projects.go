@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -108,7 +109,7 @@ type updateProjectReq struct {
 }
 
 func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -121,6 +122,8 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	renamed := false
+	oldName := p.Name
 	if req.Name != nil {
 		newName := strings.TrimSpace(*req.Name)
 		if newName == "" {
@@ -134,7 +137,19 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
 			return
 		}
+		renamed = newName != oldName
 		p.Name = newName
+	}
+	if renamed {
+		uid, _ := auth.UserID(r.Context())
+		_ = audit.Record(r.Context(), h.DB, audit.Options{
+			TeamID:     t.ID,
+			ActorID:    uid,
+			Action:     audit.ActionRenameProject,
+			TargetType: audit.TargetProject,
+			TargetID:   p.ID,
+			Metadata:   map[string]any{"oldName": oldName, "newName": p.Name},
+		})
 	}
 	writeJSON(w, http.StatusOK, p)
 }
@@ -142,7 +157,7 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 // ---------- POST /v1/projects/{id}/delete ----------
 
 func (h *ProjectsHandler) deleteProject(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -181,6 +196,15 @@ func (h *ProjectsHandler) deleteProject(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionDeleteProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"name": p.Name, "slug": p.Slug},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"id": p.ID, "status": "deleted"})
 }
 
@@ -295,7 +319,7 @@ type updateEnvVarsReq struct {
 }
 
 func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -357,5 +381,20 @@ func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "internal", "Database error")
 		return
 	}
+	uid, _ := auth.UserID(r.Context())
+	// Capture the count + change names so admins can audit which keys
+	// were touched without leaking values (which often contain secrets).
+	names := make([]string, 0, len(req.Changes))
+	for _, c := range req.Changes {
+		names = append(names, c.Name)
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpdateEnvVars,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"applied": len(req.Changes), "names": names},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"applied": len(req.Changes)})
 }

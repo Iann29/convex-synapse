@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -117,6 +118,12 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		ActorID:    u.ID,
+		Action:     audit.ActionLogin,
+		TargetType: audit.TargetUser,
+		TargetID:   u.ID,
+	})
 	h.respondTokenPair(w, http.StatusOK, u)
 }
 

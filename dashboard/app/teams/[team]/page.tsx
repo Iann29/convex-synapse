@@ -61,7 +61,15 @@ export default function TeamPage({ params }: { params: Promise<Params> }) {
             <h1 className="text-xl font-semibold">{team?.name ?? teamRef}</h1>
             <p className="text-xs text-neutral-400">Projects in this team.</p>
           </div>
-          <Button onClick={() => setOpen(true)}>New project</Button>
+          <div className="flex items-center gap-2">
+            <Link
+              href={`/teams/${encodeURIComponent(teamRef)}/audit`}
+              className="text-xs text-neutral-400 hover:text-neutral-200"
+            >
+              Audit log
+            </Link>
+            <Button onClick={() => setOpen(true)}>New project</Button>
+          </div>
         </div>
       </div>
 

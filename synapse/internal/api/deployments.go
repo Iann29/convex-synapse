@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
@@ -328,6 +329,18 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
 	})
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata: map[string]any{
+			"name":           name,
+			"deploymentType": req.Type,
+			"projectId":      projectID,
+		},
+	})
 	// Return the row in 'provisioning' state. The dashboard polls and will
 	// flip to 'running' (or 'failed') when the goroutine updates the row.
 	writeJSON(w, http.StatusCreated, d)
@@ -501,7 +514,7 @@ func (h *DeploymentsHandler) getDeployment(w http.ResponseWriter, r *http.Reques
 // ---------- POST /v1/deployments/{name}/delete ----------
 
 func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Request) {
-	d, _, _, role, ok := h.loadDeploymentForRequest(w, r)
+	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -526,6 +539,15 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusInternalServerError, "internal", "Database error")
 			return
 		}
+		uid, _ := auth.UserID(r.Context())
+		_ = audit.Record(r.Context(), h.DB, audit.Options{
+			TeamID:     t.ID,
+			ActorID:    uid,
+			Action:     audit.ActionDeleteDeployment,
+			TargetType: audit.TargetDeployment,
+			TargetID:   d.ID,
+			Metadata:   map[string]any{"name": d.Name, "wasProvisioning": true},
+		})
 		writeJSON(w, http.StatusOK, map[string]string{"name": d.Name, "status": "deleted"})
 		return
 	}
@@ -551,6 +573,15 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionDeleteDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata:   map[string]any{"name": d.Name},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"name": d.Name, "status": "deleted"})
 }
 

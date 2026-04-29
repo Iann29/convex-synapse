@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -39,6 +40,7 @@ func (h *TeamsHandler) Routes() chi.Router {
 		r.Post("/create_project", h.createProject)
 		r.Get("/invites", h.listInvites)
 		r.Post("/invites/{inviteID}/cancel", h.cancelInvite)
+		r.Get("/audit_log", h.listAuditLog)
 	})
 
 	return r
@@ -114,6 +116,14 @@ func (h *TeamsHandler) createTeam(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "Database error")
 		return
 	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateTeam,
+		TargetType: audit.TargetTeam,
+		TargetID:   t.ID,
+		Metadata:   map[string]any{"name": t.Name, "slug": t.Slug},
+	})
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -411,6 +421,15 @@ func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	p.TeamSlug = t.Slug
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"name": p.Name, "slug": p.Slug},
+	})
 	writeJSON(w, http.StatusCreated, createProjectResp{
 		ProjectID:   p.ID,
 		ProjectSlug: p.Slug,
@@ -496,6 +515,14 @@ func (h *TeamsHandler) inviteMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionInviteTeamMember,
+		TargetType: audit.TargetInvite,
+		TargetID:   inviteID,
+		Metadata:   map[string]any{"email": req.Email, "role": req.Role},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{
 		"inviteId":    inviteID,
 		"email":       req.Email,
@@ -577,5 +604,13 @@ func (h *TeamsHandler) cancelInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "invite_not_found", "Invite not found or already accepted")
 		return
 	}
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCancelInvite,
+		TargetType: audit.TargetInvite,
+		TargetID:   id,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "cancelled"})
 }

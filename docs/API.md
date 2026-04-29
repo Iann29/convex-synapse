@@ -76,6 +76,45 @@ Tokens are sensitive: anyone who has one can join the team.
 
 Deletes a pending invite. 404 if it was already accepted or never existed.
 
+### `GET /v1/teams/{ref}/audit_log` ✅ (admins only)
+
+Lists audit events for the team, newest first. Admin-only — audit data is
+privileged. Members get 403 (matches Cloud's behavior; auditing is a
+trust-anchor function).
+
+Query params:
+- `limit` (default 50, max 200) — page size.
+- `cursor` — opaque continuation token returned as `nextCursor` from the
+  previous page.
+
+Response (200):
+
+```json
+{
+  "items": [
+    {
+      "id": "12",
+      "createTime": "2026-04-29T12:00:00Z",
+      "action": "createProject",
+      "actorId": "…",
+      "actorEmail": "ian@example.com",
+      "targetType": "project",
+      "targetId": "…",
+      "metadata": { "name": "my-app", "slug": "my-app" }
+    }
+  ],
+  "nextCursor": "…"
+}
+```
+
+Action names mirror Cloud's `auditLogActions` vocabulary where it exists:
+`createTeam`, `inviteTeamMember`, `cancelInvite`, `createProject`,
+`deleteProject`, `renameProject`, `updateProjectEnvVars`, `createDeployment`,
+`deleteDeployment`, `acceptInvite`, `login`. Synapse-specific extensions
+(no Cloud counterpart): `createPersonalAccessToken`,
+`deletePersonalAccessToken`. Audit writes are best-effort: a transient DB
+error during the audit insert never fails the user-visible request.
+
 ### `POST /v1/team_invites/accept` 🔧
 
 Body: `{token}`. The caller must be authenticated. Adds the user as a
