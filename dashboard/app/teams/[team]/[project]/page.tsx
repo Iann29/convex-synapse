@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { use, useState } from "react";
 import useSWR from "swr";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +29,7 @@ function statusTone(status?: string): "green" | "yellow" | "red" | "neutral" {
 
 export default function ProjectPage({ params }: { params: Promise<Params> }) {
   const { team: teamRef, project: projectId } = use(params);
+  const router = useRouter();
 
   const { data: project } = useSWR<Project>(["/project", projectId], () =>
     api.projects.get(projectId)
@@ -86,6 +88,24 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   };
 
   const [deletingName, setDeletingName] = useState<string | null>(null);
+  const [deletingProject, setDeletingProject] = useState(false);
+
+  const deleteProject = async () => {
+    if (!confirm(`Delete project "${project?.name ?? projectId}"? All its deployments will be removed.`)) {
+      return;
+    }
+    setActionError(null);
+    setDeletingProject(true);
+    try {
+      await api.projects.delete(projectId);
+      router.push(`/teams/${encodeURIComponent(teamRef)}`);
+    } catch (err) {
+      setActionError(
+        err instanceof ApiError ? err.message : "Could not delete project"
+      );
+      setDeletingProject(false);
+    }
+  };
 
   const deleteDeployment = async (name: string) => {
     // Confirm via native dialog — the destructive action removes the
@@ -131,7 +151,17 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
               Deployments are real Convex backend containers.
             </p>
           </div>
-          <Button onClick={() => setOpen(true)}>New deployment</Button>
+          <div className="flex gap-2">
+            <Button onClick={() => setOpen(true)}>New deployment</Button>
+            <Button
+              variant="danger"
+              onClick={deleteProject}
+              disabled={deletingProject}
+              aria-label="Delete project"
+            >
+              {deletingProject ? "Deleting…" : "Delete project"}
+            </Button>
+          </div>
         </div>
       </div>
 

@@ -208,6 +208,12 @@ export const api = {
         { method: "POST", body }
       );
     },
+    delete(id: string): Promise<void> {
+      return request<void>(`/v1/projects/${encodeURIComponent(id)}/delete`, {
+        method: "POST",
+        body: {},
+      });
+    },
     async listEnvVars(id: string): Promise<EnvVar[]> {
       const r = await request<{ configs: EnvVar[] }>(
         `/v1/projects/${encodeURIComponent(id)}/list_default_environment_variables`

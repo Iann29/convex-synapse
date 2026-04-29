@@ -45,3 +45,30 @@ test("create team then create project", async ({ page }) => {
 
   await expect(page.getByRole("link", { name: /my store/i })).toBeVisible();
 });
+
+test("delete project from its detail page", async ({ page }) => {
+  await registerViaUI(page);
+
+  // Create team + project.
+  await page.getByRole("button", { name: "Create team" }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.locator("#team-name").fill("Amage");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await page.getByRole("link", { name: /amage/i }).click();
+
+  await page.getByRole("button", { name: "Create project" }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.locator("#project-name").fill("Trash Me");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+
+  // Enter the project, click Delete project, accept confirm.
+  await page.getByRole("link", { name: /trash me/i }).click();
+  await expect(page).toHaveURL(/\/teams\/amage\/[0-9a-f-]{36}\b/);
+
+  page.on("dialog", (d) => d.accept());
+  await page.getByRole("button", { name: "Delete project" }).click();
+
+  // Bounced back to the team page; the project no longer appears.
+  await expect(page).toHaveURL(/\/teams\/amage\b/);
+  await expect(page.getByRole("link", { name: /trash me/i })).toBeHidden();
+});
