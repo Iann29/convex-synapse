@@ -580,15 +580,15 @@ func probeAdoptedBackend(ctx context.Context, baseURL, adminKey string) error {
 			"deploymentUrl returned HTTP " + http.StatusText(resp.StatusCode) + " for /version"}
 	}
 
-	// /api/check_admin_key — Convex's admin-key validator. Body is
-	// {"adminKey": "<key>"}; 200 = valid, 401 = invalid. Any other code is
-	// "the URL responds but isn't a Convex backend" → bad URL.
-	body := strings.NewReader(`{"adminKey":` + jsonString(adminKey) + `}`)
-	req, err = http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/check_admin_key", body)
+	// /api/check_admin_key — Convex's admin-key validator. The backend
+	// expects GET with the admin key either as `Authorization: Convex <key>`
+	// or as a `?adminKey=` query param. 200 = valid, 401 = invalid. Any
+	// other code means the URL responds but isn't a Convex backend.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/check_admin_key", nil)
 	if err != nil {
 		return &adoptProbeError{http.StatusBadRequest, "invalid_url", "deploymentUrl is not a valid URL"}
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Convex "+adminKey)
 	resp, err = client.Do(req)
 	if err != nil {
 		return &adoptProbeError{http.StatusBadGateway, "probe_failed", "Could not reach deploymentUrl"}
@@ -605,25 +605,6 @@ func probeAdoptedBackend(ctx context.Context, baseURL, adminKey string) error {
 	}
 }
 
-// jsonString emits a JSON-quoted version of s. We avoid encoding/json's
-// Marshal-allocates-a-buffer overhead by handling only the characters that
-// appear in admin keys (printable ASCII plus quote/backslash); anything else
-// would suggest an unsupported key format.
-func jsonString(s string) string {
-	out := make([]byte, 0, len(s)+2)
-	out = append(out, '"')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '"', '\\':
-			out = append(out, '\\', c)
-		default:
-			out = append(out, c)
-		}
-	}
-	out = append(out, '"')
-	return string(out)
-}
 
 // ---------- GET /v1/projects/{id}/deployment ----------
 

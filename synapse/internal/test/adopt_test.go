@@ -2,7 +2,6 @@ package synapsetest
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,20 +45,24 @@ func newFakeConvexBackend(t *testing.T, acceptKey string) *fakeConvexBackend {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"version":"0.1-test"}`))
 		case "/api/check_admin_key":
-			body, _ := io.ReadAll(r.Body)
-			var req struct {
-				AdminKey string `json:"adminKey"`
-			}
-			if err := json.Unmarshal(body, &req); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
+			// Real Convex: GET with `Authorization: Convex <key>`.
+			// 200 with {"success":true,...} on match, 401 otherwise.
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
-			if req.AdminKey != f.want {
+			authz := r.Header.Get("Authorization")
+			const prefix = "Convex "
+			if len(authz) <= len(prefix) || authz[:len(prefix)] != prefix {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{}`))
+			if authz[len(prefix):] != f.want {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

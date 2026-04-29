@@ -199,9 +199,10 @@ Body:
   exists, returns `409 name_taken`.
 - `isDefault`, `reference` — optional, same semantics as `create_deployment`.
 
-Before inserting the row, Synapse hits `<url>/version` (proves the URL is a
-live Convex backend) and `<url>/api/check_admin_key` (proves the key works).
-Failures map to client errors:
+Before inserting the row, Synapse hits `GET <url>/version` (proves the URL
+is a live Convex backend) and `GET <url>/api/check_admin_key` with
+`Authorization: Convex <adminKey>` (proves the key works). Failures map to
+client errors:
 
 | code | status | meaning |
 |---|---|---|
