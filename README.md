@@ -1,5 +1,10 @@
 # Synapse
 
+[![CI](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
+[![Next.js](https://img.shields.io/badge/next.js-16-000?logo=next.js)](https://nextjs.org/)
+
 **Open-source control plane for self-hosted [Convex](https://www.convex.dev/) deployments.**
 
 Synapse is the missing piece for self-hosted Convex: a management layer that lets you create teams, projects, and provision multiple Convex deployments from a single dashboard — replicating the experience of Convex Cloud (`dashboard.convex.dev`) on your own infrastructure.
@@ -55,12 +60,35 @@ in v0.2, and what's deliberately out of scope.
 
 ## Quickstart
 
-See [docs/QUICKSTART.md](docs/QUICKSTART.md) once it lands. For now:
-
 ```bash
-# Coming soon
+git clone https://github.com/Iann29/convex-synapse.git
+cd convex-synapse
+cp .env.example .env
+echo "SYNAPSE_JWT_SECRET=$(openssl rand -hex 64)" >> .env
 docker compose up -d
 ```
+
+Open `http://localhost:6790`, register, create a team → project → deployment.
+Synapse provisions a fresh Convex backend container in about a second.
+
+For details (manual dev path, curl examples, `npx convex` integration), see
+[docs/QUICKSTART.md](docs/QUICKSTART.md).
+
+## Tests
+
+```bash
+# Go unit tests
+cd synapse && go test ./...
+
+# Playwright end-to-end against the live compose stack
+cd dashboard
+npm install
+npx playwright install chromium
+npm run test:e2e
+```
+
+The CI pipeline runs all three (Go, Next.js build, full Playwright suite) on
+every push.
 
 ## License
 

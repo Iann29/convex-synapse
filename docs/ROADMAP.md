@@ -15,8 +15,12 @@ provisioned via the dashboard.
 - [x] Deployments API: create (with provisioning), list, get, delete, deploy keys, auth
 - [x] Dashboard scaffold (Next.js + Tailwind)
 - [x] docker-compose.yml: postgres + synapse + dashboard
-- [ ] Dashboard polish: empty states, loading skeletons, deployment status updates
-- [ ] QUICKSTART verified end-to-end with the compose stack
+- [x] Playwright e2e tests through the full compose stack (7 tests, ~30s)
+- [x] Dashboard delete-deployment action
+- [x] CORS middleware
+- [x] CI: Go build/vet/test + Next.js build + compose build + Playwright e2e
+- [ ] Dashboard polish: loading skeletons, deployment status updates while provisioning
+- [ ] QUICKSTART verified end-to-end on a fresh machine
 
 ## v0.2 — "It's nice"
 

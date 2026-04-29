@@ -42,25 +42,56 @@ test.afterEach(async () => {
 test("provision a deployment via the dashboard", async ({ page }) => {
   await setupProject(page);
 
-  // Empty-state CTA on the project page.
   await page.getByRole("button", { name: /create deployment/i }).first().click();
   const dialog = page.getByRole("dialog");
-  // Default type is "dev" — submit straight away.
   await dialog.getByRole("button", { name: "Create", exact: true }).click();
 
-  // Wait for the deployment row — the friendly name follows
-  // "<adj>-<animal>-<NNNN>" so a 4-digit-suffix anchor is reliable.
+  // Wait for the deployment row — friendly name "<adj>-<animal>-<NNNN>".
   await expect(page.getByText(/-[a-z]+-\d{4}/).first()).toBeVisible({
     timeout: 90_000,
   });
 
-  // Then poll Docker (it's the source of truth) — the dashboard's row may
-  // appear as "provisioning" before "running" depending on SWR timing.
-  await expect.poll(() => listSynapseContainerNames().length, {
-    timeout: 30_000,
-    intervals: [500, 1000, 2000],
-  }).toBeGreaterThan(0);
+  await expect
+    .poll(() => listSynapseContainerNames().length, {
+      timeout: 30_000,
+      intervals: [500, 1000, 2000],
+    })
+    .toBeGreaterThan(0);
 
   const containers = listSynapseContainerNames();
   expect(containers[0]).toMatch(/^convex-/);
+});
+
+test("delete a deployment via the dashboard", async ({ page }) => {
+  await setupProject(page);
+
+  // Provision first.
+  await page.getByRole("button", { name: /create deployment/i }).first().click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Create", exact: true })
+    .click();
+
+  // Capture the deployment name from the rendered row.
+  const nameLocator = page.getByText(/-[a-z]+-\d{4}/).first();
+  await expect(nameLocator).toBeVisible({ timeout: 90_000 });
+  const deploymentName = (await nameLocator.textContent())?.trim() ?? "";
+  expect(deploymentName).toMatch(/^[a-z]+-[a-z]+-\d{4}$/);
+
+  // Auto-accept the native confirm() that the delete handler raises.
+  page.on("dialog", (d) => d.accept());
+
+  await page
+    .getByRole("button", { name: new RegExp(`delete deployment ${deploymentName}`, "i") })
+    .click();
+
+  // Row disappears from the list.
+  await expect(nameLocator).toBeHidden({ timeout: 15_000 });
+
+  // Container is gone on the host too.
+  await expect
+    .poll(() => listSynapseContainerNames(), {
+      timeout: 15_000,
+    })
+    .toEqual([]);
 });

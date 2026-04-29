@@ -84,6 +84,29 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
     }
   };
 
+  const [deletingName, setDeletingName] = useState<string | null>(null);
+
+  const deleteDeployment = async (name: string) => {
+    // Confirm via native dialog — the destructive action removes the
+    // container and its data volume. Synapse marks the row deleted, then
+    // we mutate the SWR cache to drop the row from the list.
+    if (!confirm(`Delete deployment "${name}"? Its data volume will be removed.`)) {
+      return;
+    }
+    setActionError(null);
+    setDeletingName(name);
+    try {
+      await api.deployments.delete(name);
+      await mutate();
+    } catch (err) {
+      setActionError(
+        err instanceof ApiError ? err.message : "Could not delete deployment"
+      );
+    } finally {
+      setDeletingName(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div>
@@ -174,6 +197,15 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                       disabled={openingName === d.name}
                     >
                       {openingName === d.name ? "Opening..." : "Open dashboard"}
+                    </Button>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => deleteDeployment(d.name)}
+                      disabled={deletingName === d.name}
+                      aria-label={`Delete deployment ${d.name}`}
+                    >
+                      {deletingName === d.name ? "Deleting..." : "Delete"}
                     </Button>
                   </div>
                 </CardBody>
