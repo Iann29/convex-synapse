@@ -37,7 +37,7 @@ provisioned via the dashboard.
 - [x] Auto-restart for `stopped` deployments (`SYNAPSE_HEALTH_AUTO_RESTART=true`); missing-container is promoted to `failed`
 - [x] Audit log: writer + `GET /v1/teams/{ref}/audit_log` + dashboard `/audit` page (admin-only)
 - [x] Playwright e2e expanded to 16 tests (proxy mode, CLI credentials, multi-deploy, audit)
-- [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
+- [x] Migration helper: import an existing standalone self-hosted deployment into Synapse — `POST /v1/projects/{id}/adopt_deployment` with `/version` + `/api/check_admin_key` probe; `adopted=true` rows skip Docker.Destroy on delete and the health worker
 - [x] Pagination on team / project listings — `?limit&?cursor` + `X-Next-Cursor` header on `/v1/teams`, `/v1/teams/{ref}/list_*`, `/v1/projects/{id}/list_deployments`
 
 ## v0.3 — "Multi-node hygiene" ✅ DONE

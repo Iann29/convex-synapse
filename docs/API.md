@@ -169,6 +169,51 @@ provisions a Convex backend container via Docker, and returns the
 `Deployment` row once `/version` responds (or after a 60s healthcheck
 warning, whichever comes first).
 
+### `POST /v1/projects/{id}/adopt_deployment` 🔧 (admins only)
+
+Registers an existing Convex backend (running outside Synapse) under this
+project. Synapse stores the URL + admin key as a regular deployment row
+flagged `adopted=true`. The dashboard, CLI credentials endpoint, and
+reverse proxy all work as if Synapse had provisioned it — but Synapse
+never touches the underlying container: `delete` only unregisters the
+row, the health worker skips adopted rows, and there is no auto-restart.
+
+Body:
+
+```json
+{
+  "deploymentUrl": "https://convex.my-server.example:3210",
+  "adminKey": "self-hosted-admin-key-…",
+  "deploymentType": "prod",
+  "name": "my-existing-app",
+  "isDefault": false,
+  "reference": ""
+}
+```
+
+- `deploymentUrl` (required) — http or https; trailing slash is stripped.
+- `adminKey` (required) — must succeed against `<url>/api/check_admin_key`.
+- `deploymentType` (default `dev`) — one of `dev|prod|preview|custom`.
+- `name` (optional) — externally-facing identifier. If omitted, Synapse
+  allocates a `friendly-cat-1234`-style name. If provided and a collision
+  exists, returns `409 name_taken`.
+- `isDefault`, `reference` — optional, same semantics as `create_deployment`.
+
+Before inserting the row, Synapse hits `<url>/version` (proves the URL is a
+live Convex backend) and `<url>/api/check_admin_key` (proves the key works).
+Failures map to client errors:
+
+| code | status | meaning |
+|---|---|---|
+| `missing_url` / `missing_admin_key` | 400 | required field empty |
+| `invalid_url` | 400 | not http/https, or unparseable |
+| `invalid_admin_key` | 400 | the deployment rejected the key |
+| `probe_failed` | 502 | URL didn't respond, or returned non-2xx |
+| `name_taken` | 409 | `name` collides with another deployment |
+
+Response (201): the `Deployment` row, with `status: "running"`,
+`adopted: true`, and the supplied URL.
+
 ### `GET /v1/projects/{id}/deployment` ✅
 
 Find one deployment in this project. Query params:

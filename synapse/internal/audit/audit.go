@@ -43,6 +43,9 @@ const (
 	// Deployments.
 	ActionCreateDeployment = "createDeployment"
 	ActionDeleteDeployment = "deleteDeployment"
+	// Adopted = registered an existing external Convex backend rather than
+	// provisioning a new one. Synapse-original; no Cloud equivalent.
+	ActionAdoptDeployment = "adoptDeployment"
 
 	// Personal access tokens. Cloud has no equivalent (it uses OAuth flows),
 	// so these names are Synapse-original; verbs follow the existing

@@ -120,9 +120,13 @@ func (w *Worker) tickWithLock(ctx context.Context, logger *slog.Logger, cfg Conf
 // sweep runs one reconciliation pass. Errors are logged, never returned —
 // a transient DB or Docker hiccup must not kill the loop.
 func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
+	// Adopted deployments are external — Synapse never started the
+	// container, never registered it with Docker, and shouldn't try to
+	// reconcile their state. The operator who registered them owns the
+	// lifecycle.
 	rows, err := w.DB.Query(ctx, `
 		SELECT id, name FROM deployments
-		 WHERE status = 'running'
+		 WHERE status = 'running' AND adopted = false
 	`)
 	if err != nil {
 		logger.Error("health: list running deployments", "err", err)
