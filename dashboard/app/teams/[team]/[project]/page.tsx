@@ -295,9 +295,21 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                       {d.isDefault && <Badge tone="neutral">default</Badge>}
                     </div>
                     {(d.deploymentUrl || d.url) && (
-                      <p className="mt-1 truncate text-xs text-neutral-500">
-                        {d.deploymentUrl || d.url}
-                      </p>
+                      <div className="mt-1 flex items-center gap-2">
+                        <p className="truncate text-xs text-neutral-500">
+                          {d.deploymentUrl || d.url}
+                        </p>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            copyUrl(d.name, (d.deploymentUrl || d.url) as string)
+                          }
+                          aria-label="Copy deployment URL"
+                        >
+                          {copiedName === d.name ? "Copied!" : "Copy"}
+                        </Button>
+                      </div>
                     )}
                   </div>
                   <div className="flex shrink-0 gap-2">
