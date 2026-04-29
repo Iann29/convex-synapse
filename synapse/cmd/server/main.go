@@ -167,19 +167,33 @@ func run() error {
 // crashes where the goroutine driving Provision dies before it can update
 // the row. Single SQL UPDATE — no Docker calls; the operator (or a future
 // reconciler) can decide whether the underlying container is salvageable.
+//
+// Multi-node coordination: 3 nodes booting at the same time would each issue
+// the same UPDATE — idempotent, but noisy. Wrap in an advisory lock so only
+// one node runs it; followers see acquired=false and move on.
 func sweepOrphanedProvisioning(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
-	tag, err := pool.Exec(ctx, `
-		UPDATE deployments
-		   SET status = 'failed',
-		       last_deploy_at = now()
-		 WHERE status = 'provisioning'
-		   AND created_at < now() - interval '10 minutes'
-	`)
+	acquired, err := db.WithTryAdvisoryLock(ctx, pool, db.LockOrphanSweep,
+		func(ctx context.Context) error {
+			tag, err := pool.Exec(ctx, `
+				UPDATE deployments
+				   SET status = 'failed',
+				       last_deploy_at = now()
+				 WHERE status = 'provisioning'
+				   AND created_at < now() - interval '10 minutes'
+			`)
+			if err != nil {
+				return err
+			}
+			if n := tag.RowsAffected(); n > 0 {
+				logger.Warn("swept orphaned provisioning deployments", "count", n)
+			}
+			return nil
+		})
 	if err != nil {
 		return err
 	}
-	if n := tag.RowsAffected(); n > 0 {
-		logger.Warn("swept orphaned provisioning deployments", "count", n)
+	if !acquired {
+		logger.Debug("orphan sweep: another node holds the lock; skipping")
 	}
 	return nil
 }

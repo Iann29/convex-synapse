@@ -17,6 +17,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	synapsedb "github.com/Iann29/synapse/internal/db"
 )
 
 // DockerStatusReporter is the subset of the docker provisioner the worker
@@ -68,6 +70,11 @@ type Worker struct {
 // Run blocks until ctx is cancelled. Each tick runs a single sweep and logs
 // a summary at INFO level when state changed; a no-op sweep emits a DEBUG
 // line so the worker is observable but not noisy.
+//
+// Multi-node coordination: each tick is wrapped in a session-level
+// pg_try_advisory_lock(LockHealthWorker). Exactly one node in the fleet
+// runs the sweep at any instant; followers observe acquired=false and
+// skip silently. Single-node deployments pay one round-trip per tick.
 func (w *Worker) Run(ctx context.Context) {
 	cfg := w.Config.sane()
 	logger := w.Logger
@@ -78,7 +85,7 @@ func (w *Worker) Run(ctx context.Context) {
 
 	// Run one sweep immediately so a fresh server doesn't wait `interval`
 	// before catching a docker mismatch.
-	w.sweep(ctx, logger, cfg)
+	w.tickWithLock(ctx, logger, cfg)
 
 	t := time.NewTicker(cfg.Interval)
 	defer t.Stop()
@@ -88,8 +95,25 @@ func (w *Worker) Run(ctx context.Context) {
 			logger.Info("health worker stopping")
 			return
 		case <-t.C:
-			w.sweep(ctx, logger, cfg)
+			w.tickWithLock(ctx, logger, cfg)
 		}
+	}
+}
+
+// tickWithLock acquires the worker's advisory lock and runs one sweep.
+// If the lock is held by another node, the tick is a no-op.
+func (w *Worker) tickWithLock(ctx context.Context, logger *slog.Logger, cfg Config) {
+	acquired, err := synapsedb.WithTryAdvisoryLock(ctx, w.DB, synapsedb.LockHealthWorker,
+		func(ctx context.Context) error {
+			w.sweep(ctx, logger, cfg)
+			return nil
+		})
+	if err != nil {
+		logger.Warn("health: advisory-lock acquire failed", "err", err)
+		return
+	}
+	if !acquired {
+		logger.Debug("health: another node holds the sweep lock; skipping tick")
 	}
 }
 
