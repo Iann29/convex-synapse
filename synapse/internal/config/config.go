@@ -41,6 +41,12 @@ type Config struct {
 	// synapse-network bridge with provisioned backends; loopback inside the
 	// container does not reach sibling containers.
 	HealthcheckViaNetwork bool
+
+	// AllowedOrigins is a comma-separated list of origins permitted to make
+	// browser-initiated requests, or "*" to allow any. Defaults to "*" since
+	// Synapse runs on operator-controlled infra and every endpoint requires
+	// a bearer token anyway.
+	AllowedOrigins string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -97,6 +103,7 @@ func Load() (*Config, error) {
 		PortRangeMin:          portMin,
 		PortRangeMax:          portMax,
 		HealthcheckViaNetwork: getEnvDefault("SYNAPSE_HEALTHCHECK_VIA_NETWORK", "") == "true",
+		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
 	}, nil
 }
 

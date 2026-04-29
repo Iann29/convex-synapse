@@ -70,6 +70,7 @@ func run() error {
 		PortRangeMin:          cfg.PortRangeMin,
 		PortRangeMax:          cfg.PortRangeMax,
 		HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
+		AllowedOrigins:        cfg.AllowedOrigins,
 		Version:               Version,
 	})
 

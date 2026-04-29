@@ -46,16 +46,22 @@ export default function RegisterPage() {
           </p>
         </div>
         <div className="space-y-2">
-          <label className="block text-xs text-neutral-400">Name (optional)</label>
+          <label htmlFor="register-name" className="block text-xs text-neutral-400">
+            Name (optional)
+          </label>
           <Input
+            id="register-name"
             value={name}
             autoComplete="name"
             onChange={(e) => setName(e.target.value)}
           />
         </div>
         <div className="space-y-2">
-          <label className="block text-xs text-neutral-400">Email</label>
+          <label htmlFor="register-email" className="block text-xs text-neutral-400">
+            Email
+          </label>
           <Input
+            id="register-email"
             type="email"
             value={email}
             autoComplete="email"
@@ -64,10 +70,11 @@ export default function RegisterPage() {
           />
         </div>
         <div className="space-y-2">
-          <label className="block text-xs text-neutral-400">
+          <label htmlFor="register-password" className="block text-xs text-neutral-400">
             Password (8+ chars)
           </label>
           <Input
+            id="register-password"
             type="password"
             value={password}
             autoComplete="new-password"

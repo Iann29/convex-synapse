@@ -48,3 +48,76 @@ jobs:
       - run: docker compose build
         env:
           SYNAPSE_JWT_SECRET: dummy-jwt-secret-for-ci-builds-only-do-not-use-in-prod-x
+
+  e2e:
+    name: Playwright e2e
+    runs-on: ubuntu-latest
+    needs: [synapse, dashboard]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard deps
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Install Playwright browser
+        working-directory: dashboard
+        run: npx playwright install --with-deps chromium
+
+      - name: Bring up the stack
+        env:
+          SYNAPSE_JWT_SECRET: dummy-jwt-secret-for-ci-e2e-only-do-not-use-in-prod-xx
+        run: docker compose up -d --build
+
+      - name: Wait for synapse
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health >/dev/null; then
+              echo "synapse healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "synapse never became healthy"
+          docker compose logs
+          exit 1
+
+      - name: Wait for dashboard
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:6790/login >/dev/null; then
+              echo "dashboard healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "dashboard never became healthy"
+          docker compose logs
+          exit 1
+
+      - name: Pre-pull convex-backend image (so first deployment is fast)
+        run: docker pull ghcr.io/get-convex/convex-backend:latest
+
+      - name: Run Playwright tests
+        working-directory: dashboard
+        run: npx playwright test --reporter=list
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:6790
+          SYNAPSE_DB_URL: postgres://synapse:synapse@localhost:5432/synapse
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: dashboard/playwright-report/
+          retention-days: 7
+
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --tail 200

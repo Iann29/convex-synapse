@@ -23,6 +23,7 @@ type RouterDeps struct {
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
+	AllowedOrigins        string
 	Version               string
 }
 
@@ -35,6 +36,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
 	r.Use(middleware.RequestLogger(d.Logger))
+	r.Use(middleware.CORS(d.AllowedOrigins))
 	r.Use(chimw.Recoverer)
 	// 90s accommodates the slowest endpoint we have today: create_deployment,
 	// which blocks on docker pull + container start + healthcheck. When we

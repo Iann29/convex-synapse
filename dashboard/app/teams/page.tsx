@@ -90,8 +90,11 @@ export default function TeamsPage() {
       <Dialog open={open} onClose={() => setOpen(false)} title="Create team">
         <form onSubmit={create} className="space-y-4">
           <div className="space-y-2">
-            <label className="block text-xs text-neutral-400">Team name</label>
+            <label htmlFor="team-name" className="block text-xs text-neutral-400">
+              Team name
+            </label>
             <Input
+              id="team-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Acme Inc."

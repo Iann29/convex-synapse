@@ -106,8 +106,11 @@ export default function TeamPage({ params }: { params: Promise<Params> }) {
       <Dialog open={open} onClose={() => setOpen(false)} title="Create project">
         <form onSubmit={create} className="space-y-4">
           <div className="space-y-2">
-            <label className="block text-xs text-neutral-400">Project name</label>
+            <label htmlFor="project-name" className="block text-xs text-neutral-400">
+              Project name
+            </label>
             <Input
+              id="project-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="my-app"

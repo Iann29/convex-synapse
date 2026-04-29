@@ -41,8 +41,11 @@ export default function LoginPage() {
           </p>
         </div>
         <div className="space-y-2">
-          <label className="block text-xs text-neutral-400">Email</label>
+          <label htmlFor="login-email" className="block text-xs text-neutral-400">
+            Email
+          </label>
           <Input
+            id="login-email"
             type="email"
             value={email}
             autoComplete="email"
@@ -51,8 +54,11 @@ export default function LoginPage() {
           />
         </div>
         <div className="space-y-2">
-          <label className="block text-xs text-neutral-400">Password</label>
+          <label htmlFor="login-password" className="block text-xs text-neutral-400">
+            Password
+          </label>
           <Input
+            id="login-password"
             type="password"
             value={password}
             autoComplete="current-password"

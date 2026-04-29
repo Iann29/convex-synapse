@@ -29,6 +29,9 @@ export function Dialog({ open, onClose, title, children, className }: Props) {
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? "dialog-title" : undefined}
         className={clsx(
           "w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-5 shadow-xl",
           className
@@ -36,7 +39,9 @@ export function Dialog({ open, onClose, title, children, className }: Props) {
         onClick={(e) => e.stopPropagation()}
       >
         {title && (
-          <h2 className="mb-4 text-base font-semibold text-neutral-100">{title}</h2>
+          <h2 id="dialog-title" className="mb-4 text-base font-semibold text-neutral-100">
+            {title}
+          </h2>
         )}
         {children}
       </div>
