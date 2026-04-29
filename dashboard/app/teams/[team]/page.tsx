@@ -8,6 +8,7 @@ import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { InvitesPanel } from "@/components/InvitesPanel";
 import { ApiError, api, type Project, type Team } from "@/lib/api";
 
 type Params = { team: string };
@@ -114,6 +115,9 @@ export default function TeamPage({ params }: { params: Promise<Params> }) {
           ))}
         </div>
       )}
+
+      <hr className="border-neutral-900" />
+      <InvitesPanel teamRef={teamRef} />
 
       <Dialog open={open} onClose={() => setOpen(false)} title="Create project">
         <form onSubmit={create} className="space-y-4">
