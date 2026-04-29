@@ -11,15 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Iann29/synapse/internal/auth"
-	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/middleware"
 )
 
 type RouterDeps struct {
-	Logger                *slog.Logger
-	DB                    *pgxpool.Pool
-	JWT                   *auth.JWTIssuer
-	Docker                *dockerprov.Client
+	Logger *slog.Logger
+	DB     *pgxpool.Pool
+	JWT    *auth.JWTIssuer
+	// Docker is a Provisioner — accepting an interface here lets tests inject
+	// a fake without bringing the docker SDK along for the ride. Production
+	// wiring passes *dockerprov.Client which already satisfies it.
+	Docker                Provisioner
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
