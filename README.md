@@ -42,12 +42,22 @@ Synapse fills that gap.
 
 ## Status
 
-**v0.1 — runs end-to-end.** A `docker compose up -d` plus a register call
-gets you a control-plane API, a dashboard, and the ability to provision
-real Convex backend containers in about a second per deployment.
+**v0.2 — feature-complete for daily use.** A `docker compose up -d` plus a
+register call gets you a control-plane API, a dashboard, and the ability to
+provision real Convex backend containers in about a second per deployment.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done, what's coming
-in v0.2, and what's deliberately out of scope.
+What works today:
+- Email + password auth (JWT sessions)
+- Personal access tokens for CLI / CI (`syn_*` opaque, hashed at rest)
+- Multi-team membership via opaque invite tokens (`/v1/team_invites/accept`)
+- Project rename/delete, default env vars (set/delete batch)
+- Real Convex backend container per deployment, ~1s provisioning
+- Deployment delete tears down container + data volume idempotently
+- Health worker reconciles `deployments.status` with Docker reality every 30s
+- 55+ automated tests (Go integration + Playwright e2e) green in CI
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's coming in v0.2/v1.0
+and what's deliberately out of scope.
 
 ## Repo layout
 
