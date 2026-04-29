@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -36,6 +37,8 @@ func (h *TeamsHandler) Routes() chi.Router {
 		r.Get("/list_deployments", h.listDeployments)
 		r.Post("/invite_team_member", h.inviteMember)
 		r.Post("/create_project", h.createProject)
+		r.Get("/invites", h.listInvites)
+		r.Post("/invites/{inviteID}/cancel", h.cancelInvite)
 	})
 
 	return r
@@ -499,4 +502,80 @@ func (h *TeamsHandler) inviteMember(w http.ResponseWriter, r *http.Request) {
 		"role":        req.Role,
 		"inviteToken": plain,
 	})
+}
+
+// ---------- GET /v1/teams/{teamRef}/invites ----------
+//
+// Lists pending invites for the team. Admin-only — invite tokens are
+// privileged data: anyone holding a token becomes a member.
+
+type pendingInvite struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Role      string    `json:"role"`
+	Token     string    `json:"token"`
+	InvitedBy string    `json:"invitedBy"`
+	CreatedAt time.Time `json:"createTime"`
+}
+
+func (h *TeamsHandler) listInvites(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can list invites")
+		return
+	}
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT id, email, role, token, invited_by, created_at
+		  FROM team_invites
+		 WHERE team_id = $1 AND accepted_at IS NULL
+		 ORDER BY created_at DESC
+	`, t.ID)
+	if err != nil {
+		logErr("list invites", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to list invites")
+		return
+	}
+	defer rows.Close()
+
+	out := make([]pendingInvite, 0)
+	for rows.Next() {
+		var inv pendingInvite
+		if err := rows.Scan(&inv.ID, &inv.Email, &inv.Role, &inv.Token, &inv.InvitedBy, &inv.CreatedAt); err != nil {
+			logErr("scan invite", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan invites")
+			return
+		}
+		out = append(out, inv)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---------- POST /v1/teams/{teamRef}/invites/{inviteID}/cancel ----------
+
+func (h *TeamsHandler) cancelInvite(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can cancel invites")
+		return
+	}
+	id := chi.URLParam(r, "inviteID")
+	tag, err := h.DB.Exec(r.Context(),
+		`DELETE FROM team_invites WHERE id::text = $1 AND team_id = $2 AND accepted_at IS NULL`,
+		id, t.ID)
+	if err != nil {
+		logErr("cancel invite", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to cancel invite")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "invite_not_found", "Invite not found or already accepted")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "cancelled"})
 }

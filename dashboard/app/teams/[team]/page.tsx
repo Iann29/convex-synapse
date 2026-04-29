@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, api, type Project, type Team } from "@/lib/api";
 
 type Params = { team: string };
@@ -63,7 +64,18 @@ export default function TeamPage({ params }: { params: Promise<Params> }) {
         </div>
       </div>
 
-      {isLoading && <p className="text-sm text-neutral-500">Loading projects...</p>}
+      {isLoading && (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <Card key={i}>
+              <CardBody>
+                <Skeleton className="h-4 w-2/3" />
+                <Skeleton className="mt-2 h-3 w-1/3" />
+              </CardBody>
+            </Card>
+          ))}
+        </div>
+      )}
       {error && (
         <p className="text-sm text-red-400">
           Failed to load projects: {(error as Error).message}

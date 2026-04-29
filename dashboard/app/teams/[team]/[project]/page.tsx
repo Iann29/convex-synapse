@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ApiError, api, type Deployment, type Project } from "@/lib/api";
 
@@ -41,8 +42,20 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
     error,
     isLoading,
     mutate,
-  } = useSWR<Deployment[]>(["/deployments", projectId], () =>
-    api.projects.listDeployments(projectId)
+  } = useSWR<Deployment[]>(
+    ["/deployments", projectId],
+    () => api.projects.listDeployments(projectId),
+    {
+      // Poll while any deployment is mid-provisioning (or any other transient
+      // state) so the UI catches up without a manual refresh. Once everything
+      // is "running" or "deleted" we stop polling to keep the page idle.
+      refreshInterval: (latestData) =>
+        latestData?.some(
+          (d) => d.status !== "running" && d.status !== "deleted",
+        )
+          ? 2000
+          : 0,
+    },
   );
 
   const [open, setOpen] = useState(false);
@@ -94,6 +107,23 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [renamePending, setRenamePending] = useState(false);
+  const [copiedName, setCopiedName] = useState<string | null>(null);
+
+  const copyUrl = async (name: string, url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedName(name);
+      // Clear the "Copied!" label after a beat — long enough to be noticed,
+      // short enough that re-clicking feels responsive.
+      setTimeout(() => {
+        setCopiedName((current) => (current === name ? null : current));
+      }, 1500);
+    } catch {
+      // Clipboard write can fail on insecure origins or denied permissions;
+      // surface it through the existing action error banner.
+      setActionError("Could not copy URL to clipboard");
+    }
+  };
 
   const submitRename = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -204,7 +234,24 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
         </p>
       )}
 
-      {isLoading && <p className="text-sm text-neutral-500">Loading deployments...</p>}
+      {isLoading && (
+        <div className="space-y-3">
+          {[0, 1, 2].map((i) => (
+            <Card key={i}>
+              <CardBody className="flex items-center justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <Skeleton className="h-4 w-1/3" />
+                  <Skeleton className="mt-2 h-3 w-2/3" />
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <Skeleton className="h-8 w-28" />
+                  <Skeleton className="h-8 w-16" />
+                </div>
+              </CardBody>
+            </Card>
+          ))}
+        </div>
+      )}
       {error && (
         <p className="text-sm text-red-400">
           Failed to load deployments: {(error as Error).message}

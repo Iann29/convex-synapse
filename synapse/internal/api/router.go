@@ -48,6 +48,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
 	meH := &MeHandler{DB: d.DB}
 	teamsH := &TeamsHandler{DB: d.DB}
+	invitesH := &InvitesHandler{DB: d.DB}
 	deploymentsH := &DeploymentsHandler{
 		DB:                    d.DB,
 		Docker:                d.Docker,
@@ -74,6 +75,7 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/teams", teamsH.Routes())
 			r.Mount("/projects", projectsH.Routes())
 			r.Mount("/deployments", deploymentsH.Routes())
+			r.Mount("/team_invites", invitesH.Routes())
 		})
 	})
 

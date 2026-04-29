@@ -67,6 +67,22 @@ Returns `{projectId, projectSlug, project}`.
 Body: `{email, role}`. Returns `{inviteId, inviteToken, email, role}`. The
 token is opaque; share it with the invitee out-of-band.
 
+### `GET /v1/teams/{ref}/invites` 🔧 (admins only)
+
+Lists pending (not-yet-accepted) invites — `[{id, email, role, token, invitedBy, createTime}]`.
+Tokens are sensitive: anyone who has one can join the team.
+
+### `POST /v1/teams/{ref}/invites/{inviteID}/cancel` 🔧 (admins only)
+
+Deletes a pending invite. 404 if it was already accepted or never existed.
+
+### `POST /v1/team_invites/accept` 🔧
+
+Body: `{token}`. The caller must be authenticated. Adds the user as a
+member with the role recorded in the invite, marks the invite consumed,
+and returns `{teamId, teamSlug, teamName, role}`. Idempotent on the
+membership insert (re-accepting from a second tab is a no-op).
+
 ## Projects
 
 ### `GET /v1/projects/{id}` ✅

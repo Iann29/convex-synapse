@@ -15,12 +15,22 @@ import (
 	"github.com/Iann29/synapse/internal/models"
 )
 
+// Provisioner is the subset of the docker provisioner that the deployments
+// handler depends on. Pulled out behind an interface so tests can swap in a
+// fake without spinning up a real Docker daemon. *dockerprov.Client implements
+// this (Provision/Destroy/Status), so production wiring is unchanged.
+type Provisioner interface {
+	Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
+	Destroy(ctx context.Context, deploymentName string) error
+	Status(ctx context.Context, deploymentName string) (string, error)
+}
+
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
 // a Docker container), list, get, delete, plus the dashboard-auth endpoint
 // that returns the deployment URL + admin key for the calling user.
 type DeploymentsHandler struct {
 	DB                    *pgxpool.Pool
-	Docker                *dockerprov.Client
+	Docker                Provisioner
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
