@@ -27,14 +27,15 @@ provisioned via the dashboard.
 
 ## v0.2 — "It's nice"
 
-- [ ] Personal access tokens (`POST /v1/create_personal_access_token`)
+- [x] Personal access tokens (`POST /v1/create_personal_access_token`) + dashboard `/me`
+- [x] Health monitoring worker — reconciles `deployments.status` with Docker reality every 30s
+- [x] Real Go test suite (44+ integration tests via httptest + a fresh postgres per test)
+- [~] Async provisioning (background goroutine + status polling) — agent in flight
 - [ ] `npx convex` CLI compatibility (auth flow, deploy keys)
 - [ ] Reverse proxy mode so deployments don't need exposed host ports
-- [ ] Health monitoring of provisioned backends (auto-restart, status reporting in dashboard)
-- [ ] Async provisioning (background goroutine + status polling)
+- [ ] Auto-restart for `failed`/`stopped` deployments (manual recovery only in v0.2)
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
-- [~] Real Go test suite (testcontainers for postgres, fake docker daemon) — in progress
-- [ ] Pagination on listings
+- [ ] Pagination on team / project listings (PAT list already paginated)
 
 ## v1.0 — "Safe to depend on"
 

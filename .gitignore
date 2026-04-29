@@ -37,3 +37,5 @@ logs/
 # Docker volumes (when bind-mounted)
 data/
 volumes/
+synapse/server
+synapse/bin/
