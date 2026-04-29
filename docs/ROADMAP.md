@@ -23,7 +23,7 @@ provisioned via the dashboard.
 - [x] Backend invite list / cancel / accept (`POST /v1/team_invites/accept`)
 - [x] CORS middleware
 - [x] CI: Go build/vet/test + Next.js build + compose build + Playwright e2e
-- [ ] QUICKSTART verified end-to-end on a fresh machine
+- [x] QUICKSTART verified end-to-end (register → team → project → real deployment provisioned in ~1s → cli_credentials snippet → adopt_deployment + bad-key path → delete cleans container+volume; adopted delete leaves Docker untouched). Re-verify on a truly fresh machine before tagging v1.
 
 ## v0.2 — "It's nice" ✅ DONE
 
