@@ -38,7 +38,7 @@ provisioned via the dashboard.
 - [x] Audit log: writer + `GET /v1/teams/{ref}/audit_log` + dashboard `/audit` page (admin-only)
 - [x] Playwright e2e expanded to 16 tests (proxy mode, CLI credentials, multi-deploy, audit)
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
-- [ ] Pagination on team / project listings (PAT list already paginated)
+- [x] Pagination on team / project listings — `?limit&?cursor` + `X-Next-Cursor` header on `/v1/teams`, `/v1/teams/{ref}/list_*`, `/v1/projects/{id}/list_deployments`
 
 ## v0.3 — "Multi-node hygiene" ✅ DONE
 

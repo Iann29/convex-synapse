@@ -57,6 +57,32 @@ Lists teams the caller belongs to.
 ### `GET /v1/teams/{ref}/list_members` ✅
 ### `GET /v1/teams/{ref}/list_deployments` ✅
 
+These (plus `GET /v1/teams` and `GET /v1/projects/{id}/list_deployments`) are
+**bounded** lists. The response shape is still a bare JSON array (matches
+Cloud's `list_*` endpoints — no breaking change for existing tools), but the
+server caps each page and signals continuation via a header:
+
+- Query `?limit=N` (default 100, max 500). Negative / non-numeric is 400
+  `invalid_limit`.
+- Query `?cursor=<id>` to fetch the page after the row with that id. The
+  cursor must refer to a row the caller can see (a team they're a member of,
+  a project in that team, etc); a bogus cursor returns 400 `invalid_cursor`.
+- Response header `X-Next-Cursor: <id>` is set when more rows exist after
+  this page. Absent header = end of results.
+
+Walk pattern (shell):
+
+```bash
+NEXT=""
+while :; do
+  RESP=$(curl -sfD - "http://localhost:8080/v1/teams${NEXT:+?cursor=$NEXT}" \
+    -H "Authorization: Bearer $TOKEN")
+  echo "$RESP" | sed -n '/^\r$/,$p' | tail -n +2 | jq .
+  NEXT=$(echo "$RESP" | tr -d '\r' | awk -F': ' '/^X-Next-Cursor/ {print $2}')
+  [ -z "$NEXT" ] && break
+done
+```
+
 ### `POST /v1/teams/{ref}/create_project` ✅
 
 Body: `{projectName, deploymentType?, deploymentClass?, deploymentRegion?}`.

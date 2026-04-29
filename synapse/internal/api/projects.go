@@ -1,10 +1,10 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -215,35 +215,64 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	deployments, err := loadProjectDeployments(r.Context(), h.DB, p.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, project_id, name, deployment_type, status,
+			       deployment_url, is_default, reference, creator_user_id, created_at
+			  FROM deployments
+			 WHERE project_id = $1 AND status <> 'deleted'
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $2
+		`, p.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM deployments WHERE id::text = $1 AND project_id = $2 AND status <> 'deleted'`,
+			cursor, p.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a deployment in this project")
+			return
+		}
+		if err != nil {
+			logErr("resolve project deployments cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, project_id, name, deployment_type, status,
+			       deployment_url, is_default, reference, creator_user_id, created_at
+			  FROM deployments
+			 WHERE project_id = $1
+			   AND status <> 'deleted'
+			   AND (created_at, id) > ($2, $3)
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $4
+		`, p.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list deployments", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list deployments")
 		return
 	}
-	writeJSON(w, http.StatusOK, deployments)
-}
-
-func loadProjectDeployments(ctx context.Context, db *pgxpool.Pool, projectID string) ([]models.Deployment, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, project_id, name, deployment_type, status,
-		       deployment_url, is_default, reference, creator_user_id, created_at
-		  FROM deployments
-		 WHERE project_id = $1 AND status <> 'deleted'
-		 ORDER BY created_at ASC
-	`, projectID)
-	if err != nil {
-		return nil, err
-	}
 	defer rows.Close()
 
-	out := make([]models.Deployment, 0)
+	deployments := make([]models.Deployment, 0, limit)
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
 		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt); err != nil {
-			return nil, err
+			logErr("scan deployment", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan deployments")
+			return
 		}
 		if url != nil {
 			d.DeploymentURL = *url
@@ -254,9 +283,18 @@ func loadProjectDeployments(ctx context.Context, db *pgxpool.Pool, projectID str
 		if creator != nil {
 			d.CreatorUserID = *creator
 		}
-		out = append(out, d)
+		deployments = append(deployments, d)
 	}
-	return out, nil
+	if err := rows.Err(); err != nil {
+		logErr("iterate deployments", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read deployments")
+		return
+	}
+	if len(deployments) > limit {
+		setNextCursor(w, deployments[limit-1].ID)
+		deployments = deployments[:limit]
+	}
+	writeJSON(w, http.StatusOK, deployments)
 }
 
 // ---------- GET /v1/projects/{id}/list_default_environment_variables ----------

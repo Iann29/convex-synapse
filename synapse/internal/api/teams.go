@@ -161,13 +161,56 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Not authenticated")
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
-		  FROM teams t
-		  JOIN team_members m ON m.team_id = t.id
-		 WHERE m.user_id = $1
-		 ORDER BY t.created_at ASC
-	`, uid)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	// Keyset pagination on (team.created_at ASC, team.id ASC). The membership
+	// row's created_at is irrelevant to ordering — what we expose is "teams I
+	// belong to in creation order", so the team's own timestamp anchors the
+	// page boundary. Cursor is the team id from the previous page.
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE m.user_id = $1
+			 ORDER BY t.created_at ASC, t.id ASC
+			 LIMIT $2
+		`, uid, limit+1)
+	} else {
+		// Resolve cursor → (created_at, id) of the team. We require membership
+		// in the lookup to avoid leaking timestamps for teams the caller can't
+		// see — same defence as the PAT cursor.
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(), `
+			SELECT t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE t.id::text = $1 AND m.user_id = $2
+		`, cursor, uid).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a team you belong to")
+			return
+		}
+		if err != nil {
+			logErr("resolve teams cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE m.user_id = $1
+			   AND (t.created_at, t.id) > ($2, $3)
+			 ORDER BY t.created_at ASC, t.id ASC
+			 LIMIT $4
+		`, uid, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list teams", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list teams")
@@ -175,7 +218,7 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	teams := make([]models.Team, 0)
+	teams := make([]models.Team, 0, limit)
 	for rows.Next() {
 		var t models.Team
 		if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt); err != nil {
@@ -184,6 +227,15 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		teams = append(teams, t)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate teams", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read teams")
+		return
+	}
+	if len(teams) > limit {
+		setNextCursor(w, teams[limit-1].ID)
+		teams = teams[:limit]
 	}
 	writeJSON(w, http.StatusOK, teams)
 }
@@ -264,12 +316,45 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT id, team_id, name, slug, is_demo, created_at
-		  FROM projects
-		 WHERE team_id = $1
-		 ORDER BY created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, team_id, name, slug, is_demo, created_at
+			  FROM projects
+			 WHERE team_id = $1
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM projects WHERE id::text = $1 AND team_id = $2`,
+			cursor, t.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a project in this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve projects cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, team_id, name, slug, is_demo, created_at
+			  FROM projects
+			 WHERE team_id = $1
+			   AND (created_at, id) > ($2, $3)
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list projects", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list projects")
@@ -277,7 +362,7 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	projects := make([]models.Project, 0)
+	projects := make([]models.Project, 0, limit)
 	for rows.Next() {
 		var p models.Project
 		if err := rows.Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt); err != nil {
@@ -287,6 +372,15 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		p.TeamSlug = t.Slug
 		projects = append(projects, p)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate projects", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read projects")
+		return
+	}
+	if len(projects) > limit {
+		setNextCursor(w, projects[limit-1].ID)
+		projects = projects[:limit]
 	}
 	writeJSON(w, http.StatusOK, projects)
 }
@@ -298,13 +392,50 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT u.id, u.email, u.name, m.role, m.created_at
-		  FROM team_members m
-		  JOIN users u ON u.id = m.user_id
-		 WHERE m.team_id = $1
-		 ORDER BY m.created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	// Cursor here is the member's user_id. Membership rows are unique on
+	// (team_id, user_id), so user_id alone disambiguates the position when
+	// paired with the membership's created_at.
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT u.id, u.email, u.name, m.role, m.created_at
+			  FROM team_members m
+			  JOIN users u ON u.id = m.user_id
+			 WHERE m.team_id = $1
+			 ORDER BY m.created_at ASC, u.id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM team_members WHERE team_id = $1 AND user_id::text = $2`,
+			t.ID, cursor).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a member of this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve members cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT u.id, u.email, u.name, m.role, m.created_at
+			  FROM team_members m
+			  JOIN users u ON u.id = m.user_id
+			 WHERE m.team_id = $1
+			   AND (m.created_at, u.id) > ($2, $3)
+			 ORDER BY m.created_at ASC, u.id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list members", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list members")
@@ -312,7 +443,7 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	members := make([]models.TeamMember, 0)
+	members := make([]models.TeamMember, 0, limit)
 	for rows.Next() {
 		var m models.TeamMember
 		if err := rows.Scan(&m.UserID, &m.Email, &m.Name, &m.Role, &m.CreatedAt); err != nil {
@@ -322,6 +453,15 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 		}
 		m.TeamID = t.ID
 		members = append(members, m)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate members", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read members")
+		return
+	}
+	if len(members) > limit {
+		setNextCursor(w, members[limit-1].UserID)
+		members = members[:limit]
 	}
 	writeJSON(w, http.StatusOK, members)
 }
@@ -333,15 +473,56 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
-		       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at
-		  FROM deployments d
-		  JOIN projects p ON p.id = d.project_id
-		 WHERE p.team_id = $1
-		   AND d.status <> 'deleted'
-		 ORDER BY d.created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
+			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE p.team_id = $1
+			   AND d.status <> 'deleted'
+			 ORDER BY d.created_at ASC, d.id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		// Cursor must refer to a non-deleted deployment in this team — keeps
+		// callers from probing other teams' deployment timestamps.
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(), `
+			SELECT d.created_at
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE d.id::text = $1 AND p.team_id = $2 AND d.status <> 'deleted'
+		`, cursor, t.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a deployment in this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve deployments cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
+			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE p.team_id = $1
+			   AND d.status <> 'deleted'
+			   AND (d.created_at, d.id) > ($2, $3)
+			 ORDER BY d.created_at ASC, d.id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list deployments", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list deployments")
@@ -349,7 +530,7 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	deployments := make([]models.Deployment, 0)
+	deployments := make([]models.Deployment, 0, limit)
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
@@ -369,6 +550,15 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 			d.CreatorUserID = *creator
 		}
 		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate deployments", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read deployments")
+		return
+	}
+	if len(deployments) > limit {
+		setNextCursor(w, deployments[limit-1].ID)
+		deployments = deployments[:limit]
 	}
 	writeJSON(w, http.StatusOK, deployments)
 }
