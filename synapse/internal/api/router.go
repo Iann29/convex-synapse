@@ -38,6 +38,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
 	meH := &MeHandler{DB: d.DB}
 	teamsH := &TeamsHandler{DB: d.DB}
+	projectsH := &ProjectsHandler{DB: d.DB}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -54,6 +55,7 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/me", meH.Routes())
 			r.Mount("/profile", meH.Routes()) // alias for cloud-dashboard parity
 			r.Mount("/teams", teamsH.Routes())
+			r.Mount("/projects", projectsH.Routes())
 		})
 	})
 

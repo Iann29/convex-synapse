@@ -35,6 +35,7 @@ func (h *TeamsHandler) Routes() chi.Router {
 		r.Get("/list_members", h.listMembers)
 		r.Get("/list_deployments", h.listDeployments)
 		r.Post("/invite_team_member", h.inviteMember)
+		r.Post("/create_project", h.createProject)
 	})
 
 	return r
@@ -354,6 +355,84 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 		deployments = append(deployments, d)
 	}
 	writeJSON(w, http.StatusOK, deployments)
+}
+
+// ---------- POST /v1/teams/{teamRef}/create_project ----------
+
+type createProjectReq struct {
+	ProjectName      string `json:"projectName"`
+	DeploymentType   string `json:"deploymentType,omitempty"`
+	DeploymentClass  string `json:"deploymentClass,omitempty"`
+	DeploymentRegion string `json:"deploymentRegion,omitempty"`
+}
+
+type createProjectResp struct {
+	ProjectID   string         `json:"projectId"`
+	ProjectSlug string         `json:"projectSlug"`
+	Project     models.Project `json:"project"`
+}
+
+func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
+	t, _, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	var req createProjectReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.ProjectName = strings.TrimSpace(req.ProjectName)
+	if req.ProjectName == "" {
+		writeError(w, http.StatusBadRequest, "missing_name", "Project name is required")
+		return
+	}
+
+	slug, err := h.allocateProjectSlug(r.Context(), t.ID, req.ProjectName)
+	if err != nil {
+		logErr("alloc project slug", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate project slug")
+		return
+	}
+
+	var p models.Project
+	err = h.DB.QueryRow(r.Context(), `
+		INSERT INTO projects (team_id, name, slug)
+		VALUES ($1, $2, $3)
+		RETURNING id, team_id, name, slug, is_demo, created_at
+	`, t.ID, req.ProjectName, slug).Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt)
+	if err != nil {
+		logErr("insert project", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to create project")
+		return
+	}
+	p.TeamSlug = t.Slug
+
+	writeJSON(w, http.StatusCreated, createProjectResp{
+		ProjectID:   p.ID,
+		ProjectSlug: p.Slug,
+		Project:     p,
+	})
+}
+
+func (h *TeamsHandler) allocateProjectSlug(ctx context.Context, teamID, name string) (string, error) {
+	base := slugify(name)
+	for i := 0; i < 50; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = withSuffix(base, i)
+		}
+		var exists bool
+		if err := h.DB.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM projects WHERE team_id = $1 AND slug = $2)`,
+			teamID, candidate).Scan(&exists); err != nil {
+			return "", err
+		}
+		if !exists {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("could not allocate slug after 50 attempts")
 }
 
 // ---------- POST /v1/teams/{teamRef}/invite_team_member ----------
