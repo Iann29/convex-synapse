@@ -42,6 +42,16 @@ export type DeploymentAuth = {
   deploymentUrl: string;
 };
 
+export type EnvVar = {
+  name: string;
+  value: string;
+  deploymentTypes: string[];
+};
+
+export type EnvVarChange =
+  | { op: "set"; name: string; value: string; deploymentTypes?: string[] }
+  | { op: "delete"; name: string };
+
 class ApiError extends Error {
   status: number;
   code?: string;
@@ -196,6 +206,21 @@ export const api = {
       return request<Deployment>(
         `/v1/projects/${encodeURIComponent(id)}/create_deployment`,
         { method: "POST", body }
+      );
+    },
+    async listEnvVars(id: string): Promise<EnvVar[]> {
+      const r = await request<{ configs: EnvVar[] }>(
+        `/v1/projects/${encodeURIComponent(id)}/list_default_environment_variables`
+      );
+      return r.configs ?? [];
+    },
+    updateEnvVars(
+      id: string,
+      changes: EnvVarChange[]
+    ): Promise<{ applied: number }> {
+      return request(
+        `/v1/projects/${encodeURIComponent(id)}/update_default_environment_variables`,
+        { method: "POST", body: { changes } }
       );
     },
   },

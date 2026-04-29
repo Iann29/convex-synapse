@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ApiError, api, type Deployment, type Project } from "@/lib/api";
 
 type Params = { team: string; project: string };
@@ -215,7 +216,10 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
         </div>
       )}
 
-      {/* TODO: settings page (rename / delete project, env vars). */}
+      <hr className="border-neutral-900" />
+      <EnvVarsPanel projectId={projectId} />
+
+      {/* TODO: settings page (rename / delete project). */}
 
       <Dialog open={open} onClose={() => setOpen(false)} title="Create deployment">
         <form onSubmit={create} className="space-y-4">
