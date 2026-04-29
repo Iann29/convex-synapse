@@ -52,6 +52,15 @@ export type EnvVarChange =
   | { op: "set"; name: string; value: string; deploymentTypes?: string[] }
   | { op: "delete"; name: string };
 
+export type PendingInvite = {
+  id: string;
+  email: string;
+  role: "admin" | "member";
+  token: string;
+  invitedBy: string;
+  createTime: string;
+};
+
 class ApiError extends Error {
   status: number;
   code?: string;
@@ -185,6 +194,34 @@ export const api = {
       return request(`/v1/teams/${encodeURIComponent(ref)}/create_project`, {
         method: "POST",
         body: { projectName: name },
+      });
+    },
+    invite(
+      ref: string,
+      email: string,
+      role: "admin" | "member" = "member"
+    ): Promise<{ inviteId: string; inviteToken: string; email: string; role: string }> {
+      return request(`/v1/teams/${encodeURIComponent(ref)}/invite_team_member`, {
+        method: "POST",
+        body: { email, role },
+      });
+    },
+    listInvites(ref: string): Promise<PendingInvite[]> {
+      return request<PendingInvite[]>(`/v1/teams/${encodeURIComponent(ref)}/invites`);
+    },
+    cancelInvite(ref: string, inviteId: string): Promise<void> {
+      return request<void>(
+        `/v1/teams/${encodeURIComponent(ref)}/invites/${encodeURIComponent(inviteId)}/cancel`,
+        { method: "POST", body: {} },
+      );
+    },
+  },
+
+  invites: {
+    accept(token: string): Promise<{ teamId: string; teamSlug: string; teamName: string; role: string }> {
+      return request("/v1/team_invites/accept", {
+        method: "POST",
+        body: { token },
       });
     },
   },
