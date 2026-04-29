@@ -3,8 +3,11 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -14,6 +17,12 @@ import (
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
 )
+
+// provisionTimeout caps how long the background goroutine waits for Docker.
+// Must be generous enough for cold image pulls on slow networks, but short
+// enough that a stuck pull eventually surfaces as a "failed" row instead of
+// a goroutine that lives forever.
+const provisionTimeout = 5 * time.Minute
 
 // Provisioner is the subset of the docker provisioner that the deployments
 // handler depends on. Pulled out behind an interface so tests can swap in a
@@ -100,7 +109,12 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	var d models.Deployment
 	var p models.Project
 	var t models.Team
-	var url, ref, creator *string
+	var url, ref, creator, containerID *string
+	var hostPort *int
+	// container_id and host_port are NULL while a deployment is still
+	// 'provisioning' (the goroutine fills them in once Provision succeeds);
+	// scanning straight into the non-pointer fields blows up on NULL, so
+	// we go through pointers and dereference defensively below.
 	err := db.QueryRow(ctx, `
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
@@ -115,7 +129,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	`, name).Scan(
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
-		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &d.HostPort, &d.ContainerID,
+		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID,
 		&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt,
 		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
 	)
@@ -130,6 +144,12 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	}
 	if creator != nil {
 		d.CreatorUserID = *creator
+	}
+	if containerID != nil {
+		d.ContainerID = *containerID
+	}
+	if hostPort != nil {
+		d.HostPort = *hostPort
 	}
 	p.TeamSlug = t.Slug
 	return &d, &p, &t, nil
@@ -287,42 +307,102 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Provisioning is sync for v0. The handler blocks until the container is
-	// running (or healthcheck times out at 60s). Async/queued provisioning
-	// is a v0.2 concern — keeps the API simple for now.
-	info, provErr := h.Docker.Provision(r.Context(), dockerprov.DeploymentSpec{
+	// Provisioning runs in the background so the handler returns instantly.
+	// We hand the goroutine its own context (the request context dies when
+	// we write the response below) with a generous deadline that covers a
+	// cold image pull on a slow link.
+	go h.provisionInBackground(d.ID, dockerprov.DeploymentSpec{
 		Name:                  name,
 		InstanceSecret:        instanceSecret,
 		HostPort:              port,
 		EnvVars:               map[string]string{},
 		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
 	})
+
+	// Return the row in 'provisioning' state. The dashboard polls and will
+	// flip to 'running' (or 'failed') when the goroutine updates the row.
+	writeJSON(w, http.StatusCreated, d)
+}
+
+// provisionInBackground runs Docker.Provision off the request goroutine and
+// reconciles the deployment row when it finishes. Errors are swallowed into
+// status="failed" + a slog event — there's no caller to return them to.
+//
+// Race with delete: a user can call /delete while we're mid-provision. We
+// detect that by re-reading status after Provision returns; if the row has
+// flipped to "deleted", we tear down whatever we just built.
+func (h *DeploymentsHandler) provisionInBackground(deploymentID string, spec dockerprov.DeploymentSpec) {
+	logger := slog.Default()
+	// Recover from panics in Docker SDK or our own code so a single bad
+	// deployment can't kill the process. The recovered row is marked
+	// 'failed' with a stack trace in the logs for forensics.
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("provision goroutine panicked",
+				"deployment_id", deploymentID,
+				"name", spec.Name,
+				"panic", rec,
+				"stack", string(debug.Stack()))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = h.DB.Exec(ctx, `
+				UPDATE deployments
+				   SET status = $1,
+				       last_deploy_at = now()
+				 WHERE id = $2
+			`, models.DeploymentStatusFailed, deploymentID)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
+	defer cancel()
+
+	info, provErr := h.Docker.Provision(ctx, spec)
 	if provErr != nil {
-		logErr("provision", provErr)
-		_, _ = h.DB.Exec(r.Context(),
-			`UPDATE deployments SET status = $1 WHERE id = $2`,
-			models.DeploymentStatusFailed, d.ID)
-		writeError(w, http.StatusInternalServerError, "provision_failed", provErr.Error())
+		logger.Error("provision failed",
+			"deployment_id", deploymentID, "name", spec.Name, "err", provErr)
+		_, dbErr := h.DB.Exec(ctx, `
+			UPDATE deployments
+			   SET status = $1,
+			       last_deploy_at = now()
+			 WHERE id = $2
+		`, models.DeploymentStatusFailed, deploymentID)
+		if dbErr != nil {
+			logger.Error("mark provision failed",
+				"deployment_id", deploymentID, "err", dbErr)
+		}
 		return
 	}
 
-	_, err = h.DB.Exec(r.Context(), `
+	// Atomically flip provisioning → running. The WHERE clause guards
+	// against a concurrent delete: if the row is already 'deleted', we
+	// don't resurrect it; instead we tear down the container we just made.
+	tag, err := h.DB.Exec(ctx, `
 		UPDATE deployments
 		   SET status = $1,
 		       container_id = $2,
-		       deployment_url = $3
+		       deployment_url = $3,
+		       last_deploy_at = now()
 		 WHERE id = $4
-	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL, d.ID)
+		   AND status = $5
+	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL,
+		deploymentID, models.DeploymentStatusProvisioning)
 	if err != nil {
-		logErr("update deployment", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Provision succeeded but persist failed")
+		logger.Error("mark provision running",
+			"deployment_id", deploymentID, "err", err)
 		return
 	}
-
-	d.Status = models.DeploymentStatusRunning
-	d.ContainerID = info.ContainerID
-	d.DeploymentURL = info.DeploymentURL
-	writeJSON(w, http.StatusCreated, d)
+	if tag.RowsAffected() == 0 {
+		// Either the row vanished or someone (delete handler) already
+		// flipped it to 'deleted'. Either way, our container is now an
+		// orphan — remove it.
+		logger.Warn("provision finished but row is no longer provisioning; cleaning up",
+			"deployment_id", deploymentID, "name", spec.Name)
+		if destroyErr := h.Docker.Destroy(ctx, spec.Name); destroyErr != nil {
+			logger.Error("orphan cleanup failed",
+				"deployment_id", deploymentID, "name", spec.Name, "err", destroyErr)
+		}
+	}
 }
 
 // ---------- GET /v1/projects/{id}/deployment ----------

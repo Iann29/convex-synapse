@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Iann29/synapse/internal/api"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/config"
@@ -54,6 +56,15 @@ func run() error {
 	}
 	defer pool.Close()
 	logger.Info("postgres connected")
+
+	// Sweep orphaned 'provisioning' rows. If the previous Synapse process
+	// crashed (or was SIGKILL'd) mid-provision, the goroutine that would
+	// have flipped status to 'running'/'failed' is gone, leaving the row
+	// stuck forever. 10 minutes is well past our 5-minute provision deadline,
+	// so anything older is unambiguously dead.
+	if err := sweepOrphanedProvisioning(rootCtx, pool, logger); err != nil {
+		logger.Error("orphan sweep failed", "err", err)
+	}
 
 	jwtIssuer := auth.NewJWTIssuer(cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 
@@ -107,5 +118,27 @@ func run() error {
 		return err
 	}
 	logger.Info("synapse stopped")
+	return nil
+}
+
+// sweepOrphanedProvisioning bumps any deployment row that's been stuck in
+// 'provisioning' for more than 10 minutes to 'failed'. This recovers from
+// crashes where the goroutine driving Provision dies before it can update
+// the row. Single SQL UPDATE — no Docker calls; the operator (or a future
+// reconciler) can decide whether the underlying container is salvageable.
+func sweepOrphanedProvisioning(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
+	tag, err := pool.Exec(ctx, `
+		UPDATE deployments
+		   SET status = 'failed',
+		       last_deploy_at = now()
+		 WHERE status = 'provisioning'
+		   AND created_at < now() - interval '10 minutes'
+	`)
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		logger.Warn("swept orphaned provisioning deployments", "count", n)
+	}
 	return nil
 }

@@ -4,11 +4,37 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
+
+	dockerprov "github.com/Iann29/synapse/internal/docker"
 )
 
 var errBoom = errors.New("simulated docker error")
+
+// waitForStatus polls the deployments table until the named row reaches the
+// expected status or the timeout elapses. The async tests use this to wait
+// for the provisioning goroutine to settle.
+func waitForStatus(t *testing.T, h *Harness, name, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		if err := h.DB.QueryRow(h.rootCtx,
+			`SELECT status FROM deployments WHERE name = $1`, name).Scan(&last); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if last == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("status of %q never became %q within %v (last seen: %q)", name, want, timeout, last)
+}
+
+// itoa is a tiny stand-in for strconv.Itoa to keep the call sites readable.
+func itoa(i int) string { return strconv.Itoa(i) }
 
 type deploymentResp struct {
 	ID             string     `json:"id"`
@@ -204,6 +230,142 @@ func TestDeployments_ListExcludesDeleted(t *testing.T) {
 		owner.AccessToken, nil, http.StatusNotFound)
 	if env.Code != "deployment_not_found" {
 		t.Errorf("got code %q want deployment_not_found", env.Code)
+	}
+}
+
+// TestDeployments_CreateReturnsImmediatelyAndProvisionsAsync covers the new
+// async contract: POST /create_deployment returns 201 the instant the row is
+// inserted (status="provisioning"), and FakeDocker.Provision is invoked
+// shortly after on a background goroutine.
+func TestDeployments_CreateReturnsImmediatelyAndProvisionsAsync(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Async Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "AsyncProj")
+
+	// Make Provision slow-ish so the response definitely beats it. If the
+	// handler were still synchronous, our 201 wouldn't arrive until after
+	// this sleep — which would fail the elapsed-time assertion below.
+	provisionDone := make(chan struct{})
+	h.Docker.ProvisionFn = func(_ context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+		defer close(provisionDone)
+		time.Sleep(150 * time.Millisecond)
+		return &dockerprov.DeploymentInfo{
+			ContainerID:   "fake-" + spec.Name,
+			HostPort:      spec.HostPort,
+			DeploymentURL: "http://127.0.0.1:" + itoa(spec.HostPort),
+		}, nil
+	}
+
+	start := time.Now()
+	var got deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]string{"type": "dev"}, http.StatusCreated, &got)
+	elapsed := time.Since(start)
+
+	if got.Status != "provisioning" {
+		t.Errorf("status: got %q want provisioning", got.Status)
+	}
+	if got.Name == "" {
+		t.Errorf("expected a generated name, got empty")
+	}
+	// Generous bound — request should return well before Provision finishes.
+	if elapsed >= 150*time.Millisecond {
+		t.Errorf("expected fast return; elapsed=%v (handler still sync?)", elapsed)
+	}
+
+	// Wait for the goroutine to call Provision.
+	select {
+	case <-provisionDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Provision was never called by the background goroutine")
+	}
+
+	// Now poll until the row flips to "running".
+	waitForStatus(t, h, got.Name, "running", 5*time.Second)
+
+	// FakeDocker recorded the call.
+	if len(h.Docker.Provisioned) != 1 || h.Docker.Provisioned[0].Name != got.Name {
+		t.Errorf("expected Provisioned([%s]), got %+v", got.Name, h.Docker.Provisioned)
+	}
+}
+
+// TestDeployments_CreateAsyncFailureMarksRowFailed covers the unhappy path:
+// FakeDocker returns an error from Provision, so the goroutine should
+// transition the row to "failed" (not leave it stuck in "provisioning").
+func TestDeployments_CreateAsyncFailureMarksRowFailed(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Fail Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "FailProj")
+
+	h.Docker.ProvisionFn = func(_ context.Context, _ dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+		return nil, errBoom
+	}
+
+	var got deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]string{"type": "dev"}, http.StatusCreated, &got)
+	if got.Status != "provisioning" {
+		t.Fatalf("status: got %q want provisioning (initial state)", got.Status)
+	}
+
+	waitForStatus(t, h, got.Name, "failed", 5*time.Second)
+
+	// last_deploy_at should be populated so the UI knows when we gave up.
+	var lastDeploy *time.Time
+	if err := h.DB.QueryRow(h.rootCtx,
+		`SELECT last_deploy_at FROM deployments WHERE name = $1`, got.Name).
+		Scan(&lastDeploy); err != nil {
+		t.Fatalf("read last_deploy_at: %v", err)
+	}
+	if lastDeploy == nil {
+		t.Errorf("expected last_deploy_at to be set on failed provision")
+	}
+}
+
+// TestDeployments_ListIncludesProvisioning ensures the row is visible in
+// list_deployments while still mid-provisioning. Without this, the dashboard
+// can't show the "provisioning..." badge while the goroutine is in flight.
+func TestDeployments_ListIncludesProvisioning(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Vis Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "VisProj")
+
+	// Block Provision so the row stays in "provisioning" for the duration
+	// of the assertions below. We unblock at the end so the goroutine can
+	// exit cleanly before the test (and its DB) tears down.
+	release := make(chan struct{})
+	h.Docker.ProvisionFn = func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &dockerprov.DeploymentInfo{
+			ContainerID:   "fake-" + spec.Name,
+			HostPort:      spec.HostPort,
+			DeploymentURL: "http://127.0.0.1:" + itoa(spec.HostPort),
+		}, nil
+	}
+	defer close(release)
+
+	var created deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]string{"type": "dev"}, http.StatusCreated, &created)
+
+	var listed []deploymentResp
+	h.DoJSON(http.MethodGet, "/v1/projects/"+proj.ID+"/list_deployments",
+		owner.AccessToken, nil, http.StatusOK, &listed)
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 deployment, got %d (%+v)", len(listed), listed)
+	}
+	if listed[0].Name != created.Name {
+		t.Errorf("listed name mismatch: got %q want %q", listed[0].Name, created.Name)
+	}
+	if listed[0].Status != "provisioning" {
+		t.Errorf("status: got %q want provisioning", listed[0].Status)
 	}
 }
 
