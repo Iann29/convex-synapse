@@ -19,6 +19,7 @@ import (
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/health"
+	"github.com/Iann29/synapse/internal/proxy"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -100,9 +101,26 @@ func run() error {
 		go worker.Run(rootCtx)
 	}
 
+	// Reverse-proxy mux: route /d/{name}/* to the proxy package, everything
+	// else to the API router. Mounting via http.NewServeMux keeps this
+	// composable without surgery on chi's tree.
+	var topHandler http.Handler = handler
+	if cfg.ProxyEnabled {
+		mux := http.NewServeMux()
+		resolver := &proxy.Resolver{
+			DB:            pool,
+			UseNetworkDNS: cfg.HealthcheckViaNetwork,
+			CacheTTL:      30 * time.Second,
+		}
+		mux.Handle("/d/", proxy.Handler(resolver, logger))
+		mux.Handle("/", handler)
+		topHandler = mux
+		logger.Info("reverse proxy enabled", "mount", "/d/")
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           handler,
+		Handler:           topHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

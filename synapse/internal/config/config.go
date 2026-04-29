@@ -47,6 +47,11 @@ type Config struct {
 	// Synapse runs on operator-controlled infra and every endpoint requires
 	// a bearer token anyway.
 	AllowedOrigins string
+
+	// ProxyEnabled mounts /d/{name}/* on the same listener that serves the
+	// API, forwarding to the deployment's internal address. Lets operators
+	// expose a single host port instead of one per deployment.
+	ProxyEnabled bool
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -104,6 +109,7 @@ func Load() (*Config, error) {
 		PortRangeMax:          portMax,
 		HealthcheckViaNetwork: getEnvDefault("SYNAPSE_HEALTHCHECK_VIA_NETWORK", "") == "true",
 		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
+		ProxyEnabled:          getEnvDefault("SYNAPSE_PROXY_ENABLED", "") == "true",
 	}, nil
 }
 
