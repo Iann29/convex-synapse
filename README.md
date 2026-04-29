@@ -37,7 +37,12 @@ Synapse fills that gap.
 
 ## Status
 
-🚧 **Early development.** See [docs/ROADMAP.md](docs/ROADMAP.md) for the build plan and current status.
+**v0.1 — runs end-to-end.** A `docker compose up -d` plus a register call
+gets you a control-plane API, a dashboard, and the ability to provision
+real Convex backend containers in about a second per deployment.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done, what's coming
+in v0.2, and what's deliberately out of scope.
 
 ## Repo layout
 
@@ -59,7 +64,13 @@ docker compose up -d
 
 ## License
 
-TBD (likely Apache-2.0 or MIT). The forked dashboard inherits Convex's [FSL-1.1-Apache-2.0](https://github.com/get-convex/convex-backend/blob/main/LICENSE) license; consult that for usage of the dashboard portion.
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+The dashboard component (`dashboard/`) is an original Next.js app that
+talks to Synapse's REST surface; it is not a fork of any Convex code, and
+also ships under Apache 2.0. (Reading the Convex Cloud dashboard
+[OpenAPI spec](https://github.com/get-convex/convex-backend/blob/main/npm-packages/dashboard/dashboard-management-openapi.json)
+to design a compatible API is fair use; we ship no code from that repo.)
 
 ## Why "Synapse"?
 
