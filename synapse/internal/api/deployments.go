@@ -51,6 +51,7 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Get("/", h.getDeployment)
 		r.Post("/delete", h.deleteDeployment)
 		r.Get("/auth", h.deploymentAuth)
+		r.Get("/cli_credentials", h.deploymentCLICredentials)
 		r.Post("/create_deploy_key", h.createDeployKey)
 	})
 	return r
@@ -570,6 +571,62 @@ func (h *DeploymentsHandler) deploymentAuth(w http.ResponseWriter, r *http.Reque
 		AdminKey:       d.AdminKey,
 		DeploymentType: d.DeploymentType,
 	})
+}
+
+// ---------- GET /v1/deployments/{name}/cli_credentials ----------
+//
+// Returns the env-var pair that `npx convex` looks for when running against a
+// self-hosted backend (see CONVEX_SELF_HOSTED_URL_VAR_NAME and
+// CONVEX_SELF_HOSTED_ADMIN_KEY_VAR_NAME in the Convex CLI's
+// `lib/utils/utils.ts`). The CLI's deployment-selection code (in
+// `lib/deploymentSelection.ts`) treats the presence of *both* vars as the
+// "selfHosted" path: it skips Big Brain and talks straight to deploymentUrl.
+//
+// We also return a copy-paste shell snippet so the dashboard can show one
+// code block instead of forcing the user to assemble the export lines from
+// two fields.
+//
+// Intentionally a member-level endpoint (same gate as /auth) — anyone who
+// can launch the standalone Convex dashboard against a deployment can also
+// use the CLI against it.
+
+type cliCredentialsResp struct {
+	DeploymentName string `json:"deploymentName"`
+	ConvexURL      string `json:"convexUrl"`
+	AdminKey       string `json:"adminKey"`
+	// ExportSnippet is a shell-pasteable string that sets both env vars at
+	// once. Built server-side so the dashboard doesn't have to hand-roll the
+	// formatting (and so any future change to the env-var names is owned by
+	// one file).
+	ExportSnippet string `json:"exportSnippet"`
+}
+
+func (h *DeploymentsHandler) deploymentCLICredentials(w http.ResponseWriter, r *http.Request) {
+	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	snippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(d.DeploymentURL) + "\n" +
+		"export CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(d.AdminKey)
+	writeJSON(w, http.StatusOK, cliCredentialsResp{
+		DeploymentName: d.Name,
+		ConvexURL:      d.DeploymentURL,
+		AdminKey:       d.AdminKey,
+		ExportSnippet:  snippet,
+	})
+}
+
+// shellQuote produces a single-quoted POSIX shell literal that survives
+// values containing spaces, '$', or other metacharacters. A naked admin key
+// is hex-only today, but quoting future-proofs against that ever changing
+// (e.g. once Synapse derives a real backend admin key like
+// "prod:happy-cat-1234|abc:def…").
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	// Replace each ' with '\'' (close, escaped quote, reopen).
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ---------- POST /v1/deployments/{name}/create_deploy_key ----------

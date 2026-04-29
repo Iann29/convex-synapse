@@ -91,22 +91,49 @@ curl -sf -X POST http://localhost:8080/v1/projects/$PID/create_deployment \
 docker ps --filter label=synapse.managed=true
 ```
 
-## Pointing `npx convex` at a Synapse-managed deployment
+## Using `npx convex` with a Synapse-managed deployment
 
-After `create_deployment`, the response includes a `name` and the dashboard's
-**Open** button knows the URL + admin key. To use the Convex CLI:
+The Convex CLI's self-hosted mode looks for two env vars:
+`CONVEX_SELF_HOSTED_URL` and `CONVEX_SELF_HOSTED_ADMIN_KEY`. When both are
+set (and `CONVEX_DEPLOYMENT` is **not**), the CLI skips Big Brain and talks
+straight to the deployment.
+
+Synapse exposes the matching env-var pair on a single endpoint:
 
 ```bash
-# Get the credentials
-curl -sf http://localhost:8080/v1/deployments/<NAME>/auth \
-  -H "Authorization: Bearer $A"
-# → {deploymentName, deploymentUrl, adminKey, deploymentType}
+# Grab + apply the credentials in one shot
+eval "$(curl -sf http://localhost:8080/v1/deployments/<NAME>/cli_credentials \
+        -H "Authorization: Bearer $A" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["exportSnippet"])')"
 
-# Point the CLI at it
-export CONVEX_URL=<deploymentUrl>
-export CONVEX_DEPLOY_KEY=<adminKey>     # for now — proper deploy keys are v0.2
-npx convex dev
+# Push code, run a function, deploy — all against the Synapse container
+npx convex dev --once
+npx convex deploy
 ```
+
+Full end-to-end:
+
+```bash
+# 1. (Already done above) Provision a deployment via Synapse
+NAME=$(curl -sf http://localhost:8080/v1/projects/$PID/deployment \
+        -H "Authorization: Bearer $A" \
+       | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+
+# 2. Bootstrap a sample app
+mkdir my-test-app && cd my-test-app
+npx create-convex@latest .
+
+# 3. Pull credentials & run the CLI
+eval "$(curl -sf http://localhost:8080/v1/deployments/$NAME/cli_credentials \
+        -H "Authorization: Bearer $A" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["exportSnippet"])')"
+npx convex dev --once
+```
+
+A `<CliCredentialsPanel>` React component
+(`dashboard/components/CliCredentialsPanel.tsx`) renders the same snippet
+inline with a one-click copy button — drop it next to a deployment row and
+the user gets the export lines without ever touching `curl`.
 
 ## Tearing it down
 

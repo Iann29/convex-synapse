@@ -42,6 +42,17 @@ export type DeploymentAuth = {
   deploymentUrl: string;
 };
 
+// Returned by GET /v1/deployments/{name}/cli_credentials. The CLI consumes
+// CONVEX_SELF_HOSTED_URL + CONVEX_SELF_HOSTED_ADMIN_KEY (see Convex CLI's
+// `lib/utils/utils.ts`); `exportSnippet` is a copy-paste shell line that sets
+// both at once.
+export type CliCredentials = {
+  deploymentName: string;
+  convexUrl: string;
+  adminKey: string;
+  exportSnippet: string;
+};
+
 export type EnvVar = {
   name: string;
   value: string;
@@ -307,6 +318,13 @@ export const api = {
     auth(name: string): Promise<DeploymentAuth> {
       return request<DeploymentAuth>(
         `/v1/deployments/${encodeURIComponent(name)}/auth`
+      );
+    },
+    // Same auth gate as `auth`, but shaped for `npx convex` consumption: the
+    // env-var pair the CLI looks for plus a copy-paste shell snippet.
+    cliCredentials(name: string): Promise<CliCredentials> {
+      return request<CliCredentials>(
+        `/v1/deployments/${encodeURIComponent(name)}/cli_credentials`
       );
     },
     delete(name: string): Promise<void> {

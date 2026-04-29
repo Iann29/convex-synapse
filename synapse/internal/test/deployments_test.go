@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +144,94 @@ func TestDeployments_AuthNonMember403(t *testing.T) {
 
 	h.AssertStatus(http.MethodGet, "/v1/deployments/stranger-owl-7777/auth",
 		stranger.AccessToken, nil, http.StatusForbidden)
+}
+
+// cliCredentialsResp mirrors the JSON shape returned by
+// GET /v1/deployments/{name}/cli_credentials. Decoded with
+// DisallowUnknownFields so any drift in the handler payload fails loudly.
+type cliCredentialsResp struct {
+	DeploymentName string `json:"deploymentName"`
+	ConvexURL      string `json:"convexUrl"`
+	AdminKey       string `json:"adminKey"`
+	ExportSnippet  string `json:"exportSnippet"`
+}
+
+func TestDeployments_CLICredentialsReturnsExportSnippet(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLI Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "CLIProj")
+	h.SeedDeployment(proj.ID, "cli-rabbit-1234", "prod", "running", true, owner.ID, 3220, "admin-key-abc")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-rabbit-1234/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	if got.DeploymentName != "cli-rabbit-1234" {
+		t.Errorf("deployment name: got %q want cli-rabbit-1234", got.DeploymentName)
+	}
+	if got.AdminKey != "admin-key-abc" {
+		t.Errorf("admin key: got %q want admin-key-abc", got.AdminKey)
+	}
+	if got.ConvexURL == "" {
+		t.Errorf("expected convex URL")
+	}
+
+	// Snippet must contain BOTH env-var names so a copy-paste sets the
+	// CLI up correctly. We don't pin the exact line ordering, but both
+	// must appear and must reference the actual values.
+	if !strings.Contains(got.ExportSnippet, "CONVEX_SELF_HOSTED_URL") {
+		t.Errorf("snippet missing CONVEX_SELF_HOSTED_URL: %q", got.ExportSnippet)
+	}
+	if !strings.Contains(got.ExportSnippet, "CONVEX_SELF_HOSTED_ADMIN_KEY") {
+		t.Errorf("snippet missing CONVEX_SELF_HOSTED_ADMIN_KEY: %q", got.ExportSnippet)
+	}
+	if !strings.Contains(got.ExportSnippet, "admin-key-abc") {
+		t.Errorf("snippet missing admin key value: %q", got.ExportSnippet)
+	}
+	if !strings.Contains(got.ExportSnippet, got.ConvexURL) {
+		t.Errorf("snippet missing convex URL %q: %q", got.ConvexURL, got.ExportSnippet)
+	}
+}
+
+func TestDeployments_CLICredentialsAnonymous401(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIAnon Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	h.SeedDeployment(proj.ID, "cli-anon-2222", "dev", "running", true, owner.ID, 3221, "")
+
+	// No bearer at all → 401 from the auth middleware.
+	env := h.AssertStatus(http.MethodGet, "/v1/deployments/cli-anon-2222/cli_credentials",
+		"", nil, http.StatusUnauthorized)
+	if env.Code == "" {
+		t.Errorf("expected error code on 401, got empty envelope")
+	}
+}
+
+func TestDeployments_CLICredentialsNonMember403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	stranger := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIStranger Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	h.SeedDeployment(proj.ID, "cli-stranger-3333", "dev", "running", false, owner.ID, 3222, "")
+
+	env := h.AssertStatus(http.MethodGet, "/v1/deployments/cli-stranger-3333/cli_credentials",
+		stranger.AccessToken, nil, http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("got code %q want forbidden", env.Code)
+	}
+}
+
+func TestDeployments_CLICredentialsUnknown404(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	env := h.AssertStatus(http.MethodGet, "/v1/deployments/no-such-name/cli_credentials",
+		owner.AccessToken, nil, http.StatusNotFound)
+	if env.Code != "deployment_not_found" {
+		t.Errorf("got code %q want deployment_not_found", env.Code)
+	}
 }
 
 func TestDeployments_DeleteMarksRowDeletedAndCallsDocker(t *testing.T) {

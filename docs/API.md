@@ -124,6 +124,40 @@ Returns `{deploymentName, deploymentUrl, adminKey, deploymentType}`. The
 dashboard calls this when the user clicks **Open** to launch the standalone
 Convex dashboard against this deployment.
 
+### `GET /v1/deployments/{name}/cli_credentials` 🔧 (members only)
+
+Returns the env-var pair the [Convex CLI](https://www.npmjs.com/package/convex)
+looks for when running against a self-hosted backend, plus a copy-pastable
+shell snippet that sets both at once:
+
+```json
+{
+  "deploymentName": "happy-cat-1234",
+  "convexUrl": "http://127.0.0.1:3211",
+  "adminKey": "…",
+  "exportSnippet": "export CONVEX_SELF_HOSTED_URL='http://127.0.0.1:3211'\nexport CONVEX_SELF_HOSTED_ADMIN_KEY='…'"
+}
+```
+
+The CLI's deployment-selection logic (in
+[`lib/deploymentSelection.ts`](https://github.com/get-convex/convex-backend/blob/main/npm-packages/convex/src/cli/lib/deploymentSelection.ts))
+treats the presence of both `CONVEX_SELF_HOSTED_URL` and
+`CONVEX_SELF_HOSTED_ADMIN_KEY` as the "selfHosted" path and skips Big Brain
+entirely. `CONVEX_DEPLOYMENT` must NOT also be set in that mode.
+
+Quickstart:
+
+```bash
+# Get credentials for a deployment (JWT or PAT both work)
+eval "$(curl -sf http://localhost:8080/v1/deployments/<NAME>/cli_credentials \
+        -H "Authorization: Bearer $TOKEN" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["exportSnippet"])')"
+
+# Now the CLI talks straight to the Synapse-managed backend container
+npx convex dev --once
+npx convex deploy
+```
+
 ### `POST /v1/deployments/{name}/create_deploy_key` ✅ (admins only)
 
 Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
