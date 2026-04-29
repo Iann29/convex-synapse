@@ -9,6 +9,20 @@ jobs:
   synapse:
     name: synapse (Go)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: synapse
+          POSTGRES_PASSWORD: synapse
+          POSTGRES_DB: synapse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U synapse"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: synapse
@@ -20,7 +34,10 @@ jobs:
           cache-dependency-path: synapse/go.sum
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - name: Test
+        env:
+          SYNAPSE_TEST_DB_URL: postgres://synapse:synapse@localhost:5432/synapse?sslmode=disable
+        run: go test ./... -count=1
 
   dashboard:
     name: dashboard (Next.js)
