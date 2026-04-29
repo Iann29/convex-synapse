@@ -9,8 +9,8 @@ endpoint with a smaller payload).
 All authenticated endpoints expect `Authorization: Bearer <token>` where the
 token is either:
 - A JWT issued by `/v1/auth/login` (15-minute lifetime by default), or
-- A `syn_*` opaque personal-access token (created via the dashboard or, in
-  v0.2+, via `/v1/create_personal_access_token`).
+- A `syn_*` opaque personal-access token (created via the dashboard's
+  `/me` page or via `POST /v1/create_personal_access_token` — see below).
 
 ## Health
 
@@ -127,6 +127,87 @@ Convex dashboard against this deployment.
 ### `POST /v1/deployments/{name}/create_deploy_key` ✅ (admins only)
 
 Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
+
+## Personal access tokens
+
+User-scoped opaque tokens for CLI / CI / programmatic access. The plaintext
+token is shown ONCE at creation; the server stores only its SHA-256 hash
+and cannot recover the original. All three endpoints require an
+authenticated caller (JWT or a previously-issued PAT) and only operate on
+tokens belonging to the caller.
+
+### `POST /v1/create_personal_access_token` ✅
+
+Body:
+
+```json
+{
+  "name": "ci-runner",
+  "scope": "user",
+  "scopeId": null,
+  "expiresAt": null
+}
+```
+
+- `name` (required) — short label, ≤100 chars.
+- `scope` (default `"user"`) — one of `user`, `team`, `project`, `deployment`.
+- `scopeId` — required when `scope` is not `"user"`; the UUID of the
+  team/project/deployment the token is bound to.
+- `expiresAt` — optional ISO-8601 timestamp; must be in the future. Omit
+  for a non-expiring token.
+
+Response (201):
+
+```json
+{
+  "token": "syn_abc123…",
+  "accessToken": {
+    "id": "…",
+    "name": "ci-runner",
+    "scope": "user",
+    "createTime": "2026-04-29T12:00:00Z"
+  }
+}
+```
+
+The plaintext `token` is the value to send as `Authorization: Bearer …`
+on subsequent requests. Save it immediately — it is never returned again.
+
+### `GET /v1/list_personal_access_tokens` ✅
+
+Lists tokens belonging to the caller, newest first.
+
+Query params:
+- `limit` (default 50, max 200) — page size.
+- `cursor` — opaque continuation token returned as `nextCursor` from the
+  previous page. Must refer to a token the caller owns.
+
+Response (200):
+
+```json
+{
+  "items": [
+    {
+      "id": "…",
+      "name": "ci-runner",
+      "scope": "user",
+      "createTime": "2026-04-29T12:00:00Z",
+      "lastUsedAt": "2026-04-29T12:05:00Z"
+    }
+  ],
+  "nextCursor": "…"
+}
+```
+
+`nextCursor` is omitted on the last page. Token hashes and plaintext
+tokens are NEVER included.
+
+### `POST /v1/delete_personal_access_token` ✅
+
+Body: `{"id": "<token-uuid>"}`. Hard-deletes the token if it belongs to
+the caller. Returns `{"id": "…"}` on success, `404 token_not_found`
+otherwise. Subsequent auth attempts with that token will be rejected by
+the auth middleware.
 
 ## Errors
 

@@ -61,6 +61,33 @@ export type PendingInvite = {
   createTime: string;
 };
 
+export type AccessToken = {
+  id: string;
+  name: string;
+  scope: "user" | "team" | "project" | "deployment";
+  scopeId?: string;
+  createTime: string;
+  expiresAt?: string;
+  lastUsedAt?: string;
+};
+
+export type CreateTokenResponse = {
+  // Plaintext "syn_*" string — shown ONCE at creation; never returned again.
+  token: string;
+  accessToken: AccessToken;
+};
+
+export type CreateTokenOpts = {
+  scope?: AccessToken["scope"];
+  scopeId?: string;
+  expiresAt?: string;
+};
+
+export type ListTokensResponse = {
+  items: AccessToken[];
+  nextCursor?: string;
+};
+
 class ApiError extends Error {
   status: number;
   code?: string;
@@ -286,6 +313,33 @@ export const api = {
       return request<void>(`/v1/deployments/${encodeURIComponent(name)}/delete`, {
         method: "POST",
         body: {},
+      });
+    },
+  },
+
+  // Personal access tokens. The plaintext token comes back ONCE in `create()` —
+  // callers must surface it to the user immediately and stash it; the server
+  // only stores a SHA-256 hash and can never recover the original.
+  tokens: {
+    create(name: string, opts: CreateTokenOpts = {}): Promise<CreateTokenResponse> {
+      return request<CreateTokenResponse>("/v1/create_personal_access_token", {
+        method: "POST",
+        body: { name, ...opts },
+      });
+    },
+    list(opts: { cursor?: string; limit?: number } = {}): Promise<ListTokensResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListTokensResponse>(
+        `/v1/list_personal_access_tokens${qs ? `?${qs}` : ""}`,
+      );
+    },
+    delete(id: string): Promise<{ id: string }> {
+      return request<{ id: string }>("/v1/delete_personal_access_token", {
+        method: "POST",
+        body: { id },
       });
     },
   },

@@ -40,10 +40,11 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(middleware.RequestLogger(d.Logger))
 	r.Use(middleware.CORS(d.AllowedOrigins))
 	r.Use(chimw.Recoverer)
-	// 90s accommodates the slowest endpoint we have today: create_deployment,
-	// which blocks on docker pull + container start + healthcheck. When we
-	// move to async provisioning (v0.2) this can drop back to 30s.
-	r.Use(chimw.Timeout(90 * time.Second))
+	// 30s is plenty now that create_deployment is async — it returns 201 the
+	// moment the row is inserted, and the docker pull/start/healthcheck runs
+	// in a background goroutine. No request handler should hold a connection
+	// longer than this; anything that does is a bug.
+	r.Use(chimw.Timeout(30 * time.Second))
 
 	r.Method(http.MethodGet, "/health", &HealthHandler{DB: d.DB, Version: d.Version})
 
@@ -51,6 +52,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	meH := &MeHandler{DB: d.DB}
 	teamsH := &TeamsHandler{DB: d.DB}
 	invitesH := &InvitesHandler{DB: d.DB}
+	tokensH := &AccessTokensHandler{DB: d.DB}
 	deploymentsH := &DeploymentsHandler{
 		DB:                    d.DB,
 		Docker:                d.Docker,
@@ -78,6 +80,10 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/projects", projectsH.Routes())
 			r.Mount("/deployments", deploymentsH.Routes())
 			r.Mount("/team_invites", invitesH.Routes())
+			// Personal access tokens — flat verb-suffixed endpoints under /v1.
+			// Registered directly (not via Mount) because chi's Mount("/", ...)
+			// collides with the existing GET /v1/ index handler above.
+			tokensH.Register(r)
 		})
 	})
 

@@ -30,7 +30,16 @@ export function Header() {
         </Link>
         {user && (
           <div className="flex items-center gap-3 text-xs text-neutral-400">
-            <span>{user.email}</span>
+            {/* The email doubles as the link to /me — the most discoverable
+                spot for "where do I manage my account?" without adding a
+                second nav item. */}
+            <Link
+              href="/me"
+              className="text-neutral-300 hover:text-neutral-100"
+              aria-label="Account"
+            >
+              {user.email}
+            </Link>
             <Button variant="ghost" size="sm" onClick={logout}>
               Logout
             </Button>
