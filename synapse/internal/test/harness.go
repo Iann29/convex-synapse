@@ -355,9 +355,10 @@ func randHex(n int) string {
 // It records calls so tests can assert on what the handler did, and lets each
 // test override behavior (e.g. force Provision to fail).
 type FakeDocker struct {
-	ProvisionFn func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
-	DestroyFn   func(ctx context.Context, name string) error
-	StatusFn    func(ctx context.Context, name string) (string, error)
+	ProvisionFn        func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
+	DestroyFn          func(ctx context.Context, name string) error
+	StatusFn           func(ctx context.Context, name string) (string, error)
+	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 
 	Provisioned []dockerprov.DeploymentSpec
 	Destroyed   []string
@@ -392,6 +393,15 @@ func (f *FakeDocker) Status(ctx context.Context, name string) (string, error) {
 		return f.StatusFn(ctx, name)
 	}
 	return "running", nil
+}
+
+// GenerateAdminKey: tests can override; default returns a deterministic
+// placeholder that's enough for code that just persists & echoes the value.
+func (f *FakeDocker) GenerateAdminKey(ctx context.Context, name, secret string) (string, error) {
+	if f.GenerateAdminKeyFn != nil {
+		return f.GenerateAdminKeyFn(ctx, name, secret)
+	}
+	return "fake-admin-key-" + name, nil
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising

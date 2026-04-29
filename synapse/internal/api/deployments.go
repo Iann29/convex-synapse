@@ -26,12 +26,17 @@ const provisionTimeout = 5 * time.Minute
 
 // Provisioner is the subset of the docker provisioner that the deployments
 // handler depends on. Pulled out behind an interface so tests can swap in a
-// fake without spinning up a real Docker daemon. *dockerprov.Client implements
-// this (Provision/Destroy/Status), so production wiring is unchanged.
+// fake without spinning up a real Docker daemon. *dockerprov.Client
+// implements all four methods, so production wiring is unchanged.
 type Provisioner interface {
 	Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	Destroy(ctx context.Context, deploymentName string) error
 	Status(ctx context.Context, deploymentName string) (string, error)
+	// GenerateAdminKey runs the convex-backend's `generate_key` binary in a
+	// throwaway container so the resulting key passes the running container's
+	// `/api/check_admin_key` validation. Random hex strings are rejected by
+	// the keybroker which signs admin keys with INSTANCE_SECRET.
+	GenerateAdminKey(ctx context.Context, instanceName, instanceSecret string) (string, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -273,8 +278,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
 		return
 	}
-	adminKey, err := dockerprov.RandomHex(32)
+	// Admin key MUST be derived from the instance secret via the convex
+	// backend's signer — random hex would be rejected by /api/check_admin_key.
+	adminKey, err := h.Docker.GenerateAdminKey(r.Context(), name, instanceSecret)
 	if err != nil {
+		logErr("generate admin key", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate admin key")
 		return
 	}
