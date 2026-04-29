@@ -10,6 +10,7 @@ import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ApiError, api, type Deployment, type Project } from "@/lib/api";
 
@@ -332,6 +333,9 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                     </Button>
                   </div>
                 </CardBody>
+                <div className="border-t border-neutral-900 px-5 py-3">
+                  <CliCredentialsPanel deploymentName={d.name} />
+                </div>
               </Card>
             );
           })}
