@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Header } from "@/components/Header";
+import { TopBar } from "@/components/TopBar";
 import { getAccessToken } from "@/lib/auth";
 
 export default function MeLayout({ children }: { children: React.ReactNode }) {
@@ -31,8 +31,8 @@ export default function MeLayout({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="min-h-screen">
-      <Header />
-      <main className="mx-auto max-w-3xl px-4 py-8">{children}</main>
+      <TopBar />
+      <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">{children}</main>
     </div>
   );
 }

@@ -14,6 +14,15 @@ export type Team = {
   createdAt?: string;
 };
 
+export type TeamMember = {
+  id: string;
+  teamId: string;
+  email: string;
+  name: string;
+  role: "admin" | "member";
+  createTime: string;
+};
+
 export type Project = {
   id: string;
   teamId: string;
@@ -224,6 +233,17 @@ export const api = {
         `/v1/teams/${encodeURIComponent(ref)}/list_projects`
       );
       return Array.isArray(r) ? r : r.projects ?? [];
+    },
+    async listDeployments(ref: string): Promise<Deployment[]> {
+      // Team-scoped flat list across every project — used by the home view's
+      // "Deployments" tab. Mirrors per-project list_deployments shape.
+      const r = await request<Deployment[] | { deployments: Deployment[] }>(
+        `/v1/teams/${encodeURIComponent(ref)}/list_deployments`
+      );
+      return Array.isArray(r) ? r : r.deployments ?? [];
+    },
+    listMembers(ref: string): Promise<TeamMember[]> {
+      return request<TeamMember[]>(`/v1/teams/${encodeURIComponent(ref)}/list_members`);
     },
     createProject(
       ref: string,
