@@ -4,17 +4,20 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/middleware"
 )
 
 type RouterDeps struct {
 	Logger  *slog.Logger
 	DB      *pgxpool.Pool
+	JWT     *auth.JWTIssuer
 	Version string
 }
 
@@ -28,14 +31,27 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(chimw.RealIP)
 	r.Use(middleware.RequestLogger(d.Logger))
 	r.Use(chimw.Recoverer)
-	r.Use(chimw.Timeout(30_000_000_000)) // 30s
+	r.Use(chimw.Timeout(30 * time.Second))
 
 	r.Method(http.MethodGet, "/health", &HealthHandler{DB: d.DB, Version: d.Version})
 
+	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
+	meH := &MeHandler{DB: d.DB}
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"name":"synapse","api":"v1","status":"placeholder"}`))
+			writeJSON(w, http.StatusOK, map[string]string{"name": "synapse", "api": "v1"})
+		})
+
+		// Public.
+		r.Mount("/auth", authH.Routes())
+
+		// Authenticated.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Authenticator(d.JWT, d.DB))
+
+			r.Mount("/me", meH.Routes())
+			r.Mount("/profile", meH.Routes()) // alias for cloud-dashboard parity
 		})
 	})
 

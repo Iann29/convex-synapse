@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Iann29/synapse/internal/api"
+	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/config"
 	"github.com/Iann29/synapse/internal/db"
 )
@@ -53,9 +54,12 @@ func run() error {
 	defer pool.Close()
 	logger.Info("postgres connected")
 
+	jwtIssuer := auth.NewJWTIssuer(cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
+
 	handler := api.NewRouter(api.RouterDeps{
 		Logger:  logger,
 		DB:      pool,
+		JWT:     jwtIssuer,
 		Version: Version,
 	})
 
