@@ -18,6 +18,7 @@ import (
 	"github.com/Iann29/synapse/internal/config"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
+	"github.com/Iann29/synapse/internal/health"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -84,6 +85,20 @@ func run() error {
 		AllowedOrigins:        cfg.AllowedOrigins,
 		Version:               Version,
 	})
+
+	// Health worker — periodic reconciler that flips deployment rows to
+	// 'stopped' / 'failed' when the underlying Docker container has gone
+	// missing. Skipped if no Docker daemon was reachable at startup; the
+	// API still works for read-only / metadata operations in that case.
+	if dockerClient != nil {
+		worker := &health.Worker{
+			DB:     pool,
+			Docker: dockerClient,
+			Config: health.Config{Interval: 30 * time.Second, StatusTimeout: 5 * time.Second},
+			Logger: logger,
+		}
+		go worker.Run(rootCtx)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

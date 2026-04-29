@@ -501,6 +501,26 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Race with the async provisioner: if the row is still 'provisioning',
+	// the goroutine in provisionInBackground may be mid-Provision (creating
+	// container + volume right now). Calling Destroy here would race the
+	// volume mount and emit "volume in use" errors. Instead, just flip the
+	// row to 'deleted' — the provisioning goroutine re-reads status after
+	// Provision and tears down whatever it built when it sees the change.
+	if d.Status == models.DeploymentStatusProvisioning {
+		if _, err := h.DB.Exec(r.Context(), `
+			UPDATE deployments
+			   SET status = 'deleted'
+			 WHERE id = $1
+		`, d.ID); err != nil {
+			logErr("mark provisioning row deleted", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Database error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"name": d.Name, "status": "deleted"})
+		return
+	}
+
 	// Tear down the container/volume first; if that fails, leave the row
 	// alone so the operator can retry. A successful Destroy is idempotent.
 	if err := h.Docker.Destroy(r.Context(), d.Name); err != nil {
