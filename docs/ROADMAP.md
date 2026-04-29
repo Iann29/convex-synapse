@@ -1,6 +1,6 @@
 # Roadmap
 
-## v0.1 — "It runs end-to-end" ✅ MOSTLY DONE
+## v0.1 — "It runs end-to-end" ✅ DONE
 
 Getting a fresh user from `git clone` to a running Convex backend container
 provisioned via the dashboard.
@@ -15,7 +15,7 @@ provisioned via the dashboard.
 - [x] Deployments API: create (with provisioning), list, get, delete, deploy keys, auth
 - [x] Dashboard scaffold (Next.js + Tailwind)
 - [x] docker-compose.yml: postgres + synapse + dashboard
-- [x] Playwright e2e tests through the full compose stack (11 tests, ~35s)
+- [x] Playwright e2e tests through the full compose stack (12 tests, ~21s)
 - [x] Dashboard delete-deployment / delete-project / rename-project actions
 - [x] Dashboard env-vars CRUD panel
 - [x] Dashboard invites panel + /accept-invite page (multi-user e2e)
@@ -25,12 +25,13 @@ provisioned via the dashboard.
 - [x] CI: Go build/vet/test + Next.js build + compose build + Playwright e2e
 - [ ] QUICKSTART verified end-to-end on a fresh machine
 
-## v0.2 — "It's nice"
+## v0.2 — "It's nice" ✅ MOSTLY DONE
 
 - [x] Personal access tokens (`POST /v1/create_personal_access_token`) + dashboard `/me`
 - [x] Health monitoring worker — reconciles `deployments.status` with Docker reality every 30s
-- [x] Real Go test suite (44+ integration tests via httptest + a fresh postgres per test)
-- [~] Async provisioning (background goroutine + status polling) — agent in flight
+- [x] Real Go test suite (68 test functions, ~7s, postgres testcontainer)
+- [x] Async provisioning (returns 201 immediately; goroutine + 5min timeout + panic recovery + orphan-row sweep at startup)
+- [x] Delete during provisioning is race-free (handler trusts the goroutine for cleanup)
 - [ ] `npx convex` CLI compatibility (auth flow, deploy keys)
 - [ ] Reverse proxy mode so deployments don't need exposed host ports
 - [ ] Auto-restart for `failed`/`stopped` deployments (manual recovery only in v0.2)
@@ -78,7 +79,8 @@ OpenAPI v1 endpoint coverage today:
 | Teams | ~80% — no SSO, no billing endpoints |
 | Projects | ~70% — no preview deploy keys, no transfer |
 | Deployments | ~60% — no transfer, no custom domains, no patch |
-| Personal access tokens | 🚧 v0.2 |
+| Personal access tokens | ✅ create / list / delete |
+| Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |
 | Cloud backups | ❌ v1.0 |
 
 The dashboard fork (when complete) covers data, functions, logs, schedules,
