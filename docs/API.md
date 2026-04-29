@@ -80,14 +80,37 @@ Body: `{changes: [{op:"set"|"delete", name, value?, deploymentTypes?}]}`.
 
 ## Deployments
 
-🚧 **Pending implementation in v0.1**. Endpoints will mirror:
+### `POST /v1/projects/{id}/create_deployment` ✅ (admins only)
 
-- `POST /v1/projects/{id}/create_deployment`
-- `GET /v1/projects/{id}/deployment` (lookup by reference / defaultProd / defaultDev)
-- `GET /v1/deployments/{name}`
-- `PATCH /v1/deployments/{name}`
-- `POST /v1/deployments/{name}/delete`
-- `POST /v1/deployments/{name}/create_deploy_key`
+Body: `{type:"dev"|"prod"|"preview"|"custom", reference?, isDefault?}`.
+Allocates a name, picks a free host port from the configured range,
+provisions a Convex backend container via Docker, and returns the
+`Deployment` row once `/version` responds (or after a 60s healthcheck
+warning, whichever comes first).
+
+### `GET /v1/projects/{id}/deployment` ✅
+
+Find one deployment in this project. Query params:
+- `reference=<string>` — match by `reference` field
+- `defaultProd=true` — most recent production deployment marked default
+- `defaultDev=true` — same for dev
+
+Without query params, returns the newest non-deleted deployment.
+
+### `GET /v1/deployments/{name}` ✅
+### `POST /v1/deployments/{name}/delete` ✅ (admins only)
+
+Stops + removes the container, drops its data volume, marks the row deleted.
+
+### `GET /v1/deployments/{name}/auth` 🔧 (members only)
+
+Returns `{deploymentName, deploymentUrl, adminKey, deploymentType}`. The
+dashboard calls this when the user clicks **Open** to launch the standalone
+Convex dashboard against this deployment.
+
+### `POST /v1/deployments/{name}/create_deploy_key` ✅ (admins only)
+
+Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
 
 ## Errors
 

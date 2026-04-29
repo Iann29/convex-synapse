@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Synapse dashboard
 
-## Getting Started
+Minimal management UI for [Synapse](../README.md) — the open-source control
+plane for self-hosted Convex deployments. Once you have a deployment, this
+dashboard hands you off to the standard self-hosted Convex dashboard for
+data/functions/logs.
 
-First, run the development server:
+## Stack
+
+- Next.js 16 + App Router + TypeScript
+- Tailwind CSS 4
+- SWR for data fetching
+- Hand-rolled shadcn-style primitives (button, card, input, dialog, badge)
+- JWT in localStorage (no auth library)
+
+## Getting started
 
 ```bash
+# from this directory
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Visit http://localhost:3000.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Default | What it does |
+|---|---|---|
+| `NEXT_PUBLIC_SYNAPSE_URL` | `http://localhost:8080` | Synapse backend base URL |
+| `NEXT_PUBLIC_CONVEX_DASHBOARD_URL` | `http://localhost:6791` | Self-hosted Convex dashboard URL (used for the "Open dashboard" button) |
 
-## Learn More
+Set them in `.env.local`. They must be `NEXT_PUBLIC_*` because the API client
+runs in the browser.
 
-To learn more about Next.js, take a look at the following resources:
+## Layout
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+app/
+  page.tsx                            # gate -> /teams or /login
+  login/  register/                   # auth
+  teams/
+    layout.tsx                        # auth guard + header
+    page.tsx                          # team list + create
+    [team]/page.tsx                   # project list + create
+    [team]/[project]/page.tsx         # deployment list + create + open
+components/ui/                        # button, card, input, dialog, badge
+components/Header.tsx
+lib/api.ts                            # typed Synapse REST wrapper
+lib/auth.ts                           # localStorage JWT helpers
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## What's stubbed
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- No project settings page (rename, env vars, delete). Marked with a TODO in
+  `app/teams/[team]/[project]/page.tsx`.
+- No team members / invite flow.
+- No token refresh; on 401 the user is bounced back to `/login`.
+- No optimistic UI — every mutation re-fetches via SWR.

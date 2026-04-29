@@ -19,10 +19,11 @@ import (
 // a Docker container), list, get, delete, plus the dashboard-auth endpoint
 // that returns the deployment URL + admin key for the calling user.
 type DeploymentsHandler struct {
-	DB           *pgxpool.Pool
-	Docker       *dockerprov.Client
-	PortRangeMin int
-	PortRangeMax int
+	DB                    *pgxpool.Pool
+	Docker                *dockerprov.Client
+	PortRangeMin          int
+	PortRangeMax          int
+	HealthcheckViaNetwork bool
 }
 
 func (h *DeploymentsHandler) Routes() chi.Router {
@@ -280,10 +281,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	// running (or healthcheck times out at 60s). Async/queued provisioning
 	// is a v0.2 concern — keeps the API simple for now.
 	info, provErr := h.Docker.Provision(r.Context(), dockerprov.DeploymentSpec{
-		Name:           name,
-		InstanceSecret: instanceSecret,
-		HostPort:       port,
-		EnvVars:        map[string]string{},
+		Name:                  name,
+		InstanceSecret:        instanceSecret,
+		HostPort:              port,
+		EnvVars:               map[string]string{},
+		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
 	})
 	if provErr != nil {
 		logErr("provision", provErr)

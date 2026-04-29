@@ -55,6 +55,7 @@ services:
       SYNAPSE_DOCKER_NETWORK: synapse-network
       SYNAPSE_PORT_RANGE_MIN: ${SYNAPSE_PORT_RANGE_MIN:-3210}
       SYNAPSE_PORT_RANGE_MAX: ${SYNAPSE_PORT_RANGE_MAX:-3500}
+      SYNAPSE_HEALTHCHECK_VIA_NETWORK: "true"
       SYNAPSE_LOG_LEVEL: ${SYNAPSE_LOG_LEVEL:-info}
     volumes:
       # Synapse provisions sibling containers via the host docker daemon.

@@ -17,8 +17,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/synapse \
     ./cmd/server
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# Synapse needs read/write access to the host docker socket to provision
+# Convex backend containers. The socket is typically owned by root:docker —
+# matching that group inside the container is host-specific and brittle, so
+# we ship as a root-owned image. Treat this container as privileged: do not
+# expose ports beyond 8080 to untrusted networks, and prefer to run it
+# behind an authenticated reverse proxy.
+FROM gcr.io/distroless/static-debian12
 COPY --from=builder /out/synapse /synapse
 EXPOSE 8080
-USER nonroot:nonroot
 ENTRYPOINT ["/synapse"]

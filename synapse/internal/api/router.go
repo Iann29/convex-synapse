@@ -16,13 +16,14 @@ import (
 )
 
 type RouterDeps struct {
-	Logger       *slog.Logger
-	DB           *pgxpool.Pool
-	JWT          *auth.JWTIssuer
-	Docker       *dockerprov.Client
-	PortRangeMin int
-	PortRangeMax int
-	Version      string
+	Logger                *slog.Logger
+	DB                    *pgxpool.Pool
+	JWT                   *auth.JWTIssuer
+	Docker                *dockerprov.Client
+	PortRangeMin          int
+	PortRangeMax          int
+	HealthcheckViaNetwork bool
+	Version               string
 }
 
 // NewRouter builds the top-level chi router. Sub-handlers are mounted by
@@ -35,7 +36,10 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(chimw.RealIP)
 	r.Use(middleware.RequestLogger(d.Logger))
 	r.Use(chimw.Recoverer)
-	r.Use(chimw.Timeout(30 * time.Second))
+	// 90s accommodates the slowest endpoint we have today: create_deployment,
+	// which blocks on docker pull + container start + healthcheck. When we
+	// move to async provisioning (v0.2) this can drop back to 30s.
+	r.Use(chimw.Timeout(90 * time.Second))
 
 	r.Method(http.MethodGet, "/health", &HealthHandler{DB: d.DB, Version: d.Version})
 
@@ -43,10 +47,11 @@ func NewRouter(d RouterDeps) http.Handler {
 	meH := &MeHandler{DB: d.DB}
 	teamsH := &TeamsHandler{DB: d.DB}
 	deploymentsH := &DeploymentsHandler{
-		DB:           d.DB,
-		Docker:       d.Docker,
-		PortRangeMin: d.PortRangeMin,
-		PortRangeMax: d.PortRangeMax,
+		DB:                    d.DB,
+		Docker:                d.Docker,
+		PortRangeMin:          d.PortRangeMin,
+		PortRangeMax:          d.PortRangeMax,
+		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
 	}
 	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
 

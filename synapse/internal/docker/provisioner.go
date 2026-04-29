@@ -22,6 +22,9 @@ type DeploymentSpec struct {
 	InstanceSecret string            // hex-encoded secret
 	HostPort       int               // host port mapped to the container's 3210
 	EnvVars        map[string]string // additional env, applied last (overrides defaults)
+	// HealthcheckViaNetwork picks the URL the provisioner polls while waiting
+	// for the backend to become healthy. See config.HealthcheckViaNetwork.
+	HealthcheckViaNetwork bool
 }
 
 // DeploymentInfo is what the provisioner returns once a container is up.
@@ -139,7 +142,13 @@ func (c *Client) Provision(ctx context.Context, spec DeploymentSpec) (*Deploymen
 		DeploymentURL: cloudOrigin,
 	}
 
-	if err := c.waitHealthy(ctx, info.DeploymentURL, 60*time.Second); err != nil {
+	// The DB-stored DeploymentURL is what API consumers see — always the
+	// host-port mapping. The internal URL is what THIS process polls.
+	healthURL := cloudOrigin
+	if spec.HealthcheckViaNetwork {
+		healthURL = fmt.Sprintf("http://%s:3210", containerName(spec.Name))
+	}
+	if err := c.waitHealthy(ctx, healthURL, 60*time.Second); err != nil {
 		// Leave the container running — operator can inspect it. Caller can
 		// flip status to "failed" while keeping it around for diagnosis.
 		c.logger.Warn("deployment did not become healthy in time",

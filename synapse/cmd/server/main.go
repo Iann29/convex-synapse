@@ -63,13 +63,14 @@ func run() error {
 	}
 
 	handler := api.NewRouter(api.RouterDeps{
-		Logger:       logger,
-		DB:           pool,
-		JWT:          jwtIssuer,
-		Docker:       dockerClient,
-		PortRangeMin: cfg.PortRangeMin,
-		PortRangeMax: cfg.PortRangeMax,
-		Version:      Version,
+		Logger:                logger,
+		DB:                    pool,
+		JWT:                   jwtIssuer,
+		Docker:                dockerClient,
+		PortRangeMin:          cfg.PortRangeMin,
+		PortRangeMax:          cfg.PortRangeMax,
+		HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
+		Version:               Version,
 	})
 
 	srv := &http.Server{

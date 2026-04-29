@@ -17,17 +17,30 @@ import (
 )
 
 type Config struct {
-	HTTPAddr        string
-	LogLevel        slog.Level
-	DBURL           string
-	JWTSecret       []byte
-	JWTAccessTTL    time.Duration
-	JWTRefreshTTL   time.Duration
-	DockerHost      string
-	BackendImage    string
-	DockerNetwork   string
-	PortRangeMin    int
-	PortRangeMax    int
+	HTTPAddr      string
+	LogLevel      slog.Level
+	DBURL         string
+	JWTSecret     []byte
+	JWTAccessTTL  time.Duration
+	JWTRefreshTTL time.Duration
+	DockerHost    string
+	BackendImage  string
+	DockerNetwork string
+	PortRangeMin  int
+	PortRangeMax  int
+
+	// HealthcheckViaNetwork chooses how Synapse polls a freshly-provisioned
+	// Convex backend.
+	//
+	// When false (default), the provisioner polls http://127.0.0.1:{hostPort}
+	// — correct when Synapse runs on the docker host alongside the
+	// daemon and the backend is reachable through host-port mapping.
+	//
+	// When true, the provisioner polls http://convex-{name}:3210 — required
+	// when Synapse itself runs inside a container that shares the
+	// synapse-network bridge with provisioned backends; loopback inside the
+	// container does not reach sibling containers.
+	HealthcheckViaNetwork bool
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -80,9 +93,10 @@ func Load() (*Config, error) {
 		JWTRefreshTTL: refreshTTL,
 		DockerHost:    getEnvDefault("SYNAPSE_DOCKER_HOST", "unix:///var/run/docker.sock"),
 		BackendImage:  getEnvDefault("SYNAPSE_BACKEND_IMAGE", "ghcr.io/get-convex/convex-backend:latest"),
-		DockerNetwork: getEnvDefault("SYNAPSE_DOCKER_NETWORK", "synapse-network"),
-		PortRangeMin:  portMin,
-		PortRangeMax:  portMax,
+		DockerNetwork:         getEnvDefault("SYNAPSE_DOCKER_NETWORK", "synapse-network"),
+		PortRangeMin:          portMin,
+		PortRangeMax:          portMax,
+		HealthcheckViaNetwork: getEnvDefault("SYNAPSE_HEALTHCHECK_VIA_NETWORK", "") == "true",
 	}, nil
 }
 
