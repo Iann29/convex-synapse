@@ -76,8 +76,10 @@ frontend-specialised agent and merged via PR (not direct to main).
 The control plane is multi-node-safe (v0.3); the Convex backend itself is
 single-writer per deployment by design (lease in `crates/postgres/src/lib.rs`
 of `get-convex/convex-backend`). Active-passive failover is achievable on
-top of upstream as-is — see [docs/DESIGN.md](DESIGN.md). This is the right
-bet for moving the user-perceived reliability needle.
+top of upstream as-is — see [docs/V0_5_PLAN.md](V0_5_PLAN.md) for the
+detailed scoping (schema, provisioner refactor, proxy picker, failover
+sequence, ~20 dev-days estimate). This is the right bet for moving the
+user-perceived reliability needle.
 
 - [ ] Switch the provisioned Convex backend's persistence from SQLite to
   Postgres (existing flag `--db postgres`)
