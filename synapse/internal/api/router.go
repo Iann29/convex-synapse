@@ -11,14 +11,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Iann29/synapse/internal/auth"
+	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/middleware"
 )
 
 type RouterDeps struct {
-	Logger  *slog.Logger
-	DB      *pgxpool.Pool
-	JWT     *auth.JWTIssuer
-	Version string
+	Logger       *slog.Logger
+	DB           *pgxpool.Pool
+	JWT          *auth.JWTIssuer
+	Docker       *dockerprov.Client
+	PortRangeMin int
+	PortRangeMax int
+	Version      string
 }
 
 // NewRouter builds the top-level chi router. Sub-handlers are mounted by
@@ -38,7 +42,13 @@ func NewRouter(d RouterDeps) http.Handler {
 	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
 	meH := &MeHandler{DB: d.DB}
 	teamsH := &TeamsHandler{DB: d.DB}
-	projectsH := &ProjectsHandler{DB: d.DB}
+	deploymentsH := &DeploymentsHandler{
+		DB:           d.DB,
+		Docker:       d.Docker,
+		PortRangeMin: d.PortRangeMin,
+		PortRangeMax: d.PortRangeMax,
+	}
+	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -56,6 +66,7 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/profile", meH.Routes()) // alias for cloud-dashboard parity
 			r.Mount("/teams", teamsH.Routes())
 			r.Mount("/projects", projectsH.Routes())
+			r.Mount("/deployments", deploymentsH.Routes())
 		})
 	})
 

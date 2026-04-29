@@ -70,23 +70,26 @@ const (
 // Deployment is the metadata Synapse persists for a provisioned Convex backend.
 // Fields like AdminKey/InstanceSecret never leave the server unless explicitly
 // requested via a privileged endpoint (e.g. dashboard auth).
+//
+// Optional timestamps use *time.Time so JSON marshalling emits null instead
+// of the Go zero value ("0001-01-01T00:00:00Z").
 type Deployment struct {
-	ID              string    `json:"id"`
-	ProjectID       string    `json:"projectId"`
-	Name            string    `json:"name"`
-	DeploymentType  string    `json:"deploymentType"`
-	Status          string    `json:"status"`
-	ContainerID     string    `json:"-"`
-	HostPort        int       `json:"-"`
-	DeploymentURL   string    `json:"deploymentUrl,omitempty"`
-	AdminKey        string    `json:"-"`
-	InstanceSecret  string    `json:"-"`
-	IsDefault       bool      `json:"isDefault"`
-	Reference       string    `json:"reference,omitempty"`
-	CreatorUserID   string    `json:"creator,omitempty"`
-	CreatedAt       time.Time `json:"createTime"`
-	LastDeployAt    time.Time `json:"lastDeployTime,omitempty"`
-	ExpiresAt       time.Time `json:"expiresAt,omitempty"`
+	ID             string     `json:"id"`
+	ProjectID      string     `json:"projectId"`
+	Name           string     `json:"name"`
+	DeploymentType string     `json:"deploymentType"`
+	Status         string     `json:"status"`
+	ContainerID    string     `json:"-"`
+	HostPort       int        `json:"-"`
+	DeploymentURL  string     `json:"deploymentUrl,omitempty"`
+	AdminKey       string     `json:"-"`
+	InstanceSecret string     `json:"-"`
+	IsDefault      bool       `json:"isDefault"`
+	Reference      string     `json:"reference,omitempty"`
+	CreatorUserID  string     `json:"creator,omitempty"`
+	CreatedAt      time.Time  `json:"createTime"`
+	LastDeployAt   *time.Time `json:"lastDeployTime,omitempty"`
+	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
 }
 
 const (

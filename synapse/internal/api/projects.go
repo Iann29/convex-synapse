@@ -21,7 +21,8 @@ import (
 //     to keep the URL hierarchy intact
 //   - project-scoped (/v1/projects/{id}/...) lives here
 type ProjectsHandler struct {
-	DB *pgxpool.Pool
+	DB          *pgxpool.Pool
+	Deployments *DeploymentsHandler
 }
 
 func (h *ProjectsHandler) Routes() chi.Router {
@@ -34,6 +35,9 @@ func (h *ProjectsHandler) Routes() chi.Router {
 		r.Get("/list_deployments", h.listDeployments)
 		r.Get("/list_default_environment_variables", h.listEnvVars)
 		r.Post("/update_default_environment_variables", h.updateEnvVars)
+		if h.Deployments != nil {
+			h.Deployments.MountProjectScopedRoutes(r)
+		}
 	})
 
 	return r

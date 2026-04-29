@@ -15,6 +15,7 @@ import (
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/config"
 	"github.com/Iann29/synapse/internal/db"
+	dockerprov "github.com/Iann29/synapse/internal/docker"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -56,11 +57,19 @@ func run() error {
 
 	jwtIssuer := auth.NewJWTIssuer(cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 
+	dockerClient, err := dockerprov.NewClient(cfg.DockerHost, cfg.BackendImage, cfg.DockerNetwork, logger)
+	if err != nil {
+		logger.Warn("docker unavailable; provisioning endpoints will fail", "err", err)
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
-		Logger:  logger,
-		DB:      pool,
-		JWT:     jwtIssuer,
-		Version: Version,
+		Logger:       logger,
+		DB:           pool,
+		JWT:          jwtIssuer,
+		Docker:       dockerClient,
+		PortRangeMin: cfg.PortRangeMin,
+		PortRangeMax: cfg.PortRangeMax,
+		Version:      Version,
 	})
 
 	srv := &http.Server{
