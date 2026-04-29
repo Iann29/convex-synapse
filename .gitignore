@@ -1,0 +1,39 @@
+# Go
+synapse/synapse
+synapse/bin/
+synapse/*.test
+synapse/*.out
+synapse/coverage.txt
+synapse/vendor/
+
+# Node / Next.js
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/.env*.local
+dashboard/.vercel
+dashboard/dist/
+
+# Env
+.env
+.env.local
+*.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker volumes (when bind-mounted)
+data/
+volumes/

@@ -1,0 +1,71 @@
+# Local dev stack. Production deployments should override secrets.
+# Run: docker compose up -d
+#
+# Services:
+#   postgres   — metadata DB for synapse
+#   synapse    — Go control-plane API (TODO: enable once Dockerfile lands)
+#   dashboard  — Next.js dashboard (TODO: enable once dashboard fork lands)
+
+name: synapse
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: synapse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-synapse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-synapse}
+      POSTGRES_DB: ${POSTGRES_DB:-synapse}
+    volumes:
+      - synapse-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-synapse} -d ${POSTGRES_DB:-synapse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-network
+
+  # synapse:
+  #   build: ./synapse
+  #   container_name: synapse-api
+  #   restart: unless-stopped
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     SYNAPSE_HTTP_ADDR: 0.0.0.0:8080
+  #     SYNAPSE_DB_URL: postgres://${POSTGRES_USER:-synapse}:${POSTGRES_PASSWORD:-synapse}@postgres:5432/${POSTGRES_DB:-synapse}?sslmode=disable
+  #     SYNAPSE_JWT_SECRET: ${SYNAPSE_JWT_SECRET}
+  #     SYNAPSE_DOCKER_HOST: unix:///var/run/docker.sock
+  #     SYNAPSE_DOCKER_NETWORK: synapse-network
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   ports:
+  #     - "8080:8080"
+  #   networks:
+  #     - synapse-network
+
+  # dashboard:
+  #   build: ./dashboard
+  #   container_name: synapse-dashboard
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - synapse
+  #   environment:
+  #     NEXT_PUBLIC_BIG_BRAIN_URL: http://synapse:8080
+  #   ports:
+  #     - "6790:6790"
+  #   networks:
+  #     - synapse-network
+
+volumes:
+  synapse-pgdata:
+
+networks:
+  synapse-network:
+    name: synapse-network
+    driver: bridge
