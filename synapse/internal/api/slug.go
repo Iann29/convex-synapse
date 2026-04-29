@@ -48,6 +48,20 @@ func withSuffix(slug string, n int) string {
 	return slug + "-" + itoa(n)
 }
 
+// withRandomSuffix returns slug-XXXX where XXXX is 2 bytes of hex-encoded
+// randomness. Used as a fallback when the deterministic withSuffix walk
+// keeps colliding under heavy concurrency — N writers trying to allocate
+// "name", "name-1", "name-2" lock-step into the same next slot, so jittering
+// breaks the convoy.
+func withRandomSuffix(slug string) string {
+	if len(slug) > 55 {
+		slug = slug[:55]
+	}
+	var buf [2]byte
+	_, _ = rand.Read(buf[:])
+	return slug + "-" + hex.EncodeToString(buf[:])
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -261,61 +262,66 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	name, err := h.allocateDeploymentName(r.Context())
-	if err != nil {
-		logErr("alloc name", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate deployment name")
-		return
-	}
-	port, err := h.allocatePort(r.Context())
-	if err != nil {
-		logErr("alloc port", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate host port")
-		return
-	}
-
+	// INSTANCE_SECRET is independent of name/port so we generate it once and
+	// keep it across retries. The admin key, by contrast, is derived from
+	// (name, secret) via Convex's `generate_key` — if we regenerate the name
+	// we have to regenerate the admin key too, so it lives inside the loop.
 	instanceSecret, err := dockerprov.RandomHex(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
 		return
 	}
-	// Admin key MUST be derived from the instance secret via the convex
-	// backend's signer — random hex would be rejected by /api/check_admin_key.
-	adminKey, err := h.Docker.GenerateAdminKey(r.Context(), name, instanceSecret)
-	if err != nil {
-		logErr("generate admin key", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate admin key")
-		return
-	}
 
-	// Insert as 'provisioning' first so concurrent allocators see this port
-	// as taken. We update with container_id + url after Provision returns.
+	// Allocate (name, port, adminKey) and INSERT atomically. Two synapse
+	// nodes (or two concurrent goroutines on one node) can pick the same
+	// port or name from the SELECT-EXISTS pre-check; the UNIQUE constraints
+	// on `name` and `host_port` reject the loser, the retry helper picks
+	// fresh candidates and tries again.
 	var d models.Deployment
 	d.ProjectID = projectID
-	d.Name = name
 	d.DeploymentType = req.Type
 	d.Status = models.DeploymentStatusProvisioning
-	d.HostPort = port
-	d.AdminKey = adminKey
 	d.InstanceSecret = instanceSecret
 	d.IsDefault = req.IsDefault
 	d.Reference = req.Reference
 	d.CreatorUserID = uid
 
-	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
-		                          admin_key, instance_secret, is_default, reference,
-		                          creator_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
-		RETURNING id, created_at
-	`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
-		adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
-	).Scan(&d.ID, &d.CreatedAt)
+	var name string
+	var port int
+	var adminKey string
+
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
+		var allocErr error
+		name, allocErr = h.allocateDeploymentName(r.Context())
+		if allocErr != nil {
+			return allocErr
+		}
+		port, allocErr = h.allocatePort(r.Context())
+		if allocErr != nil {
+			return allocErr
+		}
+		adminKey, allocErr = h.Docker.GenerateAdminKey(r.Context(), name, instanceSecret)
+		if allocErr != nil {
+			return allocErr
+		}
+		return h.DB.QueryRow(r.Context(), `
+			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
+			                          admin_key, instance_secret, is_default, reference,
+			                          creator_user_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
+			RETURNING id, created_at
+		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
+			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
+		).Scan(&d.ID, &d.CreatedAt)
+	})
 	if err != nil {
 		logErr("insert deployment", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to record deployment")
 		return
 	}
+	d.Name = name
+	d.HostPort = port
+	d.AdminKey = adminKey
 
 	// Provisioning runs in the background so the handler returns instantly.
 	// We hand the goroutine its own context (the request context dies when

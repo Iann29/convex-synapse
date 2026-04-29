@@ -13,6 +13,7 @@ import (
 
 	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	"github.com/Iann29/synapse/internal/models"
 )
 
@@ -73,47 +74,42 @@ func (h *TeamsHandler) createTeam(w http.ResponseWriter, r *http.Request) {
 		req.DefaultRegion = "self-hosted"
 	}
 
-	slug, err := h.allocateTeamSlug(r.Context(), req.Name)
-	if err != nil {
-		logErr("alloc team slug", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate team slug")
-		return
-	}
-
-	tx, err := h.DB.Begin(r.Context())
-	if err != nil {
-		logErr("tx begin", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Database error")
-		return
-	}
-	defer tx.Rollback(r.Context())
-
+	// Slug allocation (SELECT-EXISTS pre-check) races with concurrent creates.
+	// Wrap the SELECT-then-INSERT pair in the retry helper so two callers
+	// landing on the same slug (e.g. "acme-corp") don't surface a 500 — the
+	// loser regenerates and retries.
 	var t models.Team
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO teams (name, slug, creator_user_id, default_region)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, name, slug, creator_user_id, default_region, suspended, created_at
-	`, req.Name, slug, uid, req.DefaultRegion).Scan(
-		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
-	)
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 10, func() error {
+		slug, allocErr := h.allocateTeamSlug(r.Context(), req.Name)
+		if allocErr != nil {
+			return allocErr
+		}
+		tx, txErr := h.DB.Begin(r.Context())
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback(r.Context())
+
+		txErr = tx.QueryRow(r.Context(), `
+			INSERT INTO teams (name, slug, creator_user_id, default_region)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, name, slug, creator_user_id, default_region, suspended, created_at
+		`, req.Name, slug, uid, req.DefaultRegion).Scan(
+			&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
+		)
+		if txErr != nil {
+			return txErr
+		}
+		if _, txErr = tx.Exec(r.Context(), `
+			INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin')
+		`, t.ID, uid); txErr != nil {
+			return txErr
+		}
+		return tx.Commit(r.Context())
+	})
 	if err != nil {
-		logErr("insert team", err)
+		logErr("create team", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create team")
-		return
-	}
-
-	_, err = tx.Exec(r.Context(), `
-		INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin')
-	`, t.ID, uid)
-	if err != nil {
-		logErr("insert team member", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to add team member")
-		return
-	}
-
-	if err := tx.Commit(r.Context()); err != nil {
-		logErr("tx commit", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Database error")
 		return
 	}
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
@@ -127,15 +123,22 @@ func (h *TeamsHandler) createTeam(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, t)
 }
 
-// allocateTeamSlug returns a slug derived from name, appending a numeric
-// suffix if needed. Races with concurrent inserts are caught by the unique
-// index — caller should treat duplicate-key errors as a retry signal.
+// allocateTeamSlug returns a slug derived from name. The walk is "base",
+// "base-1", "base-2", ... up to 8; past that we switch to random suffixes
+// ("base-a3f7") to break convoy collisions when many writers race the same
+// allocator. The UNIQUE index on `teams.slug` is the source of truth — this
+// function only chooses a candidate, the INSERT is the commit point.
 func (h *TeamsHandler) allocateTeamSlug(ctx context.Context, name string) (string, error) {
 	base := slugify(name)
 	for i := 0; i < 50; i++ {
-		candidate := base
-		if i > 0 {
+		var candidate string
+		switch {
+		case i == 0:
+			candidate = base
+		case i < 8:
 			candidate = withSuffix(base, i)
+		default:
+			candidate = withRandomSuffix(base)
 		}
 		var exists bool
 		if err := h.DB.QueryRow(ctx,
@@ -401,21 +404,23 @@ func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slug, err := h.allocateProjectSlug(r.Context(), t.ID, req.ProjectName)
-	if err != nil {
-		logErr("alloc project slug", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate project slug")
-		return
-	}
-
+	// Project slug uniqueness is enforced by `UNIQUE (team_id, slug)`. Two
+	// concurrent creates of "My App" within the same team race the
+	// SELECT-EXISTS pre-check; the loser hits the constraint and retries.
 	var p models.Project
-	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO projects (team_id, name, slug)
-		VALUES ($1, $2, $3)
-		RETURNING id, team_id, name, slug, is_demo, created_at
-	`, t.ID, req.ProjectName, slug).Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt)
+	err := synapsedb.WithRetryOnUniqueViolation(r.Context(), 10, func() error {
+		slug, allocErr := h.allocateProjectSlug(r.Context(), t.ID, req.ProjectName)
+		if allocErr != nil {
+			return allocErr
+		}
+		return h.DB.QueryRow(r.Context(), `
+			INSERT INTO projects (team_id, name, slug)
+			VALUES ($1, $2, $3)
+			RETURNING id, team_id, name, slug, is_demo, created_at
+		`, t.ID, req.ProjectName, slug).Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt)
+	})
 	if err != nil {
-		logErr("insert project", err)
+		logErr("create project", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create project")
 		return
 	}
@@ -440,9 +445,14 @@ func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
 func (h *TeamsHandler) allocateProjectSlug(ctx context.Context, teamID, name string) (string, error) {
 	base := slugify(name)
 	for i := 0; i < 50; i++ {
-		candidate := base
-		if i > 0 {
+		var candidate string
+		switch {
+		case i == 0:
+			candidate = base
+		case i < 8:
 			candidate = withSuffix(base, i)
+		default:
+			candidate = withRandomSuffix(base)
 		}
 		var exists bool
 		if err := h.DB.QueryRow(ctx,
