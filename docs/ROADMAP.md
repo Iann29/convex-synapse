@@ -40,7 +40,26 @@ provisioned via the dashboard.
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
 - [ ] Pagination on team / project listings (PAT list already paginated)
 
-## v0.3 — "Looks the part"
+## v0.3 — "Multi-node hygiene" ✅ DONE
+
+Three cheap changes that let you run N Synapse processes against the same
+Postgres + Docker daemon without surprises. See
+[`docs/DESIGN.md`](DESIGN.md) for the audit and trade-off discussion.
+
+- [x] **Retry-on-conflict** for resource allocators (port, deployment name,
+  team slug, project slug). UNIQUE-constraint races now retry transparently
+  instead of surfacing 500s. Includes 30-goroutine race tests.
+- [x] **Advisory locks** for periodic workers (health worker sweep, orphan
+  provisioning sweep at startup). Single node behaves identically; multiple
+  nodes coordinate so exactly one runs the work at any instant.
+- [x] **Persistent provisioning queue** (`provisioning_jobs` table +
+  `internal/provisioner.Worker`). Replaces the in-process goroutine.
+  `SELECT FOR UPDATE SKIP LOCKED` shards across nodes and goroutines
+  (default concurrency=4). Crashed workers auto-recover via `requeueStale`
+  on the next Run.
+- [x] Test counts: 88 → 92 Go integration; 16/16 Playwright in ~1.6 min.
+
+## v0.4 — "Looks the part"
 
 UI redesign to match the Convex Cloud dashboard aesthetic. Tracked in
 [docs/DESIGN.md](DESIGN.md). Will be developed on a feature branch by a
