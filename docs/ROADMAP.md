@@ -1,42 +1,66 @@
 # Roadmap
 
-Checklist-style. Items tracked in TaskList during active dev sessions.
+## v0.1 — "It runs end-to-end" ✅ MOSTLY DONE
 
-## v0.1 — "It runs"
+Getting a fresh user from `git clone` to a running Convex backend container
+provisioned via the dashboard.
 
 - [x] Repo bootstrapped (git, README, structure)
-- [ ] Go backend boilerplate: chi, slog, /health
-- [ ] Postgres schema + migrations
-- [ ] Auth: register, login, JWT middleware, /v1/me
-- [ ] Teams API: create, list, get, members
-- [ ] Projects API: create, list, get, env vars
-- [ ] Docker provisioner service
-- [ ] Deployments API: create (with real container provisioning), list, get, delete
-- [ ] Dashboard fork imported, builds locally
-- [ ] docker-compose.yml: postgres + synapse + dashboard up
-- [ ] QUICKSTART that gets a new user from zero to a running deployment in 5 minutes
+- [x] Go backend boilerplate: chi, slog, /health
+- [x] Postgres schema + migrations (embedded, applied at startup)
+- [x] Auth: register, login, refresh, JWT middleware, /v1/me
+- [x] Teams API: create, list, get, members, invites
+- [x] Projects API: create, list, get, update, delete, env vars
+- [x] Docker provisioner: ensures network/image, creates containers, allocates ports
+- [x] Deployments API: create (with provisioning), list, get, delete, deploy keys, auth
+- [x] Dashboard scaffold (Next.js + Tailwind)
+- [x] docker-compose.yml: postgres + synapse + dashboard
+- [ ] Dashboard polish: empty states, loading skeletons, deployment status updates
+- [ ] QUICKSTART verified end-to-end with the compose stack
 
 ## v0.2 — "It's nice"
 
-- [ ] Personal access tokens (for `npx convex` CLI)
-- [ ] Project env vars CRUD
-- [ ] Deploy keys
-- [ ] Reverse proxy mode (so backends don't need exposed ports)
-- [ ] Health monitoring of provisioned backends (auto-restart, status reporting)
-- [ ] Migration helper: import an existing self-hosted deployment into Synapse
+- [ ] Personal access tokens (`POST /v1/create_personal_access_token`)
+- [ ] `npx convex` CLI compatibility (auth flow, deploy keys)
+- [ ] Reverse proxy mode so deployments don't need exposed host ports
+- [ ] Health monitoring of provisioned backends (auto-restart, status reporting in dashboard)
+- [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
+- [ ] Real Go test suite (testcontainers for postgres, fake docker daemon)
+- [ ] Dashboard: rename/delete projects, manage env vars
+- [ ] Pagination on listings
 
-## v1.0 — "It's safe to depend on"
+## v1.0 — "Safe to depend on"
 
-- [ ] Audit log (subset)
+- [ ] Audit log (subset of cloud's 66 events)
 - [ ] Custom domains with auto-TLS
-- [ ] Backups (volume snapshots → S3)
+- [ ] Volume snapshot backups → S3
 - [ ] RBAC: project-level roles
-- [ ] OAuth/SSO (probably via Authentik/Zitadel integration)
+- [ ] OAuth/SSO via OIDC (works with Authentik, Zitadel, Keycloak)
 - [ ] Kubernetes provisioner (alternative to Docker)
 - [ ] Helm chart
+- [ ] Public API stability guarantees + versioned releases
 
 ## Maybe never
 
 - Full Stripe/Orb billing parity (irrelevant for self-hosted)
-- LaunchDarkly equivalent (use a static config)
-- WorkOS-specific paths (use a generic OIDC provider instead)
+- LaunchDarkly equivalent (use static config + env vars)
+- WorkOS-specific paths (use OIDC instead)
+- Discord/Vercel/etc integrations (out of scope)
+
+## Compatibility scorecard
+
+OpenAPI v1 endpoint coverage today:
+
+| Resource | Coverage |
+|---|---|
+| Auth | custom (no WorkOS) |
+| Profile (`/me`) | ✅ |
+| Teams | ~80% — no SSO, no billing endpoints |
+| Projects | ~70% — no preview deploy keys, no transfer |
+| Deployments | ~60% — no transfer, no custom domains, no patch |
+| Personal access tokens | 🚧 v0.2 |
+| Cloud backups | ❌ v1.0 |
+
+The dashboard fork (when complete) covers data, functions, logs, schedules,
+files, history, and per-deployment settings — all by talking directly to the
+Convex backend with the admin key Synapse hands out, no extra work.

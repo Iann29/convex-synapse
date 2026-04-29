@@ -1,10 +1,14 @@
-# Local dev stack. Production deployments should override secrets.
-# Run: docker compose up -d
+# Synapse local stack.
+# Run from repo root: docker compose up -d
 #
-# Services:
-#   postgres   — metadata DB for synapse
-#   synapse    — Go control-plane API (TODO: enable once Dockerfile lands)
-#   dashboard  — Next.js dashboard (TODO: enable once dashboard fork lands)
+# What you get:
+#   postgres   — metadata DB for synapse (persisted in named volume)
+#   synapse    — control-plane API on host port 8080
+#   dashboard  — Next.js dashboard on host port 6790
+#
+# Synapse provisions Convex backend containers on the synapse-network,
+# bound to host ports in the configured range (default 3210-3500).
+# It needs access to the Docker socket on the host.
 
 name: synapse
 
@@ -20,7 +24,7 @@ services:
     volumes:
       - synapse-pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-synapse} -d ${POSTGRES_DB:-synapse}"]
       interval: 5s
@@ -29,38 +33,55 @@ services:
     networks:
       - synapse-network
 
-  # synapse:
-  #   build: ./synapse
-  #   container_name: synapse-api
-  #   restart: unless-stopped
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #   environment:
-  #     SYNAPSE_HTTP_ADDR: 0.0.0.0:8080
-  #     SYNAPSE_DB_URL: postgres://${POSTGRES_USER:-synapse}:${POSTGRES_PASSWORD:-synapse}@postgres:5432/${POSTGRES_DB:-synapse}?sslmode=disable
-  #     SYNAPSE_JWT_SECRET: ${SYNAPSE_JWT_SECRET}
-  #     SYNAPSE_DOCKER_HOST: unix:///var/run/docker.sock
-  #     SYNAPSE_DOCKER_NETWORK: synapse-network
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   ports:
-  #     - "8080:8080"
-  #   networks:
-  #     - synapse-network
+  synapse:
+    build:
+      context: ./synapse
+      args:
+        VERSION: ${SYNAPSE_VERSION:-dev}
+    image: synapse:${SYNAPSE_VERSION:-dev}
+    container_name: synapse-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_HTTP_ADDR: 0.0.0.0:8080
+      SYNAPSE_DB_URL: postgres://${POSTGRES_USER:-synapse}:${POSTGRES_PASSWORD:-synapse}@postgres:5432/${POSTGRES_DB:-synapse}?sslmode=disable
+      SYNAPSE_JWT_SECRET: ${SYNAPSE_JWT_SECRET}
+      SYNAPSE_JWT_ACCESS_TTL: ${SYNAPSE_JWT_ACCESS_TTL:-15m}
+      SYNAPSE_JWT_REFRESH_TTL: ${SYNAPSE_JWT_REFRESH_TTL:-720h}
+      SYNAPSE_DOCKER_HOST: unix:///var/run/docker.sock
+      SYNAPSE_BACKEND_IMAGE: ${SYNAPSE_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:latest}
+      SYNAPSE_DOCKER_NETWORK: synapse-network
+      SYNAPSE_PORT_RANGE_MIN: ${SYNAPSE_PORT_RANGE_MIN:-3210}
+      SYNAPSE_PORT_RANGE_MAX: ${SYNAPSE_PORT_RANGE_MAX:-3500}
+      SYNAPSE_LOG_LEVEL: ${SYNAPSE_LOG_LEVEL:-info}
+    volumes:
+      # Synapse provisions sibling containers via the host docker daemon.
+      # This mount is unavoidable for the v0 architecture; the alternative is
+      # rootless docker-in-docker, which is out of scope.
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${SYNAPSE_PORT:-8080}:8080"
+    networks:
+      - synapse-network
 
-  # dashboard:
-  #   build: ./dashboard
-  #   container_name: synapse-dashboard
-  #   restart: unless-stopped
-  #   depends_on:
-  #     - synapse
-  #   environment:
-  #     NEXT_PUBLIC_BIG_BRAIN_URL: http://synapse:8080
-  #   ports:
-  #     - "6790:6790"
-  #   networks:
-  #     - synapse-network
+  dashboard:
+    build:
+      context: ./dashboard
+    image: synapse-dashboard:${SYNAPSE_VERSION:-dev}
+    container_name: synapse-dashboard
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    environment:
+      # The browser talks to Synapse via the host port mapping. If you put
+      # a reverse proxy in front, override this to the public URL.
+      NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
+    ports:
+      - "${DASHBOARD_PORT:-6790}:3000"
+    networks:
+      - synapse-network
 
 volumes:
   synapse-pgdata:
