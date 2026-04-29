@@ -22,13 +22,14 @@ URL changed.
 |---|---|
 | `synapse/` | Go backend — REST API + Docker provisioner |
 | `synapse/cmd/server/main.go` | Entrypoint |
-| `synapse/internal/api/` | HTTP handlers (one file per resource: auth, teams, projects, deployments…) |
+| `synapse/internal/api/` | HTTP handlers (one file per resource: auth, teams, projects, deployments, invites, access_tokens…) |
 | `synapse/internal/auth/` | Password hash, JWT issuer, opaque-token helpers, request context |
 | `synapse/internal/db/` | pgx pool + embedded SQL migrations |
-| `synapse/internal/docker/` | Docker SDK wrapper + provisioner |
-| `synapse/internal/middleware/` | chi middleware (auth, logging) |
+| `synapse/internal/docker/` | Docker SDK wrapper + provisioner. The api package depends on the `Provisioner` interface (defined in api/deployments.go) so tests can inject a fake. |
+| `synapse/internal/health/` | Periodic worker that reconciles deployments.status with Docker reality |
+| `synapse/internal/middleware/` | chi middleware (auth, logging, CORS) |
 | `synapse/internal/models/` | Domain types — JSON tags match OpenAPI v1 |
-| `synapse/migrations/` *(deprecated)* | All migrations live in `internal/db/migrations/` (so `go:embed` works) |
+| `synapse/internal/test/` | Integration test suite (`Setup(t)` harness + per-resource `_test.go`). Package: `synapsetest`. |
 | `dashboard/` | Will host the Next.js dashboard fork (placeholder for now) |
 | `docs/` | ARCHITECTURE.md, ROADMAP.md, QUICKSTART.md |
 | `docker-compose.yml` | Local dev stack (postgres + future synapse + dashboard) |
@@ -84,15 +85,36 @@ PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
 
 ## Testing
 
-There is no formal test suite yet. The pattern so far is **end-to-end smoke
-tests after each feature** using `curl` against a running server backed by
-the local Postgres. Each commit message captures the manual test flow that
-verified the feature.
+Two suites, both expected to be green on every push:
 
-Add real Go tests when:
-- You touch business-logic that's not trivially obvious from the SQL/HTTP
-  layer (e.g. provisioner state machines).
-- A bug surfaces — add a test that fails on the bug, then fix.
+**Go integration tests** (`synapse/internal/test/`)
+
+- `Setup(t)` builds a fresh `synapse_test_<hex>` postgres database, applies
+  migrations, wires the chi router with a `FakeDocker` (satisfies `api.Provisioner`),
+  and returns a `httptest.Server`. ~470ms warm; ~7s for the full suite.
+- Tests live in package `synapsetest` (NOT whitebox in `internal/api`) because
+  the harness imports `internal/api` to build the router — co-locating tests
+  with handlers would create an import cycle.
+- 44+ tests across auth/teams/projects/deployments/invites/health.
+- Dependency: postgres on `localhost:5432` OR `SYNAPSE_TEST_DB_URL` env var.
+  Tests SKIP (don't fail) if no postgres is reachable.
+- Decode every response with `json.DisallowUnknownFields()` so shape drift
+  fails loudly.
+- Add a new test when: you touch business-logic, a bug surfaces, or you add
+  a new endpoint.
+
+**Playwright e2e** (`dashboard/tests/`)
+
+- Runs against the live compose stack at `localhost:6790` + `localhost:8080`.
+- 11+ tests, ~35s. Covers auth, teams, projects (rename/delete), env vars,
+  deployments (create/delete/copy URL), multi-context invites.
+- Direct postgres access at `localhost:5432` for `truncateAll()` reset
+  between tests.
+- Direct Docker SDK for `pruneSynapseContainers()` cleanup.
+- All locators use stable IDs (`#register-email`) or roles. Avoid `getByText`
+  with regex — those collide on partial matches.
+
+CI runs both jobs (plus build + vet) on every push.
 
 ## Versioning
 
@@ -114,9 +136,21 @@ This repo is intentionally **less** than Convex Cloud:
 - No LaunchDarkly feature flags
 
 If you're tempted to add one of these, push back hard or move it to the
-roadmap. The MVP is "user signs up, creates a team, creates a project,
-provisions a deployment, Convex backend container runs". Anything that
-isn't on that path can wait.
+roadmap.
+
+## What HAS landed
+
+The MVP is "user signs up, creates a team, creates a project, provisions
+a deployment, Convex backend container runs" — that path works end-to-end.
+Beyond that, v0.1 also includes:
+
+- Multi-user team membership via opaque invite tokens (`/v1/team_invites/accept`)
+- Project rename + delete (cascades to deployments + env vars)
+- Per-project default env vars (set/delete batch)
+- Personal access tokens (CLI/CI authentication, `syn_*` opaque format)
+- Async provisioning + status polling on the dashboard (UI updates live)
+- Health worker that reconciles deployments.status with Docker reality
+- Full Playwright e2e + Go integration test suites in CI
 
 ## Pointers
 

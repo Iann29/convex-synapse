@@ -37,10 +37,14 @@ the trade-offs are explained there and not always re-stated in the code.
 
 A feature is done when:
 
-- [ ] `go build ./... && go vet ./...` is clean
+- [ ] `cd synapse && go build ./... && go vet ./... && go test ./...` is clean
 - [ ] The endpoint is reachable on a freshly-truncated DB
 - [ ] The auth/authz checks (member-only, admin-only) are exercised
 - [ ] Errors return structured JSON via `writeError`
+- [ ] **Integration test added** in `synapse/internal/test/<resource>_test.go`
+  if it's a new endpoint, OR a new test case if it's a behavior change
+- [ ] **Playwright spec added** in `dashboard/tests/` if it's a new user-facing flow
+- [ ] `docs/API.md` updated for any new/changed endpoint
 - [ ] The commit message body lists the curl flow you actually ran
 - [ ] `docs/ROADMAP.md` is updated if the change crosses a phase boundary
 
