@@ -15,12 +15,14 @@ provisioned via the dashboard.
 - [x] Deployments API: create (with provisioning), list, get, delete, deploy keys, auth
 - [x] Dashboard scaffold (Next.js + Tailwind)
 - [x] docker-compose.yml: postgres + synapse + dashboard
-- [x] Playwright e2e tests through the full compose stack (10 tests, ~37s)
+- [x] Playwright e2e tests through the full compose stack (11 tests, ~35s)
 - [x] Dashboard delete-deployment / delete-project / rename-project actions
 - [x] Dashboard env-vars CRUD panel
+- [x] Dashboard invites panel + /accept-invite page (multi-user e2e)
+- [x] Dashboard skeleton loaders + copy-URL button + auto-refresh while provisioning
+- [x] Backend invite list / cancel / accept (`POST /v1/team_invites/accept`)
 - [x] CORS middleware
 - [x] CI: Go build/vet/test + Next.js build + compose build + Playwright e2e
-- [ ] Dashboard polish: loading skeletons, deployment status updates while provisioning
 - [ ] QUICKSTART verified end-to-end on a fresh machine
 
 ## v0.2 — "It's nice"
@@ -29,9 +31,9 @@ provisioned via the dashboard.
 - [ ] `npx convex` CLI compatibility (auth flow, deploy keys)
 - [ ] Reverse proxy mode so deployments don't need exposed host ports
 - [ ] Health monitoring of provisioned backends (auto-restart, status reporting in dashboard)
+- [ ] Async provisioning (background goroutine + status polling)
 - [ ] Migration helper: import an existing standalone self-hosted deployment into Synapse
-- [ ] Real Go test suite (testcontainers for postgres, fake docker daemon)
-- [ ] Dashboard: rename/delete projects, manage env vars
+- [~] Real Go test suite (testcontainers for postgres, fake docker daemon) — in progress
 - [ ] Pagination on listings
 
 ## v1.0 — "Safe to depend on"
