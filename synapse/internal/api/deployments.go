@@ -3,9 +3,7 @@ package api
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
-	"runtime/debug"
 	"strings"
 	"time"
 
@@ -18,6 +16,7 @@ import (
 	synapsedb "github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
+	"github.com/Iann29/synapse/internal/provisioner"
 )
 
 // provisionTimeout caps how long the background goroutine waits for Docker.
@@ -304,7 +303,16 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		if allocErr != nil {
 			return allocErr
 		}
-		return h.DB.QueryRow(r.Context(), `
+		// Insert the deployment row + enqueue the provisioning job in a
+		// single transaction so we never end up with a row that no worker
+		// will pick up (or a queue entry that points at nothing).
+		tx, txErr := h.DB.Begin(r.Context())
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback(r.Context())
+
+		if txErr = tx.QueryRow(r.Context(), `
 			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
 			                          admin_key, instance_secret, is_default, reference,
 			                          creator_user_id)
@@ -312,7 +320,13 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 			RETURNING id, created_at
 		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
 			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
-		).Scan(&d.ID, &d.CreatedAt)
+		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
+			return txErr
+		}
+		if txErr = provisioner.Enqueue(r.Context(), tx, d.ID, h.HealthcheckViaNetwork); txErr != nil {
+			return txErr
+		}
+		return tx.Commit(r.Context())
 	})
 	if err != nil {
 		logErr("insert deployment", err)
@@ -323,17 +337,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	d.HostPort = port
 	d.AdminKey = adminKey
 
-	// Provisioning runs in the background so the handler returns instantly.
-	// We hand the goroutine its own context (the request context dies when
-	// we write the response below) with a generous deadline that covers a
-	// cold image pull on a slow link.
-	go h.provisionInBackground(d.ID, dockerprov.DeploymentSpec{
-		Name:                  name,
-		InstanceSecret:        instanceSecret,
-		HostPort:              port,
-		EnvVars:               map[string]string{},
-		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
-	})
+	// The provisioner.Worker on this (or any) Synapse process will dequeue
+	// the job and drive Docker.Provision. The dashboard's existing SWR
+	// polling on /list_deployments picks up the status flip from
+	// 'provisioning' to 'running' or 'failed' without any handler-side
+	// coordination — same UX as before, just resilient to crashes.
 
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
 		TeamID:     teamID,
@@ -352,86 +360,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusCreated, d)
 }
 
-// provisionInBackground runs Docker.Provision off the request goroutine and
-// reconciles the deployment row when it finishes. Errors are swallowed into
-// status="failed" + a slog event — there's no caller to return them to.
-//
-// Race with delete: a user can call /delete while we're mid-provision. We
-// detect that by re-reading status after Provision returns; if the row has
-// flipped to "deleted", we tear down whatever we just built.
-func (h *DeploymentsHandler) provisionInBackground(deploymentID string, spec dockerprov.DeploymentSpec) {
-	logger := slog.Default()
-	// Recover from panics in Docker SDK or our own code so a single bad
-	// deployment can't kill the process. The recovered row is marked
-	// 'failed' with a stack trace in the logs for forensics.
-	defer func() {
-		if rec := recover(); rec != nil {
-			logger.Error("provision goroutine panicked",
-				"deployment_id", deploymentID,
-				"name", spec.Name,
-				"panic", rec,
-				"stack", string(debug.Stack()))
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_, _ = h.DB.Exec(ctx, `
-				UPDATE deployments
-				   SET status = $1,
-				       last_deploy_at = now()
-				 WHERE id = $2
-			`, models.DeploymentStatusFailed, deploymentID)
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
-	defer cancel()
-
-	info, provErr := h.Docker.Provision(ctx, spec)
-	if provErr != nil {
-		logger.Error("provision failed",
-			"deployment_id", deploymentID, "name", spec.Name, "err", provErr)
-		_, dbErr := h.DB.Exec(ctx, `
-			UPDATE deployments
-			   SET status = $1,
-			       last_deploy_at = now()
-			 WHERE id = $2
-		`, models.DeploymentStatusFailed, deploymentID)
-		if dbErr != nil {
-			logger.Error("mark provision failed",
-				"deployment_id", deploymentID, "err", dbErr)
-		}
-		return
-	}
-
-	// Atomically flip provisioning → running. The WHERE clause guards
-	// against a concurrent delete: if the row is already 'deleted', we
-	// don't resurrect it; instead we tear down the container we just made.
-	tag, err := h.DB.Exec(ctx, `
-		UPDATE deployments
-		   SET status = $1,
-		       container_id = $2,
-		       deployment_url = $3,
-		       last_deploy_at = now()
-		 WHERE id = $4
-		   AND status = $5
-	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL,
-		deploymentID, models.DeploymentStatusProvisioning)
-	if err != nil {
-		logger.Error("mark provision running",
-			"deployment_id", deploymentID, "err", err)
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		// Either the row vanished or someone (delete handler) already
-		// flipped it to 'deleted'. Either way, our container is now an
-		// orphan — remove it.
-		logger.Warn("provision finished but row is no longer provisioning; cleaning up",
-			"deployment_id", deploymentID, "name", spec.Name)
-		if destroyErr := h.Docker.Destroy(ctx, spec.Name); destroyErr != nil {
-			logger.Error("orphan cleanup failed",
-				"deployment_id", deploymentID, "name", spec.Name, "err", destroyErr)
-		}
-	}
-}
+// (provisionInBackground was removed in favour of internal/provisioner —
+// the same logic now lives in provisioner.Worker, dequeued from the
+// `provisioning_jobs` table instead of being spawned as a per-handler
+// goroutine. Survival across process restarts; multi-node sharding via
+// SELECT FOR UPDATE SKIP LOCKED.)
 
 // ---------- GET /v1/projects/{id}/deployment ----------
 

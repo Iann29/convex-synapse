@@ -19,6 +19,7 @@ import (
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/health"
+	"github.com/Iann29/synapse/internal/provisioner"
 	"github.com/Iann29/synapse/internal/proxy"
 )
 
@@ -86,6 +87,30 @@ func run() error {
 		AllowedOrigins:        cfg.AllowedOrigins,
 		Version:               Version,
 	})
+
+	// Provisioning worker — dequeues 'provision' jobs inserted by the
+	// /create_deployment handler and drives Docker.Provision to completion.
+	// Survives process restarts (jobs persisted as rows) and shards across
+	// nodes via SELECT FOR UPDATE SKIP LOCKED.
+	if dockerClient != nil {
+		hostName, _ := os.Hostname()
+		nodeID := hostName
+		if nodeID == "" {
+			nodeID = "synapse"
+		}
+		pworker := &provisioner.Worker{
+			DB:     pool,
+			Docker: dockerClient,
+			Config: provisioner.Config{
+				PollInterval:          time.Second,
+				JobTimeout:            5 * time.Minute,
+				NodeID:                nodeID,
+				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
+			},
+			Logger: logger,
+		}
+		go pworker.Run(rootCtx)
+	}
 
 	// Health worker — periodic reconciler that flips deployment rows to
 	// 'stopped' / 'failed' when the underlying Docker container has gone

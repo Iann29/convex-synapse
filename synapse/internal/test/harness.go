@@ -37,6 +37,7 @@ import (
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
+	"github.com/Iann29/synapse/internal/provisioner"
 )
 
 // defaultDSN is the local docker-compose postgres. Override with
@@ -140,6 +141,23 @@ func Setup(t *testing.T) *Harness {
 	})
 	srv := httptest.NewServer(router)
 
+	// Provisioner worker — drives the persistent job queue. Tests that
+	// don't care about provisioning still get one running; it's harmless
+	// when there are no jobs. Use 50ms poll so e2e flow completes
+	// snappily within test timeouts.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	pworker := &provisioner.Worker{
+		DB:     pool,
+		Docker: fake,
+		Config: provisioner.Config{
+			PollInterval: 50 * time.Millisecond,
+			JobTimeout:   30 * time.Second,
+			NodeID:       "test-" + dbName,
+		},
+		Logger: logger,
+	}
+	go pworker.Run(workerCtx)
+
 	h := &Harness{
 		T:       t,
 		Server:  srv,
@@ -151,6 +169,7 @@ func Setup(t *testing.T) *Harness {
 		rootCtx: context.Background(),
 	}
 	t.Cleanup(func() {
+		workerCancel()
 		srv.Close()
 		pool.Close()
 		dropDatabase(rootDSN, dbName)

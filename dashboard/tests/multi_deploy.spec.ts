@@ -114,8 +114,11 @@ test("provision three deployments, then delete them all", async ({ page }) => {
 
   // Wait for all three to flip to status="running". The page renders three
   // status badges; they start as "provisioning" and the SWR loop swaps them.
+  // Worker processes jobs serially (one Provision at a time) and may be
+  // catching up on orphans from prior tests that left jobs in flight
+  // during truncate. Keep the timeout generous.
   await expect(page.getByText("running", { exact: true })).toHaveCount(3, {
-    timeout: 90_000,
+    timeout: 180_000,
   });
 
   // Three distinct convex-* containers on the host.
