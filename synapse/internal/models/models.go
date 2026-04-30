@@ -90,10 +90,67 @@ type Deployment struct {
 	// Adopted deployments are external backends registered into Synapse
 	// (rather than provisioned by it). Lifecycle hooks like delete skip
 	// Docker calls for these rows; the operator manages the container.
-	Adopted      bool       `json:"adopted,omitempty"`
+	Adopted bool `json:"adopted,omitempty"`
+	// HA flags (v0.5+). HAEnabled=false + ReplicaCount=1 is the default
+	// and matches every deployment that existed before v0.5. The fields
+	// are exposed in API responses so dashboard / CLI tooling can render
+	// "ha (2 replicas)" badges without a second round-trip.
+	HAEnabled    bool       `json:"haEnabled,omitempty"`
+	ReplicaCount int        `json:"replicaCount,omitempty"`
 	CreatedAt    time.Time  `json:"createTime"`
 	LastDeployAt *time.Time `json:"lastDeployTime,omitempty"`
 	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
+}
+
+// DeploymentReplicaStatus enumerates the per-replica lifecycle states.
+// Distinct from the deployment-level status: a deployment is
+// `status=running` as long as at least one replica is `running`; only
+// promotes to `failed` when all replicas are stopped/failed.
+const (
+	ReplicaStatusProvisioning = "provisioning"
+	ReplicaStatusRunning      = "running"
+	ReplicaStatusStopped      = "stopped"
+	ReplicaStatusFailed       = "failed"
+)
+
+// DeploymentReplica is one running container backing a deployment. A
+// single-replica deployment has exactly one of these (replica_index=0)
+// mirroring its host_port + container_id; HA-enabled deployments have N.
+type DeploymentReplica struct {
+	ID               string     `json:"id"`
+	DeploymentID     string     `json:"deploymentId"`
+	ReplicaIndex     int        `json:"replicaIndex"`
+	ContainerID      string     `json:"-"`
+	HostPort         int        `json:"-"`
+	Status           string     `json:"status"`
+	LastSeenActiveAt *time.Time `json:"lastSeenActiveAt,omitempty"`
+	CreatedAt        time.Time  `json:"createTime"`
+}
+
+// DeploymentStorage describes the (optional) Postgres + S3 backing for a
+// deployment. SQLite + local-volume deployments have no row in
+// `deployment_storage` and read no fields here.
+//
+// Encrypted columns (DBURL, S3AccessKey, S3SecretKey) are AES-GCM
+// ciphertexts produced by internal/crypto/secrets.go. The plaintext is
+// only handed to a freshly-spawned container as an env var; never
+// returned over the API, never logged.
+type DeploymentStorage struct {
+	DeploymentID      string
+	DBKind            string // "postgres" today; "mysql"/"cockroach" later
+	DBURLEnc          []byte
+	DBSchema          string
+	S3Endpoint        string
+	S3Region          string
+	S3AccessKeyEnc    []byte
+	S3SecretKeyEnc    []byte
+	S3BucketFiles     string
+	S3BucketModules   string
+	S3BucketSearch    string
+	S3BucketExports   string
+	S3BucketSnapshots string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 const (
