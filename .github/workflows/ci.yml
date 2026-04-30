@@ -84,10 +84,18 @@ jobs:
             installer/lib/port.sh \
             installer/install/ui.sh \
             installer/install/preflight.sh \
+            installer/install/secrets.sh \
+            installer/install/caddy.sh \
+            installer/install/compose.sh \
+            installer/install/verify.sh \
             installer/test/helpers/load.bash
+      - name: Build bats test image
+        # Tiny image extending bats/bats:latest with jq + curl so the
+        # tests that exercise verify.sh / compose.sh have the same
+        # tools they'll have in production. Cached across runs.
+        run: docker build -t synapse-bats installer/test/
       - name: bats
-        run: |
-          docker run --rm -v "$PWD:/code" -w /code bats/bats:latest -r installer/test/
+        run: docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/
 
   e2e:
     name: Playwright e2e
