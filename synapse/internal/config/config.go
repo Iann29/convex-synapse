@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -52,6 +53,26 @@ type Config struct {
 	// API, forwarding to the deployment's internal address. Lets operators
 	// expose a single host port instead of one per deployment.
 	ProxyEnabled bool
+
+	// PublicURL is the externally-reachable URL of the Synapse instance
+	// (e.g. "https://synapse.example.com"). Used by /v1/deployments/...
+	// /auth and /cli_credentials to compute the URL the *caller's*
+	// machine should use when talking to a deployment — not the
+	// container-internal "http://127.0.0.1:<port>" the provisioner
+	// stores for its own healthcheck.
+	//
+	// When ProxyEnabled and PublicURL are both set, returned URLs
+	// become "<PublicURL>/d/<name>" so a remote `npx convex` flows
+	// through the Synapse proxy and reaches the right replica
+	// (including HA failover) without exposing per-deployment ports.
+	//
+	// When PublicURL is set but ProxyEnabled is false, the host-port
+	// suffix is preserved: "<PublicURL>:<port>". Operators using
+	// host-port mode still need to expose those ports.
+	//
+	// Empty (default) → keep the legacy "http://127.0.0.1:<port>"
+	// shape, suitable for local dev.
+	PublicURL string
 
 	// HealthAutoRestart, when true, has the health worker call docker
 	// `start` on a deployment whose status just flipped to "stopped". A
@@ -135,6 +156,7 @@ func Load() (*Config, error) {
 		HealthcheckViaNetwork: getEnvDefault("SYNAPSE_HEALTHCHECK_VIA_NETWORK", "") == "true",
 		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
 		ProxyEnabled:          getEnvDefault("SYNAPSE_PROXY_ENABLED", "") == "true",
+		PublicURL:             strings.TrimRight(os.Getenv("SYNAPSE_PUBLIC_URL"), "/"),
 		HealthAutoRestart:     getEnvDefault("SYNAPSE_HEALTH_AUTO_RESTART", "") == "true",
 
 		HAEnabled:             getEnvDefault("SYNAPSE_HA_ENABLED", "") == "true",

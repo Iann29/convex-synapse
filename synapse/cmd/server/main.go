@@ -101,6 +101,8 @@ func run() error {
 		HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
 		AllowedOrigins:        cfg.AllowedOrigins,
 		Version:               Version,
+		PublicURL:             cfg.PublicURL,
+		ProxyEnabled:          cfg.ProxyEnabled,
 		HA: api.HAConfig{
 			Enabled:             cfg.HAEnabled,
 			BackendPostgresURL:  cfg.BackendPostgresURL,

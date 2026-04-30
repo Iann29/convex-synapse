@@ -51,6 +51,12 @@ type DeploymentsHandler struct {
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
 
+	// PublicURL + ProxyEnabled control the URL shape returned by /auth
+	// and /cli_credentials. See RouterDeps.PublicURL for the rules.
+	// Empty PublicURL keeps the legacy "http://127.0.0.1:<port>" shape.
+	PublicURL    string
+	ProxyEnabled bool
+
 	// HA carries cluster-wide HA defaults. Empty when HA isn't enabled
 	// — the handler refuses requests that ask for ha:true in that case.
 	HA HAConfig
@@ -61,6 +67,32 @@ type DeploymentsHandler struct {
 	// ([]byte, error) } so we don't import internal/crypto here —
 	// production wiring passes *crypto.SecretBox.
 	Crypto SecretEncrypter
+}
+
+// publicDeploymentURL returns the URL a *remote* caller (the operator's
+// laptop running `npx convex`, the dashboard reaching out from a
+// browser tab) should use to reach this deployment. The provisioner
+// stores "http://127.0.0.1:<port>" — fine for synapse-side healthchecks
+// but useless from outside the host.
+//
+// Decision matrix:
+//   - PublicURL empty                      → return d.DeploymentURL (legacy)
+//   - PublicURL set, ProxyEnabled true     → "<PublicURL>/d/<name>"
+//   - PublicURL set, ProxyEnabled false    → "<PublicURL>:<host_port>"
+//
+// Adopted deployments keep d.DeploymentURL — the operator already
+// supplied a public URL when they registered it.
+func (h *DeploymentsHandler) publicDeploymentURL(d *models.Deployment) string {
+	if h.PublicURL == "" || d.Adopted {
+		return d.DeploymentURL
+	}
+	if h.ProxyEnabled {
+		return h.PublicURL + "/d/" + d.Name
+	}
+	if d.HostPort == 0 {
+		return d.DeploymentURL
+	}
+	return fmt.Sprintf("%s:%d", h.PublicURL, d.HostPort)
 }
 
 // SecretEncrypter is the *crypto.SecretBox subset the handler needs.
@@ -1227,7 +1259,7 @@ func (h *DeploymentsHandler) deploymentAuth(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, http.StatusOK, deploymentAuthResp{
 		DeploymentName: d.Name,
-		DeploymentURL:  d.DeploymentURL,
+		DeploymentURL:  h.publicDeploymentURL(d),
 		AdminKey:       d.AdminKey,
 		DeploymentType: d.DeploymentType,
 	})
@@ -1266,11 +1298,12 @@ func (h *DeploymentsHandler) deploymentCLICredentials(w http.ResponseWriter, r *
 	if !ok {
 		return
 	}
-	snippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(d.DeploymentURL) + "\n" +
+	publicURL := h.publicDeploymentURL(d)
+	snippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(publicURL) + "\n" +
 		"export CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(d.AdminKey)
 	writeJSON(w, http.StatusOK, cliCredentialsResp{
 		DeploymentName: d.Name,
-		ConvexURL:      d.DeploymentURL,
+		ConvexURL:      publicURL,
 		AdminKey:       d.AdminKey,
 		ExportSnippet:  snippet,
 	})
