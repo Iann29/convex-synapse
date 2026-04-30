@@ -59,35 +59,69 @@ Postgres + Docker daemon without surprises. See
   on the next Run.
 - [x] Test counts: ~88 → ~101 Go (integration + new unit/race/advisorylock/provisioner); 16/16 Playwright in ~1.6 min.
 
-## v0.4 — "Looks the part"
+## v0.4 — "Looks the part" ✅ DONE
 
-UI redesign to match the Convex Cloud dashboard aesthetic. Tracked in
-[docs/DESIGN.md](DESIGN.md). Will be developed on a feature branch by a
-frontend-specialised agent and merged via PR (not direct to main).
+UI redesign to match the Convex Cloud dashboard aesthetic. Merged via
+PR #1 on 2026-04-29.
 
-- [ ] Top app bar (team picker + tabs + profile menu)
-- [ ] Home page redesign (Projects / Deployments tabs, grid+list toggle, empty state)
-- [ ] Team Settings shell (left sidebar + General / Members / Access Tokens panes)
-- [ ] Avatar component with deterministic gradient + initials
-- [ ] Logo + favicon
+- [x] Top app bar (team picker + tabs + profile menu)
+- [x] Home page redesign (Projects / Deployments tabs, grid+list toggle, empty state)
+- [x] Team Settings shell (left sidebar + General / Members / Access Tokens panes)
+- [x] Avatar component with deterministic gradient + initials
+- [x] Logo + favicon
 
-## v0.5 — "HA-per-deployment"
+## v0.5 — "HA-per-deployment" 🚧 IN FLIGHT
 
 The control plane is multi-node-safe (v0.3); the Convex backend itself is
 single-writer per deployment by design (lease in `crates/postgres/src/lib.rs`
 of `get-convex/convex-backend`). Active-passive failover is achievable on
 top of upstream as-is — see [docs/V0_5_PLAN.md](V0_5_PLAN.md) for the
-detailed scoping (schema, provisioner refactor, proxy picker, failover
-sequence, ~20 dev-days estimate). This is the right bet for moving the
-user-perceived reliability needle.
+detailed scoping. This is the right bet for moving the user-perceived
+reliability needle.
 
-- [ ] Switch the provisioned Convex backend's persistence from SQLite to
-  Postgres (existing flag `--db postgres`)
-- [ ] S3-compatible blob storage for file/exports/snapshots
-- [ ] Run 2 backend containers per deployment behind an HTTP load balancer
-  with `/version` healthcheck
-- [ ] Document the lease takeover characteristics (cold rebuild of in-memory
-  indexes, seconds-not-zero failover)
+Chunks landed:
+- [x] **Chunk 1** — Schema + models + AES-GCM secrets helper. Migration
+  000004 adds `deployment_storage` + `deployment_replicas` tables and
+  `deployments.ha_enabled` / `replica_count` columns; backfills one
+  replica row per existing deployment. `internal/crypto/secrets.go`
+  envelopes connection material with `SYNAPSE_STORAGE_KEY`. (commit
+  `8fbba60`)
+- [x] **Chunk 2** — Replica-aware Docker provisioner. `DeploymentSpec`
+  grows `ReplicaIndex`, `HAReplica`, `Storage` (Postgres + S3 env vars).
+  `ContainerName` / `VolumeName` keep the legacy single-replica naming
+  unchanged; HA replicas pick up the `-{idx}` suffix. New
+  `DestroyReplica` / `RestartReplica` / `StatusReplica` methods.
+  (commit `421bd4a`)
+- [x] **Chunk 3** — Cluster config + `ha:true` request gate.
+  `SYNAPSE_HA_ENABLED` + `SYNAPSE_BACKEND_*` envs propagate to the
+  handler; `create_deployment` validates and refuses with
+  `ha_disabled` / `ha_misconfigured`. (commit `c9f04cb`)
+- [x] **Chunk 4** — Replica-aware health worker. Iterates
+  `deployment_replicas` rows, rolls up replica statuses into the
+  deployment-level status, calls `Restart` / `RestartReplica` based on
+  HA mode. (commit `47614a3`)
+- [x] **Chunk 5** — Replica-aware proxy resolver + failover. `ResolveAll`
+  returns the ordered replica list (`last_seen_active_at DESC`); proxy
+  retries down the slice on connection-level errors. New
+  `ErrNoReplicas` → 503 distinct from 404. (PR #2, commit on `main`)
+- [x] **Chunks 6+7** — `ha:true` provisions for real. `provisioner.Worker`
+  reads replica jobs, decrypts `deployment_storage`, calls Provision
+  with HA spec; `create_deployment` allocates 2 ports, writes the
+  storage row encrypted, inserts 2 replica rows + 2 jobs in one tx;
+  the replica-aware pre-check stops siblings from skipping each other.
+  (PR #3, commit on `main`)
+- [x] **Chunk 8** — Dashboard HA toggle + badge. "High availability (2
+  replicas + Postgres + S3)" checkbox in the create-deployment dialog;
+  `HA ×N` badge on deployment rows. Backend errors surface inline.
+  (PR #4)
+
+Still in flight:
+- [ ] **Chunks 9-10** — Real-backend e2e gated by `SYNAPSE_HA_E2E=1`
+  (provision against live Postgres + MinIO + 2 Convex containers,
+  `docker kill` the active, expect failover). `upgrade_to_ha`
+  endpoint + worker for migrating an existing single-replica
+  deployment via export/import. README + QUICKSTART + V0_5_PLAN
+  refresh once the above land.
 
 ## v1.0 — "Safe to depend on"
 
