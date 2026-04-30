@@ -2,9 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Header } from "@/components/Header";
+import { TopBar } from "@/components/TopBar";
 import { getAccessToken } from "@/lib/auth";
 
+// Auth gate + persistent TopBar for everything under /teams. The TopBar
+// derives the active team from the URL itself, so per-team layouts don't
+// need to wrap it again.
 export default function TeamsLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [ready, setReady] = useState(false);
@@ -27,8 +30,8 @@ export default function TeamsLayout({ children }: { children: React.ReactNode })
 
   return (
     <div className="min-h-screen">
-      <Header />
-      <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
+      <TopBar />
+      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6">{children}</main>
     </div>
   );
 }

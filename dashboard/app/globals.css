@@ -1,13 +1,26 @@
 @import "tailwindcss";
 
 :root {
+  /* Surfaces */
   --background: #0a0a0a;
+  --surface-1: #111113;
+  --surface-2: #161618;
   --foreground: #ededed;
+  /* Brand accent. Cyan→violet, deliberately distinct from Convex Cloud's
+     orange/yellow so we're clearly not trade-mark-cloning. The single hex
+     fallback is used wherever a gradient would be excessive. */
+  --accent: #8b5cf6;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(139, 92, 246, 0.12);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
   --font-sans: var(--font-inter);
 }
 
@@ -16,6 +29,7 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-inter), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* Hide spin buttons on number inputs (we don't use any but defensive). */
@@ -23,4 +37,36 @@ input::-webkit-outer-spin-button,
 input::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
+}
+
+/* Scrollbar — restrained dark, matches the surfaces. Firefox falls back to
+   `scrollbar-color` automatically. */
+* {
+  scrollbar-color: #2a2a2c transparent;
+  scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2a2c;
+  border: 2px solid #0a0a0a;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3d;
+}
+
+/* Subtle entrance for cards / panes — used sparingly, sites that animate
+   everything feel sluggish. */
+@keyframes synapse-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+.synapse-fade-in {
+  animation: synapse-fade-in 180ms ease-out both;
 }
