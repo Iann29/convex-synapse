@@ -18,6 +18,13 @@ func (f *fakeRestarter) Restart(ctx context.Context, name string) error {
 	return f.fn(ctx, name)
 }
 
+// RestartReplica defaults to forwarding to the legacy Restart so existing
+// single-replica auto-restart tests don't have to special-case the new
+// signature. Tests that exercise the HA-aware path can wrap fn themselves.
+func (f *fakeRestarter) RestartReplica(ctx context.Context, name string, _ int) error {
+	return f.fn(ctx, name)
+}
+
 // Worker.sweep against real postgres + the harness's FakeDocker. Verifies
 // that a "running" row whose container is gone gets reconciled to "stopped".
 func TestHealthWorker_ReconcilesGoneContainer(t *testing.T) {

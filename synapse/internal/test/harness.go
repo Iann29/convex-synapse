@@ -377,6 +377,7 @@ type FakeDocker struct {
 	ProvisionFn        func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	DestroyFn          func(ctx context.Context, name string) error
 	StatusFn           func(ctx context.Context, name string) (string, error)
+	StatusReplicaFn    func(ctx context.Context, name string, replicaIndex int) (string, error)
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 
 	Provisioned []dockerprov.DeploymentSpec
@@ -408,6 +409,19 @@ func (f *FakeDocker) Destroy(ctx context.Context, name string) error {
 }
 
 func (f *FakeDocker) Status(ctx context.Context, name string) (string, error) {
+	if f.StatusFn != nil {
+		return f.StatusFn(ctx, name)
+	}
+	return "running", nil
+}
+
+// StatusReplica is the HA-aware variant. Defaults to delegating to
+// StatusFn — most tests don't care about the index. Tests that exercise
+// the replica-level path can set StatusReplicaFn directly.
+func (f *FakeDocker) StatusReplica(ctx context.Context, name string, replicaIndex int) (string, error) {
+	if f.StatusReplicaFn != nil {
+		return f.StatusReplicaFn(ctx, name, replicaIndex)
+	}
 	if f.StatusFn != nil {
 		return f.StatusFn(ctx, name)
 	}
@@ -455,6 +469,21 @@ func (h *Harness) SeedDeployment(projectID, name, depType, status string, isDefa
 		"fake-container-"+name).Scan(&id)
 	if err != nil {
 		h.T.Fatalf("seed deployment: %v", err)
+	}
+	// Mirror the row into deployment_replicas — every deployment has at
+	// least one replica row, by invariant. The migration backfills
+	// pre-existing rows; SeedDeployment runs post-migration so we have
+	// to do the same insert ourselves to keep tests in sync with the
+	// production code path.
+	replicaStatus := status
+	if status == "deleted" {
+		replicaStatus = "stopped"
+	}
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO deployment_replicas (deployment_id, replica_index, container_id, host_port, status)
+		VALUES ($1, 0, $2, $3, $4)
+	`, id, "fake-container-"+name, sqlNull(hostPort), replicaStatus); err != nil {
+		h.T.Fatalf("seed replica: %v", err)
 	}
 	return id
 }

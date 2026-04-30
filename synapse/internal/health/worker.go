@@ -23,15 +23,25 @@ import (
 
 // DockerStatusReporter is the subset of the docker provisioner the worker
 // needs. The provisioner.Client implements it; tests can pass a fake.
+//
+// For HA deployments, the worker addresses individual replicas via
+// StatusReplica — single-replica (legacy) deployments keep using Status
+// so existing tests, fakes, and the *dockerprov.Client all keep their
+// non-HA call paths intact.
 type DockerStatusReporter interface {
 	Status(ctx context.Context, deploymentName string) (string, error)
+	StatusReplica(ctx context.Context, deploymentName string, replicaIndex int) (string, error)
 }
 
 // Restarter is the optional auto-recovery hook. When the worker reconciles
 // a row to "stopped" and AutoRestart is true, it calls Restart(name). The
 // docker.Client's Restart implements this; nil disables auto-recovery.
+//
+// HA deployments use RestartReplica which targets one replica by index.
+// A nil Restarter disables auto-restart for both single and HA modes.
 type Restarter interface {
 	Restart(ctx context.Context, deploymentName string) error
+	RestartReplica(ctx context.Context, deploymentName string, replicaIndex int) error
 }
 
 // Config controls how often the worker scans and what counts as "stale".
@@ -119,25 +129,43 @@ func (w *Worker) tickWithLock(ctx context.Context, logger *slog.Logger, cfg Conf
 
 // sweep runs one reconciliation pass. Errors are logged, never returned —
 // a transient DB or Docker hiccup must not kill the loop.
+//
+// The worker iterates deployment_replicas rows (one per running replica)
+// rather than deployments — that way HA deployments with N replicas
+// reconcile each replica independently and the deployment-level status
+// is recomputed as an aggregate. For pre-v0.5 single-replica deployments
+// (replica_count=1, ha_enabled=false), the migration backfilled exactly
+// one replica row each, so the iteration is structurally identical to
+// the old "iterate deployments" loop.
 func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 	// Adopted deployments are external — Synapse never started the
 	// container, never registered it with Docker, and shouldn't try to
 	// reconcile their state. The operator who registered them owns the
 	// lifecycle.
 	rows, err := w.DB.Query(ctx, `
-		SELECT id, name FROM deployments
-		 WHERE status = 'running' AND adopted = false
+		SELECT r.id, d.id, d.name, r.replica_index, d.ha_enabled
+		  FROM deployment_replicas r
+		  JOIN deployments d ON d.id = r.deployment_id
+		 WHERE r.status = 'running'
+		   AND d.adopted = false
+		   AND d.status <> 'deleted'
 	`)
 	if err != nil {
-		logger.Error("health: list running deployments", "err", err)
+		logger.Error("health: list running replicas", "err", err)
 		return
 	}
 
-	type item struct{ id, name string }
+	type item struct {
+		replicaID    string
+		deploymentID string
+		name         string
+		replicaIndex int
+		haEnabled    bool
+	}
 	var items []item
 	for rows.Next() {
 		var it item
-		if err := rows.Scan(&it.id, &it.name); err != nil {
+		if err := rows.Scan(&it.replicaID, &it.deploymentID, &it.name, &it.replicaIndex, &it.haEnabled); err != nil {
 			logger.Error("health: scan row", "err", err)
 			rows.Close()
 			return
@@ -150,11 +178,19 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 		return
 	}
 
+	// Track which deployments had any replica change. Each one needs a
+	// status-recompute pass at the end; without that, the deployment
+	// row's status drifts from the aggregate of its replicas.
+	deploymentsTouched := make(map[string]bool)
 	var changed int
 	for _, it := range items {
-		if w.reconcile(ctx, logger, cfg, it.id, it.name) {
+		if w.reconcileReplica(ctx, logger, cfg, it.replicaID, it.deploymentID, it.name, it.replicaIndex, it.haEnabled) {
 			changed++
+			deploymentsTouched[it.deploymentID] = true
 		}
+	}
+	for did := range deploymentsTouched {
+		w.recomputeDeploymentStatus(ctx, logger, did)
 	}
 	if changed > 0 {
 		logger.Info("health sweep", "checked", len(items), "changed", changed)
@@ -163,79 +199,160 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 	}
 }
 
-// reconcile returns true if the row's status changed.
-func (w *Worker) reconcile(ctx context.Context, logger *slog.Logger, cfg Config, id, name string) bool {
+// reconcileReplica returns true if the replica row's status changed.
+// Recomputing the deployment-level status is the caller's job (sweep
+// batches it so a single deployment with N changed replicas gets one
+// recompute, not N).
+func (w *Worker) reconcileReplica(ctx context.Context, logger *slog.Logger, cfg Config,
+	replicaID, deploymentID, name string, replicaIndex int, haEnabled bool,
+) bool {
 	statusCtx, cancel := context.WithTimeout(ctx, cfg.StatusTimeout)
 	defer cancel()
-	dockerStatus, err := w.Docker.Status(statusCtx, name)
+
+	var dockerStatus string
+	var err error
+	if haEnabled {
+		dockerStatus, err = w.Docker.StatusReplica(statusCtx, name, replicaIndex)
+	} else {
+		dockerStatus, err = w.Docker.Status(statusCtx, name)
+	}
 	if err != nil {
-		logger.Warn("health: docker status", "deployment", name, "err", err)
+		logger.Warn("health: docker status",
+			"deployment", name, "replica", replicaIndex, "err", err)
 		return false
 	}
 
-	// Empty string from Status() means the container is gone.
-	// Anything else: docker container.State.Status — running/exited/dead/created/paused/restarting.
 	target := classify(dockerStatus)
 	if target == "" {
-		// Either we got a status we can't interpret or no change is needed.
 		return false
 	}
 
 	tag, err := w.DB.Exec(ctx, `
-		UPDATE deployments
+		UPDATE deployment_replicas
 		   SET status = $1
 		 WHERE id = $2
 		   AND status = 'running'
-	`, target, id)
+	`, target, replicaID)
 	if err != nil {
-		logger.Error("health: update status", "deployment", name, "err", err)
+		logger.Error("health: update replica status",
+			"deployment", name, "replica", replicaIndex, "err", err)
 		return false
 	}
 	if tag.RowsAffected() == 0 {
 		return false
 	}
-	logger.Info("health: reconciled deployment",
+	logger.Info("health: reconciled replica",
 		"deployment", name,
+		"replica", replicaIndex,
 		"docker_status", dockerStatus,
 		"new_status", target)
 
-	// Auto-recovery: if the row just flipped to "stopped" and the operator
-	// opted in to auto-restart, try to bring it back. We don't restart "failed"
-	// rows automatically — that state is reserved for situations a human
-	// should look at (provisioning crash, image pull error, panic).
+	// Auto-recovery on a stopped replica: same gate as before, just
+	// scoped to the replica that flipped.
 	if cfg.AutoRestart && target == "stopped" && w.Restarter != nil {
-		w.tryRestart(ctx, logger, cfg, id, name)
+		w.tryRestartReplica(ctx, logger, cfg, replicaID, deploymentID, name, replicaIndex, haEnabled)
 	}
 	return true
 }
 
-// tryRestart attempts a one-shot recovery. On success, flips status back to
-// running. On failure (or container missing), leaves the row at stopped/failed
-// so a human can decide. Restart loops are NOT in scope — single attempt only.
-func (w *Worker) tryRestart(ctx context.Context, logger *slog.Logger, cfg Config, id, name string) {
+// recomputeDeploymentStatus reads the deployment's replica statuses and
+// rolls them up into the deployment-level status:
+//
+//	any replica running     →  running
+//	all replicas stopped    →  stopped
+//	all replicas failed     →  failed
+//	mixed stopped + failed  →  failed   (worst-wins; operator should look)
+//	mixed running + others  →  running  (covered by the first rule)
+//
+// Single-replica deployments degenerate to "the replica's status is the
+// deployment's status" — which is exactly the pre-v0.5 behavior.
+func (w *Worker) recomputeDeploymentStatus(ctx context.Context, logger *slog.Logger, deploymentID string) {
+	var anyRunning, anyFailed, total int
+	err := w.DB.QueryRow(ctx, `
+		SELECT
+		    count(*) FILTER (WHERE status = 'running'),
+		    count(*) FILTER (WHERE status = 'failed'),
+		    count(*)
+		  FROM deployment_replicas
+		 WHERE deployment_id = $1
+	`, deploymentID).Scan(&anyRunning, &anyFailed, &total)
+	if err != nil {
+		logger.Error("health: recompute aggregate", "deployment_id", deploymentID, "err", err)
+		return
+	}
+	if total == 0 {
+		// Nothing to do — orphaned deployment with no replicas.
+		return
+	}
+	var target string
+	switch {
+	case anyRunning > 0:
+		target = "running"
+	case anyFailed > 0:
+		target = "failed"
+	default:
+		target = "stopped"
+	}
+	// Don't touch deployments already terminally 'deleted'; only flip
+	// active rows. Also avoid clobbering 'failed' with 'stopped' — once
+	// flipped to failed (via the worker or the provisioner) the deployment
+	// stays there until the operator intervenes.
+	tag, err := w.DB.Exec(ctx, `
+		UPDATE deployments
+		   SET status = $1
+		 WHERE id = $2
+		   AND status NOT IN ('deleted','failed')
+		   AND status <> $1
+	`, target, deploymentID)
+	if err != nil {
+		logger.Error("health: update aggregate", "deployment_id", deploymentID, "err", err)
+		return
+	}
+	if tag.RowsAffected() > 0 {
+		logger.Info("health: deployment status recomputed",
+			"deployment_id", deploymentID,
+			"new_status", target,
+			"replicas_total", total,
+			"replicas_running", anyRunning,
+			"replicas_failed", anyFailed)
+	}
+}
+
+// tryRestartReplica attempts a one-shot recovery on a stopped replica.
+// Same shape as the legacy tryRestart, just scoped to one replica row
+// instead of the whole deployment.
+func (w *Worker) tryRestartReplica(ctx context.Context, logger *slog.Logger, cfg Config,
+	replicaID, deploymentID, name string, replicaIndex int, haEnabled bool,
+) {
 	startCtx, cancel := context.WithTimeout(ctx, cfg.StatusTimeout)
 	defer cancel()
 
-	if err := w.Restarter.Restart(startCtx, name); err != nil {
+	var err error
+	if haEnabled {
+		err = w.Restarter.RestartReplica(startCtx, name, replicaIndex)
+	} else {
+		err = w.Restarter.Restart(startCtx, name)
+	}
+	if err != nil {
 		logger.Warn("health: auto-restart failed",
-			"deployment", name, "err", err)
-		// Container gone is unrecoverable from our side — promote to failed.
+			"deployment", name, "replica", replicaIndex, "err", err)
 		if err.Error() == "container not found" {
 			_, _ = w.DB.Exec(ctx,
-				`UPDATE deployments SET status = 'failed' WHERE id = $1 AND status = 'stopped'`,
-				id)
+				`UPDATE deployment_replicas SET status = 'failed' WHERE id = $1 AND status = 'stopped'`,
+				replicaID)
 		}
 		return
 	}
 
 	if _, err := w.DB.Exec(ctx,
-		`UPDATE deployments SET status = 'running' WHERE id = $1 AND status = 'stopped'`,
-		id); err != nil {
+		`UPDATE deployment_replicas SET status = 'running' WHERE id = $1 AND status = 'stopped'`,
+		replicaID); err != nil {
 		logger.Error("health: post-restart update",
-			"deployment", name, "err", err)
+			"deployment", name, "replica", replicaIndex, "err", err)
 		return
 	}
-	logger.Info("health: auto-restarted deployment", "deployment", name)
+	logger.Info("health: auto-restarted replica",
+		"deployment", name, "replica", replicaIndex)
 }
 
 // classify maps Docker's container state strings to our deployments.status

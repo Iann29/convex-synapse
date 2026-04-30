@@ -112,30 +112,29 @@ func TestMigration_DeploymentDefaultsForHA(t *testing.T) {
 // TestMigration_HostPortUniqueOnReplicas verifies the new UNIQUE
 // constraint on deployment_replicas.host_port — two replicas can't share
 // a port even if they belong to different deployments.
+//
+// Seeded deployments already write a replica_index=0 row each; we attempt
+// to add a *second* replica (index=1) on deployment B that reuses the
+// port held by deployment A's replica 0. Postgres should reject it.
 func TestMigration_HostPortUniqueOnReplicas(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()
 	team := createTeam(t, h, owner.AccessToken, "Unique Co")
 	proj := createProject(t, h, owner.AccessToken, team.Slug, "App")
 
-	idA := h.SeedDeployment(proj.ID, "first-cat-1234", "dev", "running",
+	h.SeedDeployment(proj.ID, "first-cat-1234", "dev", "running",
 		false, owner.ID, 4244, "k1")
 	idB := h.SeedDeployment(proj.ID, "second-cat-5678", "dev", "running",
 		false, owner.ID, 4245, "k2")
 
-	if _, err := h.DB.Exec(h.rootCtx, `
-		INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, status)
-		VALUES ($1, 0, 9999, 'running')
-	`, idA); err != nil {
-		t.Fatalf("seed replica A: %v", err)
-	}
 	_, err := h.DB.Exec(h.rootCtx, `
 		INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, status)
-		VALUES ($1, 0, 9999, 'running')
+		VALUES ($1, 1, 4244, 'running')
 	`, idB)
 	if err == nil {
-		t.Fatalf("expected UNIQUE host_port to reject second replica using same port, got nil")
+		t.Fatalf("expected UNIQUE host_port to reject the new replica reusing port 4244, got nil")
 	}
+
 	// Sanity: caller reaching this still has read-access via the API.
 	h.DoJSON(http.MethodGet, "/v1/projects/"+proj.ID+"/list_deployments",
 		owner.AccessToken, nil, http.StatusOK, nil)
