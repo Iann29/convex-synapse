@@ -70,7 +70,7 @@ PR #1 on 2026-04-29.
 - [x] Avatar component with deterministic gradient + initials
 - [x] Logo + favicon
 
-## v0.5 — "HA-per-deployment" 🚧 IN FLIGHT
+## v0.5 — "HA-per-deployment" ✅ DONE
 
 The control plane is multi-node-safe (v0.3); the Convex backend itself is
 single-writer per deployment by design (lease in `crates/postgres/src/lib.rs`
@@ -113,15 +113,39 @@ Chunks landed:
 - [x] **Chunk 8** — Dashboard HA toggle + badge. "High availability (2
   replicas + Postgres + S3)" checkbox in the create-deployment dialog;
   `HA ×N` badge on deployment rows. Backend errors surface inline.
-  (PR #4)
+  (PR #4, merged)
+- [x] **Chunk 9** — Gated real-backend e2e + `ha` compose profile.
+  `docker compose --profile ha up` brings up backend-postgres + minio;
+  `synapse/internal/test/ha_real_e2e_test.go` is gated by
+  `SYNAPSE_HA_E2E=1`. Operator setup walkthrough lives in
+  [docs/HA_TESTING.md](HA_TESTING.md). (PR #6, merged)
+- [x] **Chunk 10** — `POST /v1/deployments/{name}/upgrade_to_ha`
+  endpoint with full validation (`ha_disabled`, `ha_misconfigured`,
+  `already_ha`, `cannot_upgrade_adopted`, `deployment_not_running`)
+  and audit-event recording. Worker mechanics (snapshot_export →
+  re-provision → snapshot_import → swap) deferred to v0.5.1; today
+  the happy path returns `501 ha_upgrade_not_yet_implemented` with a
+  pointer to V0_5_PLAN.md. (PR #7, merged)
 
-Still in flight:
-- [ ] **Chunks 9-10** — Real-backend e2e gated by `SYNAPSE_HA_E2E=1`
-  (provision against live Postgres + MinIO + 2 Convex containers,
-  `docker kill` the active, expect failover). `upgrade_to_ha`
-  endpoint + worker for migrating an existing single-replica
-  deployment via export/import. README + QUICKSTART + V0_5_PLAN
-  refresh once the above land.
+## v0.5.1 — "HA polish" 📋 NEXT
+
+The mechanical pieces that didn't fit in v0.5's main slice. Both are
+behind already-shipped APIs, so adding them is a runtime-only change.
+
+- [ ] Worker handler for `upgrade_to_ha` jobs: stream `snapshot_export`
+  from the existing replica, provision 2 new HA replicas, run
+  `snapshot_import` into the new pair, atomic swap (flip `ha_enabled`,
+  mark old replica `stopped`, invalidate proxy cache, audit). Endpoint
+  flips from `501` to `202` once the worker accepts the new `kind`.
+- [ ] Real-backend failover e2e: extend `synapsetest.Setup` with an
+  option to inject `*dockerprov.Client` instead of `FakeDocker`, then
+  drive `docker kill` against the active replica from the
+  `SYNAPSE_HA_E2E=1` test and assert traffic flows to the standby
+  within 60s.
+- [ ] Active health probe in `internal/proxy/`. Today
+  `last_seen_active_at` is unset by anyone — the picker falls back to
+  `replica_index ASC`. A 2s probe loop hitting `/api/check_admin_key`
+  populates the column so the picker stabilises on the lease holder.
 
 ## v1.0 — "Safe to depend on"
 

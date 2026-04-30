@@ -22,6 +22,9 @@ Match the symptom, jump to the section.
 - [Health worker keeps fighting auto-restart with another node](#double-restart)
 - [Provisioning queue not draining; old jobs from a previous test run blocking new ones](#queue-stalled)
 - [Test failures only in CI, not local](#ci-only)
+- [`ha_disabled` / `ha_misconfigured` from create_deployment with `ha:true`](#ha-disabled)
+- [HA replica stuck in "provisioning"; sibling went to "running" already](#ha-stuck-replica)
+- [Decryption error reading deployment_storage on a worker](#ha-decrypt-fail)
 
 ---
 
@@ -221,3 +224,57 @@ Tests pass locally but fail in CI.
 
 When in doubt: trigger the CI manually with `gh run rerun --failed` and
 look at the actual logs. Don't speculate.
+
+## HA disabled
+
+Submitting `ha:true` returns one of:
+
+- `400 ha_disabled`        — `SYNAPSE_HA_ENABLED` is unset on the cluster
+- `400 ha_misconfigured`   — HA is on but `SYNAPSE_BACKEND_*` (Postgres URL,
+                              S3 endpoint/keys, bucket prefix) or
+                              `SYNAPSE_STORAGE_KEY` is missing
+- `409 already_ha`         — deployment is already HA (no-op)
+- `400 cannot_upgrade_adopted` — adopted rows aren't managed by Synapse
+- `409 deployment_not_running` — wait for the deployment to come back to
+                                  `running` before upgrading
+
+**Fix:**
+1. Check `docker compose exec synapse env | grep -E 'SYNAPSE_HA|SYNAPSE_BACKEND|SYNAPSE_STORAGE'`.
+2. If `SYNAPSE_STORAGE_KEY` is set but synapse refused to start, the value
+   isn't 64 hex chars (32 bytes). Re-generate: `openssl rand -hex 32`.
+3. See `docs/HA_TESTING.md` for the full operator setup, including the
+   `docker compose --profile ha up` sequence that brings up MinIO + a
+   backend Postgres for testing.
+
+## HA stuck replica
+
+One replica of an HA deployment shows `running` but the other is stuck at
+`provisioning` for >2 minutes.
+
+**Cause possibilities:**
+- The backing Postgres is unreachable from inside the synapse-network
+  (ping it from the synapse container: `docker compose exec synapse wget -qO- backend-postgres:5432` should fail with a non-DNS error).
+- The S3 bucket doesn't exist (Synapse doesn't auto-create them today).
+- The convex-backend image can't reach the operator's Postgres / S3.
+
+**Fix:**
+1. `docker logs convex-<name>-<idx>` — the upstream backend logs the
+   exact connection error (Postgres auth, S3 401, bucket-not-found).
+2. Confirm buckets `<prefix>-<name>-files`, `-modules`, `-search`,
+   `-exports`, `-snapshots` exist (use `mc ls local/`).
+3. If the lease holder's container died but the row says `running`, the
+   health worker takes up to 30s to flip it. Manual check:
+   `docker ps --filter label=synapse.deployment=<name>`.
+
+## HA decrypt fail
+
+Worker log: `provisioner: load deployment_storage failed: decrypt db_url:
+crypto: open: cipher: message authentication failed`.
+
+**Cause:** `SYNAPSE_STORAGE_KEY` rotated since the row was written. The
+ciphertext can only be read by the key it was encrypted with.
+
+**Fix:** Don't rotate the key in production without a re-encrypt script.
+For dev, drop the affected `deployment_storage` rows + recreate the
+deployments. v0.5 does NOT support graceful key rotation — that's a
+follow-up.

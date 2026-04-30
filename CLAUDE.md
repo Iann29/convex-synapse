@@ -19,24 +19,25 @@ talks to Synapse with the same shape Cloud uses.
 
 | Path | What's there |
 |---|---|
-| `synapse/cmd/server/main.go` | Entrypoint. Wires DB, JWT, docker, health worker, provisioner worker, optional reverse proxy |
+| `synapse/cmd/server/main.go` | Entrypoint. Wires DB, JWT, docker, health worker, provisioner worker, optional reverse proxy, optional crypto box for HA |
 | `synapse/internal/api/` | HTTP handlers (one file per resource: auth, teams, projects, deployments, invites, access_tokens, audit_log, health) |
 | `synapse/internal/audit/` | Best-effort writer (`Record`) hooked into every mutating handler |
 | `synapse/internal/auth/` | Password hash, JWT issuer, opaque-token helpers, request context |
+| `synapse/internal/crypto/` | AES-256-GCM envelope (`SecretBox`) used for `deployment_storage` Postgres URL + S3 keys. v0.5+, opt-in via `SYNAPSE_STORAGE_KEY` |
 | `synapse/internal/db/` | pgx pool + embedded SQL migrations + `WithRetryOnUniqueViolation` + `WithTryAdvisoryLock` helpers |
-| `synapse/internal/docker/` | Docker SDK wrapper (Provision/Destroy/Status/Restart/GenerateAdminKey) |
-| `synapse/internal/health/` | Periodic worker that reconciles `deployments.status` with Docker reality. Optional auto-restart |
+| `synapse/internal/docker/` | Docker SDK wrapper. `Provision[Replica]/Destroy[Replica]/Status[Replica]/Restart[Replica]/GenerateAdminKey`. v0.5 split single-replica vs HA paths via `DeploymentSpec.HAReplica` + `Storage` |
+| `synapse/internal/health/` | Periodic worker that reconciles `deployment_replicas.status` with Docker reality, then rolls up to `deployments.status`. Optional auto-restart |
 | `synapse/internal/middleware/` | chi middleware (auth, logging, CORS) |
-| `synapse/internal/models/` | Domain types — JSON tags match OpenAPI v1 |
-| `synapse/internal/provisioner/` | Persistent job queue; `Worker` runs N parallel goroutines pulling via `SELECT FOR UPDATE SKIP LOCKED` |
-| `synapse/internal/proxy/` | Optional `/d/{name}/*` reverse proxy mount, with a name→address resolver cache |
-| `synapse/internal/test/` | Integration test suite (`Setup(t)` harness + per-resource `_test.go`). Package: `synapsetest` |
-| `synapse/internal/db/migrations/` | `go:embed`'d SQL migrations applied at startup. Currently 2 migrations |
-| `dashboard/` | Next.js 16 + Tailwind 4 dashboard. Real pages, not a placeholder |
-| `dashboard/tests/` | Playwright e2e (16 specs) — runs against live compose stack |
-| `docs/` | ARCHITECTURE.md, ROADMAP.md, QUICKSTART.md, API.md, DESIGN.md |
-| `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard |
-| `.env.example` | Every config var the backend reads |
+| `synapse/internal/models/` | Domain types — JSON tags match OpenAPI v1. v0.5 added `Deployment.HAEnabled/ReplicaCount`, `DeploymentReplica`, `DeploymentStorage` |
+| `synapse/internal/provisioner/` | Persistent job queue; `Worker` runs N parallel goroutines pulling via `SELECT FOR UPDATE SKIP LOCKED`. v0.5 reads `replica_id` and decrypts `deployment_storage` for HA jobs |
+| `synapse/internal/proxy/` | Optional `/d/{name}/*` reverse proxy. v0.5 returns multi-replica address list and fails over on connection error |
+| `synapse/internal/test/` | Integration test suite (`Setup(t)` / `SetupHA(t)` harness + per-resource `_test.go`). Package: `synapsetest` |
+| `synapse/internal/db/migrations/` | `go:embed`'d SQL migrations applied at startup. Currently 6 migrations (init, jobs, adopted, replicas, replica_id on jobs, upgrade_to_ha kind) |
+| `dashboard/` | Next.js 16 + Tailwind 4 dashboard. Real pages, not a placeholder. HA toggle + `HA ×N` badge on deployments since v0.5 |
+| `dashboard/tests/` | Playwright e2e (20 specs) — runs against live compose stack |
+| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, HA_TESTING |
+| `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile adds backend-postgres + minio for HA testing |
+| `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |
 
 ## Common commands
 
@@ -119,19 +120,27 @@ Both suites green on every push.
 - `Setup(t)` builds a fresh `synapse_test_<hex>` database, applies migrations,
   wires the chi router with a `FakeDocker` + a `provisioner.Worker` (50ms poll),
   and returns a `httptest.Server`. ~470ms warm.
+- `SetupHA(t)` (v0.5+) is the HA variant — same wiring plus a per-test
+  `*crypto.SecretBox` and stub HA cluster config so HA flows can be
+  exercised end-to-end against `FakeDocker`. The `Crypto` field on the
+  Harness exposes the box for tests that want to decrypt
+  `deployment_storage` rows directly.
 - Package `synapsetest` (NOT whitebox) — harness imports `internal/api`,
   co-locating tests would create an import cycle.
-- ~100 tests across auth/teams/projects/deployments/invites/health/proxy/
-  audit/access_tokens/race/advisorylock/provisioner.
+- ~131 tests across auth/teams/projects/deployments/invites/health/proxy/
+  audit/access_tokens/race/advisorylock/provisioner/HA.
 - Dependency: postgres on `localhost:5432` OR `SYNAPSE_TEST_DB_URL`. Skips
   (doesn't fail) if no postgres is reachable.
 - Decode every response with `json.DisallowUnknownFields()` so shape drift
   fails loudly.
+- Real-backend HA test (`ha_real_e2e_test.go`) is gated by
+  `SYNAPSE_HA_E2E=1`; skipped by default. See `docs/HA_TESTING.md` for
+  the operator setup.
 
 **Playwright e2e** (`dashboard/tests/`)
 
-- 16 specs against the live compose stack at `localhost:6790` + `:8080`.
-  ~1.5 min for the full suite.
+- 20 specs against the live compose stack at `localhost:6790` + `:8080`.
+  ~2.5 min for the full suite.
 - Direct postgres + Docker SDK for cleanup helpers in `tests/helpers/`.
 - All locators use stable IDs (`#register-email`) or roles. Avoid `getByText`
   with regex — those collide on partial matches; scope to `getByRole("dialog")`
@@ -167,12 +176,15 @@ If you're tempted to add one, move it to the roadmap and discuss first.
 | Teams + invites (multi-user via opaque tokens) | `internal/api/teams.go`, `internal/api/invites.go` |
 | Projects + env vars (CRUD, batch updates) | `internal/api/projects.go` |
 | Deployments (provision real Convex backends, ~1s) | `internal/api/deployments.go`, `internal/provisioner/` |
+| Adopt existing (register an external Convex backend) | `internal/api/deployments.go::adoptDeployment` |
+| Pagination on listings (`?limit&?cursor` + `X-Next-Cursor`) | `internal/api/pagination.go` |
 | `npx convex` CLI compatibility | `internal/api/deployments.go::deploymentCLICredentials` |
-| Reverse proxy (`/d/{name}/*`) | `internal/proxy/` |
-| Health worker + auto-restart | `internal/health/` |
+| Reverse proxy (`/d/{name}/*`, multi-replica failover) | `internal/proxy/` |
+| Health worker (replica-aware aggregate roll-up) + auto-restart | `internal/health/` |
 | Audit log (Cloud-vocabulary actions) | `internal/audit/`, `internal/api/audit_log.go` |
 | Multi-node hygiene (retry / advisory lock / queue) | `internal/db/`, `internal/provisioner/` |
-| Dashboard (16 e2e tests, real pages) | `dashboard/` |
+| **HA-per-deployment (v0.5)**: 2 replicas + Postgres + S3 backed, encrypted secrets, proxy failover, `upgrade_to_ha` endpoint reserved | `internal/crypto/`, `internal/db/migrations/000004-000006`, `internal/api/deployments.go::createDeployment ha:true`, `upgradeToHA` |
+| Dashboard (20 e2e tests, real pages, HA toggle + badge) | `dashboard/` |
 
 ## Pointers
 

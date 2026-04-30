@@ -42,12 +42,20 @@ Synapse fills that gap.
 
 ## Status
 
-**v0.4 done; v0.5 (HA-per-deployment) in flight — 8 of 10 chunks landed.**
-Operators can now opt a deployment into HA at create time: the backend
+**v0.5 (HA-per-deployment) feature-complete — 10/10 chunks landed.**
+Operators can opt a deployment into HA at create time: the backend
 provisions two replicas backed by Postgres + S3, the proxy fails over
-between them on connection errors, and the health worker tracks replica
-state independently. Single-replica behavior is unchanged — HA is a
-per-deployment switch behind `SYNAPSE_HA_ENABLED`.
+between them on connection errors, the health worker tracks replica
+state independently, and the dashboard surfaces a toggle + `HA ×2`
+badge. Single-replica behavior is unchanged — HA is a per-deployment
+switch behind `SYNAPSE_HA_ENABLED`.
+
+The mechanical pieces deferred to v0.5.1: the real-backend
+`docker kill`-the-active failover test (skeleton + compose profile
+shipped, see [docs/HA_TESTING.md](docs/HA_TESTING.md)), and the
+`upgrade_to_ha` worker that migrates an existing single-replica
+deployment to HA via `snapshot_export`/`snapshot_import` (the endpoint
+is reserved with full validation; today returns 501).
 
 The dashboard matches the Convex Cloud aesthetic (top app bar, team
 picker, redesigned home, team-settings shell), and the control plane is
@@ -88,13 +96,16 @@ What works today:
   replicas backed by Postgres + S3 with AES-GCM-encrypted creds at rest,
   proxy fails over between replicas on connection error, health worker
   rolls up replica statuses into the deployment-level status, dashboard
-  toggle + `HA ×N` badge. Real-backend e2e + `upgrade_to_ha` endpoint
-  still in flight — see [docs/ROADMAP.md](docs/ROADMAP.md).
-- ~125 Go integration tests + 20 Playwright e2e green in CI
+  toggle + `HA ×N` badge. `POST /v1/deployments/{name}/upgrade_to_ha`
+  endpoint reserved (validation live; worker mechanics in v0.5.1). See
+  [docs/HA_TESTING.md](docs/HA_TESTING.md) for the operator setup.
+- ~131 Go integration tests + 20 Playwright e2e green in CI
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next (chunks 9-10 of
-v0.5 still in flight; full plan in [docs/V0_5_PLAN.md](docs/V0_5_PLAN.md))
-and what's deliberately out of scope.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next (the v0.5.1
+follow-up — `upgrade_to_ha` worker + real-backend failover e2e), the
+v0.5 design in [docs/V0_5_PLAN.md](docs/V0_5_PLAN.md), and the operator
+guide in [docs/HA_TESTING.md](docs/HA_TESTING.md). What's deliberately
+out of scope is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Repo layout
 
@@ -102,8 +113,8 @@ and what's deliberately out of scope.
 |---|---|
 | `synapse/` | Go backend — the control plane (REST API + provisioner) |
 | `dashboard/` | Next.js frontend — original app talking to Synapse's REST surface |
-| `docs/` | Architecture notes, quickstart, roadmap, v0.5 plan |
-| `docker-compose.yml` | One-command local stack |
+| `docs/` | Architecture, quickstart, roadmap, API ref, v0.5 plan, HA testing guide |
+| `docker-compose.yml` | One-command local stack (+ optional `ha` profile for HA testing) |
 
 ## Quickstart
 

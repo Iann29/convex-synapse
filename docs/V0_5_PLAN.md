@@ -1,8 +1,19 @@
 # v0.5 — HA-per-deployment plan
 
+> **Status:** v0.5 is now landed (10/10 chunks merged into `main`). This
+> document is the original scoping pass that drove the implementation;
+> it's preserved for the design rationale (lease semantics, schema
+> shape, picker strategy, failover sequence). For the operator-facing
+> "how do I run this?" walkthrough see [HA_TESTING.md](HA_TESTING.md).
+> For the chunk-by-chunk landing log see [ROADMAP.md](ROADMAP.md).
+>
+> The mechanical pieces deferred to **v0.5.1** are listed at the bottom
+> of [ROADMAP.md](ROADMAP.md): the `upgrade_to_ha` worker, the
+> real-backend `docker kill` failover test, and the active health
+> probe in the proxy.
+
 Scoping document for the v0.5 milestone (active-passive failover per
-deployment). Authored by an investigation pass, not yet approved for
-implementation. Read this before writing any code in this area.
+deployment). Authored by an investigation pass.
 
 The v0.3 multi-node-hygiene work made the **control plane** survivable to a
 Synapse process restart; v0.5 makes the **data plane** survivable to a

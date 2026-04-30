@@ -36,8 +36,9 @@ go build ./... && go vet ./...
 ```bash
 PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
   "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, \
-   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs \
-   RESTART IDENTITY;"
+   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs, \
+   deployment_replicas, deployment_storage \
+   RESTART IDENTITY CASCADE;"
 docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
 docker volume ls -q --filter name=synapse-data- | xargs -r docker volume rm
 ```
@@ -47,6 +48,29 @@ Plain `DELETE FROM users` will fail because `teams.creator_user_id` has
 
 If you're between Playwright runs and the worker has in-flight goroutines
 from prior jobs, also `docker compose restart synapse` to nuke them.
+
+## HA mode (v0.5+, optional)
+
+By default `docker compose up -d` runs in single-replica mode. To
+exercise the HA path, opt into the `ha` compose profile and configure
+the cluster envs:
+
+```bash
+docker compose --profile ha up -d           # adds backend-postgres + minio
+openssl rand -hex 32                         # generate SYNAPSE_STORAGE_KEY
+# Add to .env:
+#   SYNAPSE_HA_ENABLED=true
+#   SYNAPSE_STORAGE_KEY=<hex>
+#   SYNAPSE_BACKEND_POSTGRES_URL=postgres://convex:convex@backend-postgres:5432/postgres?sslmode=disable
+#   SYNAPSE_BACKEND_S3_ENDPOINT=http://minio:9000
+#   SYNAPSE_BACKEND_S3_ACCESS_KEY=minioadmin
+#   SYNAPSE_BACKEND_S3_SECRET_KEY=minioadmin
+docker compose up -d synapse                 # restart with new env
+```
+
+See `docs/HA_TESTING.md` for the full operator walkthrough including
+pre-creating MinIO buckets. The profile is idle by default — plain
+`docker compose up -d` doesn't bring up the HA services.
 
 ## Smoke test the API
 
