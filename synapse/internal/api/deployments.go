@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -53,6 +54,18 @@ type DeploymentsHandler struct {
 	// HA carries cluster-wide HA defaults. Empty when HA isn't enabled
 	// — the handler refuses requests that ask for ha:true in that case.
 	HA HAConfig
+
+	// Crypto encrypts the per-deployment Postgres + S3 secrets stored
+	// in deployment_storage. Required when HA is enabled; unused when
+	// HA.Enabled is false. Type is interface{ EncryptString(string)
+	// ([]byte, error) } so we don't import internal/crypto here —
+	// production wiring passes *crypto.SecretBox.
+	Crypto SecretEncrypter
+}
+
+// SecretEncrypter is the *crypto.SecretBox subset the handler needs.
+type SecretEncrypter interface {
+	EncryptString(s string) ([]byte, error)
 }
 
 func (h *DeploymentsHandler) Routes() chi.Router {
@@ -171,23 +184,208 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 // Concurrent calls race and lose to the UNIQUE(host_port) constraint —
 // the create flow surfaces that as a retryable error.
 func (h *DeploymentsHandler) allocatePort(ctx context.Context) (int, error) {
-	var port int
-	err := h.DB.QueryRow(ctx, `
+	ports, err := h.allocatePorts(ctx, 1)
+	if err != nil {
+		return 0, err
+	}
+	return ports[0], nil
+}
+
+// allocatePorts returns N free host ports from the configured range.
+// "Free" considers both the legacy deployments.host_port and the v0.5
+// deployment_replicas.host_port columns so single- and HA-mode rows
+// don't collide with each other.
+//
+// Concurrency: the allocator picks candidates in a single SELECT but
+// commits them via separate INSERTs in the caller's transaction. Two
+// callers can pick overlapping ports; the UNIQUE constraints catch the
+// loser, the retry helper picks fresh candidates and tries again.
+func (h *DeploymentsHandler) allocatePorts(ctx context.Context, n int) ([]int, error) {
+	if n <= 0 {
+		return nil, errors.New("allocatePorts: n must be > 0")
+	}
+	rows, err := h.DB.Query(ctx, `
 		WITH used AS (
 		  SELECT host_port FROM deployments
 		   WHERE host_port IS NOT NULL AND status <> 'deleted'
+		  UNION
+		  SELECT host_port FROM deployment_replicas
+		   WHERE host_port IS NOT NULL AND status <> 'stopped' AND status <> 'failed'
 		)
 		SELECT p FROM (
 		  SELECT generate_series($1::int, $2::int) AS p
 		) candidates
 		 WHERE p NOT IN (SELECT host_port FROM used)
 		 ORDER BY p
-		 LIMIT 1
-	`, h.PortRangeMin, h.PortRangeMax).Scan(&port)
+		 LIMIT $3
+	`, h.PortRangeMin, h.PortRangeMax, n)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return port, nil
+	defer rows.Close()
+
+	out := make([]int, 0, n)
+	for rows.Next() {
+		var p int
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) < n {
+		return nil, fmt.Errorf("allocatePorts: only %d of %d requested ports free in range [%d,%d]",
+			len(out), n, h.PortRangeMin, h.PortRangeMax)
+	}
+	return out, nil
+}
+
+// perDeploymentStorage carries the resolved per-deployment Postgres +
+// S3 connection material. Every field is plaintext at this point —
+// EncryptString runs separately for the credential-bearing fields.
+type perDeploymentStorage struct {
+	PostgresURL     string
+	DBSchema        string
+	S3Endpoint      string
+	S3Region        string
+	S3AccessKey     string
+	S3SecretKey     string
+	BucketFiles     string
+	BucketModules   string
+	BucketSearch    string
+	BucketExports   string
+	BucketSnapshots string
+}
+
+// derivePerDeploymentStorage builds the storage spec for a new HA
+// deployment by combining cluster-wide defaults with per-deployment
+// overrides. The Postgres URL keeps the cluster's host/port/credentials
+// but swaps the database name to convex_<deployment>; the S3 buckets
+// are <prefix>-<deployment>-{files,modules,search,exports,snapshots}.
+func derivePerDeploymentStorage(deploymentName string, cluster HAConfig, overrides *haOverrides) perDeploymentStorage {
+	s := perDeploymentStorage{
+		PostgresURL: cluster.BackendPostgresURL,
+		S3Endpoint:  cluster.BackendS3Endpoint,
+		S3Region:    cluster.BackendS3Region,
+		S3AccessKey: cluster.BackendS3AccessKey,
+		S3SecretKey: cluster.BackendS3SecretKey,
+	}
+	if overrides != nil {
+		if overrides.PostgresURL != "" {
+			s.PostgresURL = overrides.PostgresURL
+		}
+		if overrides.S3Endpoint != "" {
+			s.S3Endpoint = overrides.S3Endpoint
+		}
+		if overrides.S3Region != "" {
+			s.S3Region = overrides.S3Region
+		}
+		if overrides.S3AccessKey != "" {
+			s.S3AccessKey = overrides.S3AccessKey
+		}
+		if overrides.S3SecretKey != "" {
+			s.S3SecretKey = overrides.S3SecretKey
+		}
+	}
+	// `convex_<deployment>` becomes the schema/database name. Swap the
+	// last path segment of the Postgres URL — the operator ran the
+	// cluster default at, say, `postgres://.../convex_admin`, and we
+	// route this deployment to `postgres://.../convex_happy_cat_1234`.
+	// A dedicated schema/database keeps the upstream backend's tables
+	// from colliding across tenants.
+	dbName := "convex_" + sqlIdent(deploymentName)
+	s.DBSchema = dbName
+	s.PostgresURL = swapPostgresDatabase(s.PostgresURL, dbName)
+
+	prefix := cluster.BackendBucketPrefix
+	if prefix == "" {
+		prefix = "convex"
+	}
+	bucketBase := prefix + "-" + sqlIdent(deploymentName)
+	s.BucketFiles = bucketBase + "-files"
+	s.BucketModules = bucketBase + "-modules"
+	s.BucketSearch = bucketBase + "-search"
+	s.BucketExports = bucketBase + "-exports"
+	s.BucketSnapshots = bucketBase + "-snapshots"
+	return s
+}
+
+// sqlIdent normalises a deployment name for use as a SQL identifier
+// fragment / S3 bucket name suffix. We replace dashes with underscores
+// for Postgres database names (Postgres allows `-` only in quoted
+// identifiers, and we'd rather not quote at backend-config time).
+// Buckets keep the dash form via the caller — same string fed into
+// "convex-{name}-files" works for S3 since S3 buckets allow dashes.
+func sqlIdent(deploymentName string) string {
+	out := make([]byte, 0, len(deploymentName))
+	for i := 0; i < len(deploymentName); i++ {
+		c := deploymentName[i]
+		switch {
+		case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+			out = append(out, c)
+		case c >= 'A' && c <= 'Z':
+			out = append(out, c+32)
+		default:
+			out = append(out, '_')
+		}
+	}
+	return string(out)
+}
+
+// swapPostgresDatabase replaces the path segment (the database name) of
+// a Postgres URL with the supplied dbName, preserving everything else
+// (host, port, user, password, query string).
+//
+// Why not net/url? net/url cleans the path component on serialisation
+// and we'd risk losing a non-default port or trailing slash. The
+// targeted replacement here is more predictable for the limited input
+// shapes we accept (postgres://user:pass@host:port/db?params).
+func swapPostgresDatabase(rawURL, dbName string) string {
+	// Find the slash after host[:port] — that's where the db name starts.
+	// Inputs look like postgres://[user[:pass]@]host[:port]/db[?params].
+	scheme := ""
+	for _, p := range []string{"postgres://", "postgresql://"} {
+		if len(rawURL) >= len(p) && rawURL[:len(p)] == p {
+			scheme = p
+			break
+		}
+	}
+	if scheme == "" {
+		// Unsupported shape — return as-is rather than mangle. The
+		// backend container will surface the URL to the operator.
+		return rawURL
+	}
+	rest := rawURL[len(scheme):]
+	slash := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '/' {
+			slash = i
+			break
+		}
+	}
+	prefix := rawURL
+	suffix := ""
+	if slash >= 0 {
+		prefix = rawURL[:len(scheme)+slash+1]
+		afterDB := rest[slash+1:]
+		// Cut off existing db name; keep query string intact.
+		q := -1
+		for i := 0; i < len(afterDB); i++ {
+			if afterDB[i] == '?' {
+				q = i
+				break
+			}
+		}
+		if q >= 0 {
+			suffix = afterDB[q:]
+		}
+	} else {
+		// No path at all — append a / before the db name.
+		prefix = rawURL + "/"
+	}
+	return prefix + dbName + suffix
 }
 
 // allocateDeploymentName generates a unique friendly name. Race-loses are
@@ -285,13 +483,6 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if req.HA {
-		// HA-aware provisioning lands across v0.5 chunks 4-5 (replica
-		// allocation + worker rewrite + proxy picker). The body field is
-		// accepted now so the dashboard doesn't have to do feature
-		// detection later, but actual HA flows are gated on flag + plan.
-		// Until those land, refuse loudly so an operator who turns on
-		// HA in their config doesn't get a silent fallback to a single
-		// SQLite replica that can't survive a host loss.
 		if !h.HA.Enabled {
 			writeError(w, http.StatusBadRequest, "ha_disabled",
 				"HA-per-deployment is disabled on this Synapse instance (set SYNAPSE_HA_ENABLED=true)")
@@ -302,12 +493,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 				"HA is enabled but cluster config is incomplete: "+missing)
 			return
 		}
-		// Implementation lands in v0.5 chunks 4-5. Refusing now is the
-		// honest answer; we'll flip this to the actual flow when the
-		// replica-aware provisioner + proxy picker are in place.
-		writeError(w, http.StatusNotImplemented, "ha_not_yet_implemented",
-			"HA provisioning is in flight; see docs/V0_5_PLAN.md")
-		return
+		if h.Crypto == nil {
+			writeError(w, http.StatusBadRequest, "ha_misconfigured",
+				"HA is enabled but SYNAPSE_STORAGE_KEY is not set")
+			return
+		}
 	}
 
 	// INSTANCE_SECRET is independent of name/port so we generate it once and
@@ -318,6 +508,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
 		return
+	}
+
+	replicaCount := 1
+	if req.HA {
+		replicaCount = 2
 	}
 
 	// Allocate (name, port, adminKey) and INSERT atomically. Two synapse
@@ -333,9 +528,11 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	d.IsDefault = req.IsDefault
 	d.Reference = req.Reference
 	d.CreatorUserID = uid
+	d.HAEnabled = req.HA
+	d.ReplicaCount = replicaCount
 
 	var name string
-	var port int
+	var ports []int
 	var adminKey string
 
 	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
@@ -344,7 +541,7 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		if allocErr != nil {
 			return allocErr
 		}
-		port, allocErr = h.allocatePort(r.Context())
+		ports, allocErr = h.allocatePorts(r.Context(), replicaCount)
 		if allocErr != nil {
 			return allocErr
 		}
@@ -352,28 +549,82 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		if allocErr != nil {
 			return allocErr
 		}
-		// Insert the deployment row + enqueue the provisioning job in a
-		// single transaction so we never end up with a row that no worker
-		// will pick up (or a queue entry that points at nothing).
+		// Insert the deployment row + N replica rows + (optional) storage row +
+		// N provisioning jobs in one transaction so we never end up with a
+		// half-formed deployment.
 		tx, txErr := h.DB.Begin(r.Context())
 		if txErr != nil {
 			return txErr
 		}
 		defer tx.Rollback(r.Context())
 
+		// deployments.host_port stays in the row for single-replica
+		// back-compat (legacy code paths still read it). For HA, we
+		// store the first replica's port so the legacy fallback still
+		// resolves to something live during a roll-out.
+		primaryPort := ports[0]
 		if txErr = tx.QueryRow(r.Context(), `
 			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
 			                          admin_key, instance_secret, is_default, reference,
-			                          creator_user_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
+			                          creator_user_id, ha_enabled, replica_count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12)
 			RETURNING id, created_at
-		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
+		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, primaryPort,
 			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
+			req.HA, replicaCount,
 		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
 			return txErr
 		}
-		if txErr = provisioner.Enqueue(r.Context(), tx, d.ID, h.HealthcheckViaNetwork); txErr != nil {
-			return txErr
+
+		// Per-deployment storage row (HA only). Each deployment gets
+		// its own database name + bucket prefix so multiple HA
+		// deployments can share a single Postgres + S3 cluster without
+		// stepping on each other.
+		if req.HA {
+			storage := derivePerDeploymentStorage(name, h.HA, req.HAOverrides)
+			dbURLEnc, encErr := h.Crypto.EncryptString(storage.PostgresURL)
+			if encErr != nil {
+				return fmt.Errorf("encrypt db_url: %w", encErr)
+			}
+			s3KeyEnc, encErr := h.Crypto.EncryptString(storage.S3AccessKey)
+			if encErr != nil {
+				return fmt.Errorf("encrypt s3_access_key: %w", encErr)
+			}
+			s3SecretEnc, encErr := h.Crypto.EncryptString(storage.S3SecretKey)
+			if encErr != nil {
+				return fmt.Errorf("encrypt s3_secret_key: %w", encErr)
+			}
+			if _, txErr = tx.Exec(r.Context(), `
+				INSERT INTO deployment_storage (deployment_id, db_kind, db_url_enc, db_schema,
+				                                 s3_endpoint, s3_region,
+				                                 s3_access_key_enc, s3_secret_key_enc,
+				                                 s3_bucket_files, s3_bucket_modules, s3_bucket_search,
+				                                 s3_bucket_exports, s3_bucket_snapshots)
+				VALUES ($1, 'postgres', $2, $3,
+				        $4, $5, $6, $7,
+				        $8, $9, $10, $11, $12)
+			`, d.ID, dbURLEnc, storage.DBSchema,
+				storage.S3Endpoint, storage.S3Region, s3KeyEnc, s3SecretEnc,
+				storage.BucketFiles, storage.BucketModules, storage.BucketSearch,
+				storage.BucketExports, storage.BucketSnapshots,
+			); txErr != nil {
+				return txErr
+			}
+		}
+
+		// Replica rows + their provisioning jobs.
+		for idx, port := range ports {
+			var replicaID string
+			if txErr = tx.QueryRow(r.Context(), `
+				INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, status)
+				VALUES ($1, $2, $3, 'provisioning')
+				RETURNING id
+			`, d.ID, idx, port).Scan(&replicaID); txErr != nil {
+				return txErr
+			}
+			if txErr = provisioner.EnqueueReplica(r.Context(), tx, d.ID, replicaID, h.HealthcheckViaNetwork); txErr != nil {
+				return txErr
+			}
 		}
 		return tx.Commit(r.Context())
 	})
@@ -383,7 +634,9 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 	d.Name = name
-	d.HostPort = port
+	if len(ports) > 0 {
+		d.HostPort = ports[0]
+	}
 	d.AdminKey = adminKey
 
 	// The provisioner.Worker on this (or any) Synapse process will dequeue

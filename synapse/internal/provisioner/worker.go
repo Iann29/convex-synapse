@@ -17,6 +17,7 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"time"
@@ -92,6 +93,20 @@ type Worker struct {
 	Docker Provisioner
 	Config Config
 	Logger *slog.Logger
+
+	// Crypto, when non-nil, decrypts the per-deployment Postgres + S3
+	// secrets in deployment_storage. Required for HA deployments;
+	// single-replica deployments don't read it. nil disables HA-mode
+	// provisioning (jobs with replica_id pointing at HA deployments
+	// will fail with a clear error rather than panic).
+	Crypto SecretDecrypter
+}
+
+// SecretDecrypter is the *crypto.SecretBox subset the worker needs.
+// Pulled out behind an interface so the worker package doesn't import
+// internal/crypto, keeping the dependency arrows clean.
+type SecretDecrypter interface {
+	DecryptString(ciphertext []byte) (string, error)
 }
 
 // Execer is the Exec subset of pgx — pool, conn, or tx all satisfy it.
@@ -104,11 +119,32 @@ type Execer interface {
 // Enqueue inserts a 'provision' job for deploymentID. The caller is expected
 // to have just inserted (or about to insert in the same txn) the matching
 // deployments row in 'provisioning' state.
+//
+// Single-replica deployments leave replicaID empty — the worker resolves
+// replica_index=0 from the deployment automatically and behaves exactly
+// like pre-v0.5. HA deployments enqueue one job per replica with the
+// matching deployment_replicas.id.
 func Enqueue(ctx context.Context, db Execer, deploymentID string, healthcheckViaNetwork bool) error {
+	return EnqueueReplica(ctx, db, deploymentID, "", healthcheckViaNetwork)
+}
+
+// EnqueueReplica is the HA-aware variant of Enqueue. Pass the
+// deployment_replicas.id so the worker can read per-replica info
+// (replica_index, host_port) and set deployment_replicas.status when
+// it finishes. An empty replicaID falls back to the legacy
+// "no replica row" behaviour for backwards compatibility.
+func EnqueueReplica(ctx context.Context, db Execer, deploymentID, replicaID string, healthcheckViaNetwork bool) error {
+	if replicaID == "" {
+		_, err := db.Exec(ctx, `
+			INSERT INTO provisioning_jobs (deployment_id, kind, status, healthcheck_via_network)
+			VALUES ($1, 'provision', 'pending', $2)
+		`, deploymentID, healthcheckViaNetwork)
+		return err
+	}
 	_, err := db.Exec(ctx, `
-		INSERT INTO provisioning_jobs (deployment_id, kind, status, healthcheck_via_network)
-		VALUES ($1, 'provision', 'pending', $2)
-	`, deploymentID, healthcheckViaNetwork)
+		INSERT INTO provisioning_jobs (deployment_id, replica_id, kind, status, healthcheck_via_network)
+		VALUES ($1, $2, 'provision', 'pending', $3)
+	`, deploymentID, replicaID, healthcheckViaNetwork)
 	return err
 }
 
@@ -216,11 +252,45 @@ type claimedJob struct {
 	HostPort              int
 	InstanceSecret        string
 	HealthcheckViaNetwork bool
+
+	// Replica targeting (v0.5+). When ReplicaID is empty, this is a
+	// pre-v0.5 single-replica job; the worker treats it as
+	// replica_index=0 with no HA suffix. When set, the worker reads
+	// replica_index from deployment_replicas and uses the HA-aware
+	// container naming + storage env-vars.
+	ReplicaID    string
+	ReplicaIndex int
+	HAEnabled    bool
+	// Decrypted storage env (Postgres URL + S3) when the deployment
+	// runs in HA mode. nil for SQLite/legacy.
+	Storage *Storage
+}
+
+// Storage carries the per-deployment Postgres + S3 connection info that
+// gets pushed into the container as env vars. Decrypted from
+// deployment_storage by claimNext using the configured SecretBox.
+type Storage struct {
+	PostgresURL       string
+	DoNotRequireSSL   bool
+	S3Endpoint        string
+	S3Region          string
+	S3AccessKey       string
+	S3SecretKey       string
+	BucketFiles       string
+	BucketModules     string
+	BucketSearch      string
+	BucketExports     string
+	BucketSnapshots   string
 }
 
 // claimNext pulls the oldest pending job, atomically marks it 'claimed',
-// and joins the deployments row for the data the worker needs (name,
-// host_port, instance_secret).
+// and joins the deployments + (optional) deployment_replicas /
+// deployment_storage rows for the data the worker needs.
+//
+// Single-replica jobs (replica_id IS NULL) read host_port from the
+// deployments row, exactly like the pre-v0.5 worker. HA jobs
+// (replica_id IS NOT NULL) read host_port from the replica row and
+// load decrypted storage env vars from deployment_storage.
 //
 // SELECT … FOR UPDATE SKIP LOCKED is what makes this safe across N nodes:
 // each worker grabs a different row, no contention, no doubled work.
@@ -233,21 +303,70 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 	defer tx.Rollback(ctx)
 
 	var j claimedJob
+	var replicaID, replicaIndex *int64
+	var replicaIDStr *string
+	var replicaHostPort *int
+	var deploymentHostPort *int
 	err = tx.QueryRow(ctx, `
-		SELECT j.id, j.deployment_id, d.name, d.host_port, d.instance_secret, j.healthcheck_via_network
+		SELECT j.id, j.deployment_id, j.replica_id::text,
+		       d.name, d.host_port, d.instance_secret, d.ha_enabled,
+		       r.replica_index, r.host_port,
+		       j.healthcheck_via_network
 		  FROM provisioning_jobs j
 		  JOIN deployments d ON d.id = j.deployment_id
+		  LEFT JOIN deployment_replicas r ON r.id = j.replica_id
 		 WHERE j.status = 'pending'
 		 ORDER BY j.created_at ASC
 		 FOR UPDATE OF j SKIP LOCKED
 		 LIMIT 1
-	`).Scan(&j.JobID, &j.DeploymentID, &j.Name, &j.HostPort, &j.InstanceSecret, &j.HealthcheckViaNetwork)
+	`).Scan(&j.JobID, &j.DeploymentID, &replicaIDStr,
+		&j.Name, &deploymentHostPort, &j.InstanceSecret, &j.HAEnabled,
+		&replicaIndex, &replicaHostPort,
+		&j.HealthcheckViaNetwork)
+	_ = replicaID
 	if errors.Is(err, pgx.ErrNoRows) {
 		return claimedJob{}, false
 	}
 	if err != nil {
 		logger.Error("provisioner: claim query", "err", err)
 		return claimedJob{}, false
+	}
+
+	// Decide which host_port wins. If we joined a replica row, prefer
+	// it (the ground truth for HA deployments). Otherwise fall back to
+	// the deployments row.
+	if replicaHostPort != nil {
+		j.HostPort = *replicaHostPort
+	} else if deploymentHostPort != nil {
+		j.HostPort = *deploymentHostPort
+	}
+	if replicaIDStr != nil && *replicaIDStr != "" {
+		j.ReplicaID = *replicaIDStr
+		if replicaIndex != nil {
+			j.ReplicaIndex = int(*replicaIndex)
+		}
+	}
+
+	// Load decrypted storage env vars for HA deployments. Failure is
+	// terminal — without storage we can't provision; mark the job
+	// failed and let the worker move on.
+	if j.HAEnabled {
+		if w.Crypto == nil {
+			logger.Error("provisioner: HA job seen but worker has no crypto helper",
+				"job_id", j.JobID, "deployment_id", j.DeploymentID)
+			// Don't claim — leave it pending so a properly-configured
+			// worker can pick it up. (Otherwise we'd flap the row to
+			// failed and prevent recovery.)
+			return claimedJob{}, false
+		}
+		storage, loadErr := loadStorage(ctx, tx, w.Crypto, j.DeploymentID)
+		if loadErr != nil {
+			logger.Error("provisioner: load deployment_storage failed",
+				"job_id", j.JobID, "deployment_id", j.DeploymentID, "err", loadErr)
+			// Same reasoning — leave the job pending; no claim.
+			return claimedJob{}, false
+		}
+		j.Storage = storage
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -267,6 +386,95 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 		return claimedJob{}, false
 	}
 	return j, true
+}
+
+// loadStorage reads a deployment_storage row and decrypts the
+// connection material so the worker can hand it to Provision as
+// plaintext env vars. Errors (row missing, decryption failure) bubble
+// up — the caller leaves the job pending so a re-keyed worker can
+// retry without the bad row clogging the queue.
+func loadStorage(ctx context.Context, tx pgx.Tx, dec SecretDecrypter, deploymentID string) (*Storage, error) {
+	var (
+		dbURLEnc        []byte
+		s3AccessKeyEnc  []byte
+		s3SecretKeyEnc  []byte
+		s3Endpoint      string
+		s3Region        string
+		bucketFiles     string
+		bucketModules   string
+		bucketSearch    string
+		bucketExports   string
+		bucketSnapshots string
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT db_url_enc, s3_access_key_enc, s3_secret_key_enc,
+		       s3_endpoint, s3_region,
+		       s3_bucket_files, s3_bucket_modules, s3_bucket_search,
+		       s3_bucket_exports, s3_bucket_snapshots
+		  FROM deployment_storage
+		 WHERE deployment_id = $1
+	`, deploymentID).Scan(&dbURLEnc, &s3AccessKeyEnc, &s3SecretKeyEnc,
+		&s3Endpoint, &s3Region,
+		&bucketFiles, &bucketModules, &bucketSearch,
+		&bucketExports, &bucketSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("read deployment_storage: %w", err)
+	}
+
+	dbURL, err := dec.DecryptString(dbURLEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt db_url: %w", err)
+	}
+	s3Access, err := dec.DecryptString(s3AccessKeyEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt s3_access_key: %w", err)
+	}
+	s3Secret, err := dec.DecryptString(s3SecretKeyEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt s3_secret_key: %w", err)
+	}
+
+	return &Storage{
+		PostgresURL: dbURL,
+		// Operators on internal Postgres / MinIO over plain HTTP need
+		// the backend's DO_NOT_REQUIRE_SSL=1; we infer it from the URL
+		// scheme on the Postgres side, and the S3 endpoint never sees
+		// this flag (S3 SDK negotiates separately).
+		DoNotRequireSSL: !hasSSLPrefix(dbURL),
+		S3Endpoint:      s3Endpoint,
+		S3Region:        s3Region,
+		S3AccessKey:     s3Access,
+		S3SecretKey:     s3Secret,
+		BucketFiles:     bucketFiles,
+		BucketModules:   bucketModules,
+		BucketSearch:    bucketSearch,
+		BucketExports:   bucketExports,
+		BucketSnapshots: bucketSnapshots,
+	}, nil
+}
+
+func hasSSLPrefix(url string) bool {
+	// Quick heuristic — `?sslmode=require` (or stricter) anywhere in
+	// the URL means TLS is enforced; absence means we should pass
+	// DO_NOT_REQUIRE_SSL=1 to the backend so it doesn't refuse the
+	// connection. Not a parser; a bad URL fails later in the backend
+	// regardless.
+	return contains(url, "sslmode=require") ||
+		contains(url, "sslmode=verify-ca") ||
+		contains(url, "sslmode=verify-full")
+}
+
+func contains(s, sub string) bool {
+	return len(sub) <= len(s) && indexOf(s, sub) >= 0
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 // runJob executes the docker provisioning for a claimed job. Updates the
@@ -290,19 +498,27 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		}
 	}()
 
-	// Pre-check: if the deployment row was already deleted (test truncate
-	// between claim and run, or a real /delete that arrived after we
-	// claimed but before we started Docker.Provision), skip the costly
-	// Provision call entirely. The same check exists post-Provision as a
-	// safety net, but the pre-check turns "create container then destroy
-	// it" into a no-op SQL probe, which matters under heavy queue churn.
+	// Pre-check: skip costly Provision when the work is no longer needed.
+	//
+	// HA jobs check the *replica* row's status — sibling replicas might
+	// have already flipped the deployment row to 'running' but THIS
+	// replica still has work to do. Single-replica jobs check the
+	// deployment row directly (legacy behaviour: deployment.status is
+	// the only signal).
 	var current string
-	if err := w.DB.QueryRow(ctx,
-		`SELECT status FROM deployments WHERE id = $1`, j.DeploymentID,
-	).Scan(&current); err != nil {
+	var query string
+	var arg string
+	if j.ReplicaID != "" {
+		query = `SELECT status FROM deployment_replicas WHERE id = $1`
+		arg = j.ReplicaID
+	} else {
+		query = `SELECT status FROM deployments WHERE id = $1`
+		arg = j.DeploymentID
+	}
+	if err := w.DB.QueryRow(ctx, query, arg).Scan(&current); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			logger.Info("provisioner: deployment row gone before provision; skipping",
-				"deployment_id", j.DeploymentID, "name", j.Name)
+			logger.Info("provisioner: row gone before provision; skipping",
+				"deployment_id", j.DeploymentID, "name", j.Name, "replica", j.ReplicaIndex)
 			w.markDone(j.JobID)
 			return
 		}
@@ -311,24 +527,53 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		logger.Warn("provisioner: pre-check status query failed",
 			"deployment_id", j.DeploymentID, "err", err)
 	} else if current != models.DeploymentStatusProvisioning {
-		logger.Info("provisioner: deployment no longer provisioning; skipping",
-			"deployment_id", j.DeploymentID, "name", j.Name, "status", current)
+		logger.Info("provisioner: row no longer provisioning; skipping",
+			"deployment_id", j.DeploymentID, "name", j.Name,
+			"replica", j.ReplicaIndex, "status", current)
 		w.markDone(j.JobID)
 		return
 	}
 
-	info, err := w.Docker.Provision(ctx, dockerprov.DeploymentSpec{
+	spec := dockerprov.DeploymentSpec{
 		Name:                  j.Name,
 		InstanceSecret:        j.InstanceSecret,
 		HostPort:              j.HostPort,
 		EnvVars:               map[string]string{},
 		HealthcheckViaNetwork: j.HealthcheckViaNetwork,
-	})
+		HAReplica:             j.HAEnabled,
+		ReplicaIndex:          j.ReplicaIndex,
+	}
+	if j.Storage != nil {
+		spec.Storage = &dockerprov.StorageEnv{
+			PostgresURL:     j.Storage.PostgresURL,
+			DoNotRequireSSL: j.Storage.DoNotRequireSSL,
+			S3Endpoint:      j.Storage.S3Endpoint,
+			S3Region:        j.Storage.S3Region,
+			S3AccessKey:     j.Storage.S3AccessKey,
+			S3SecretKey:     j.Storage.S3SecretKey,
+			BucketFiles:     j.Storage.BucketFiles,
+			BucketModules:   j.Storage.BucketModules,
+			BucketSearch:    j.Storage.BucketSearch,
+			BucketExports:   j.Storage.BucketExports,
+			BucketSnapshots: j.Storage.BucketSnapshots,
+		}
+	}
+
+	info, err := w.Docker.Provision(ctx, spec)
 	if err != nil {
 		logger.Error("provisioner: provision failed",
-			"job_id", j.JobID, "deployment", j.Name, "err", err)
+			"job_id", j.JobID, "deployment", j.Name, "replica", j.ReplicaIndex, "err", err)
 		w.markFailed(j.JobID, j.DeploymentID, err.Error())
 		return
+	}
+
+	// Update both the replica (when one is targeted) and the deployment
+	// row. Single-replica deployments (legacy + v0.5 single mode) only
+	// have replica_index=0; we still write its replica row so the proxy
+	// resolver and health worker can read uniformly from
+	// deployment_replicas.
+	if j.ReplicaID != "" {
+		w.markReplicaRunning(ctx, logger, j.ReplicaID, info.ContainerID)
 	}
 
 	// Atomic UPDATE WHERE status='provisioning' — if /delete flipped the
@@ -337,8 +582,8 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 	tag, err := w.DB.Exec(ctx, `
 		UPDATE deployments
 		   SET status         = $1,
-		       container_id   = $2,
-		       deployment_url = $3,
+		       container_id   = COALESCE(container_id, $2),
+		       deployment_url = COALESCE(deployment_url, $3),
 		       last_deploy_at = now()
 		 WHERE id = $4
 		   AND status = 'provisioning'
@@ -350,21 +595,59 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 	}
 
 	if tag.RowsAffected() == 0 {
+		// HA: status may already be "running" because a sibling replica
+		// finished first — that's fine, leave it. Only treat 0 rows as
+		// "deployment was deleted" when there's no other running replica.
+		if j.HAEnabled {
+			var runningReplicas int
+			_ = w.DB.QueryRow(ctx, `
+				SELECT count(*) FROM deployment_replicas
+				 WHERE deployment_id = $1 AND status = 'running'
+			`, j.DeploymentID).Scan(&runningReplicas)
+			if runningReplicas > 0 {
+				w.markDone(j.JobID)
+				logger.Info("provisioner: replica ready (sibling already running)",
+					"deployment_id", j.DeploymentID, "name", j.Name,
+					"replica", j.ReplicaIndex, "job_id", j.JobID)
+				return
+			}
+		}
 		logger.Warn("provisioner: deployment no longer provisioning; cleaning up",
 			"deployment_id", j.DeploymentID, "name", j.Name)
-		if destroyErr := w.Docker.Destroy(ctx, j.Name); destroyErr != nil {
+		if j.HAEnabled {
+			if destroyErr := w.Docker.Destroy(ctx, j.Name); destroyErr != nil {
+				logger.Warn("provisioner: cleanup destroy failed",
+					"deployment_id", j.DeploymentID, "err", destroyErr)
+			}
+		} else if destroyErr := w.Docker.Destroy(ctx, j.Name); destroyErr != nil {
 			logger.Warn("provisioner: cleanup destroy failed",
 				"deployment_id", j.DeploymentID, "err", destroyErr)
 		}
-		// Mark the job done either way — it executed successfully, the
-		// row was just deleted out from under us.
 		w.markDone(j.JobID)
 		return
 	}
 
 	w.markDone(j.JobID)
 	logger.Info("provisioner: deployment ready",
-		"deployment_id", j.DeploymentID, "name", j.Name, "job_id", j.JobID)
+		"deployment_id", j.DeploymentID, "name", j.Name,
+		"replica", j.ReplicaIndex, "job_id", j.JobID)
+}
+
+// markReplicaRunning flips a deployment_replicas row to 'running' once
+// the worker's Provision call returns. Best-effort: a transient DB
+// error is logged but doesn't fail the job — the next health-worker
+// sweep will reconcile if the row drifts.
+func (w *Worker) markReplicaRunning(ctx context.Context, logger *slog.Logger, replicaID, containerID string) {
+	if _, err := w.DB.Exec(ctx, `
+		UPDATE deployment_replicas
+		   SET status = 'running',
+		       container_id = $1
+		 WHERE id = $2
+		   AND status = 'provisioning'
+	`, containerID, replicaID); err != nil {
+		logger.Warn("provisioner: mark replica running",
+			"replica_id", replicaID, "err", err)
+	}
 }
 
 func (w *Worker) markDone(jobID int64) {

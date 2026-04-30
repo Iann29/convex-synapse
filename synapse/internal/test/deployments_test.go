@@ -47,6 +47,9 @@ type deploymentResp struct {
 	IsDefault      bool       `json:"isDefault"`
 	Reference      string     `json:"reference,omitempty"`
 	Creator        string     `json:"creator,omitempty"`
+	Adopted        bool       `json:"adopted,omitempty"`
+	HAEnabled      bool       `json:"haEnabled,omitempty"`
+	ReplicaCount   int        `json:"replicaCount,omitempty"`
 	CreateTime     time.Time  `json:"createTime"`
 	LastDeployTime *time.Time `json:"lastDeployTime,omitempty"`
 	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`

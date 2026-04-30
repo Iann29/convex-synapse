@@ -16,6 +16,7 @@ import (
 	"github.com/Iann29/synapse/internal/api"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/config"
+	"github.com/Iann29/synapse/internal/crypto"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/health"
@@ -76,6 +77,20 @@ func run() error {
 		logger.Warn("docker unavailable; provisioning endpoints will fail", "err", err)
 	}
 
+	// Storage-secrets crypto. Optional — only HA-enabled clusters need
+	// it. When unset the handler refuses ha:true with ha_misconfigured;
+	// non-HA flows are unaffected.
+	var secretBox *crypto.SecretBox
+	if cfg.HAEnabled {
+		secretBox, err = crypto.NewFromEnv()
+		if err != nil {
+			logger.Error("HA enabled but SYNAPSE_STORAGE_KEY is missing or malformed",
+				"err", err)
+			return err
+		}
+		logger.Info("HA mode enabled; storage secrets envelope active")
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
 		Logger:                logger,
 		DB:                    pool,
@@ -95,6 +110,7 @@ func run() error {
 			BackendS3SecretKey:  cfg.BackendS3SecretKey,
 			BackendBucketPrefix: cfg.BackendS3BucketPrefix,
 		},
+		Crypto: secretBox,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the
@@ -117,6 +133,7 @@ func run() error {
 				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
 			},
 			Logger: logger,
+			Crypto: secretBox, // nil when HA is off — single-replica jobs don't read it
 		}
 		go pworker.Run(rootCtx)
 	}

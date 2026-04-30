@@ -33,6 +33,12 @@ type RouterDeps struct {
 	// honours the `ha:true` flag in the request body and provisions
 	// replicas backed by the configured Postgres + S3.
 	HA HAConfig
+
+	// Crypto encrypts deployment_storage secrets at rest. Required when
+	// HA.Enabled is true; nil disables the HA path. The handler refuses
+	// ha:true requests with ha_misconfigured when HA is on but Crypto
+	// is unset.
+	Crypto SecretEncrypter
 }
 
 // HAConfig carries cluster-wide defaults for the per-deployment Postgres
@@ -80,6 +86,7 @@ func NewRouter(d RouterDeps) http.Handler {
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
 		HA:                    d.HA,
+		Crypto:                d.Crypto,
 	}
 	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
 
