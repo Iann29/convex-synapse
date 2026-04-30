@@ -3,9 +3,7 @@ package api
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
-	"runtime/debug"
 	"strings"
 	"time"
 
@@ -13,9 +11,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
+	"github.com/Iann29/synapse/internal/provisioner"
 )
 
 // provisionTimeout caps how long the background goroutine waits for Docker.
@@ -26,12 +27,17 @@ const provisionTimeout = 5 * time.Minute
 
 // Provisioner is the subset of the docker provisioner that the deployments
 // handler depends on. Pulled out behind an interface so tests can swap in a
-// fake without spinning up a real Docker daemon. *dockerprov.Client implements
-// this (Provision/Destroy/Status), so production wiring is unchanged.
+// fake without spinning up a real Docker daemon. *dockerprov.Client
+// implements all four methods, so production wiring is unchanged.
 type Provisioner interface {
 	Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	Destroy(ctx context.Context, deploymentName string) error
 	Status(ctx context.Context, deploymentName string) (string, error)
+	// GenerateAdminKey runs the convex-backend's `generate_key` binary in a
+	// throwaway container so the resulting key passes the running container's
+	// `/api/check_admin_key` validation. Random hex strings are rejected by
+	// the keybroker which signs admin keys with INSTANCE_SECRET.
+	GenerateAdminKey(ctx context.Context, instanceName, instanceSecret string) (string, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -63,6 +69,7 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 // handler into projects.go.
 func (h *DeploymentsHandler) MountProjectScopedRoutes(r chi.Router) {
 	r.Post("/create_deployment", h.createDeployment)
+	r.Post("/adopt_deployment", h.adoptDeployment)
 	r.Get("/deployment", h.getProjectDeployment)
 }
 
@@ -119,7 +126,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	err := db.QueryRow(ctx, `
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
-		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id,
+		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
 		       p.id, p.team_id, p.name, p.slug, p.is_demo, p.created_at,
 		       t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
 		  FROM deployments d
@@ -130,7 +137,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	`, name).Scan(
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
-		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID,
+		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
 		&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt,
 		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
 	)
@@ -255,156 +262,349 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	name, err := h.allocateDeploymentName(r.Context())
-	if err != nil {
-		logErr("alloc name", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate deployment name")
-		return
-	}
-	port, err := h.allocatePort(r.Context())
-	if err != nil {
-		logErr("alloc port", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate host port")
-		return
-	}
-
+	// INSTANCE_SECRET is independent of name/port so we generate it once and
+	// keep it across retries. The admin key, by contrast, is derived from
+	// (name, secret) via Convex's `generate_key` — if we regenerate the name
+	// we have to regenerate the admin key too, so it lives inside the loop.
 	instanceSecret, err := dockerprov.RandomHex(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
 		return
 	}
-	adminKey, err := dockerprov.RandomHex(32)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate admin key")
-		return
-	}
 
-	// Insert as 'provisioning' first so concurrent allocators see this port
-	// as taken. We update with container_id + url after Provision returns.
+	// Allocate (name, port, adminKey) and INSERT atomically. Two synapse
+	// nodes (or two concurrent goroutines on one node) can pick the same
+	// port or name from the SELECT-EXISTS pre-check; the UNIQUE constraints
+	// on `name` and `host_port` reject the loser, the retry helper picks
+	// fresh candidates and tries again.
 	var d models.Deployment
 	d.ProjectID = projectID
-	d.Name = name
 	d.DeploymentType = req.Type
 	d.Status = models.DeploymentStatusProvisioning
-	d.HostPort = port
-	d.AdminKey = adminKey
 	d.InstanceSecret = instanceSecret
 	d.IsDefault = req.IsDefault
 	d.Reference = req.Reference
 	d.CreatorUserID = uid
 
-	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
-		                          admin_key, instance_secret, is_default, reference,
-		                          creator_user_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
-		RETURNING id, created_at
-	`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
-		adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
-	).Scan(&d.ID, &d.CreatedAt)
+	var name string
+	var port int
+	var adminKey string
+
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
+		var allocErr error
+		name, allocErr = h.allocateDeploymentName(r.Context())
+		if allocErr != nil {
+			return allocErr
+		}
+		port, allocErr = h.allocatePort(r.Context())
+		if allocErr != nil {
+			return allocErr
+		}
+		adminKey, allocErr = h.Docker.GenerateAdminKey(r.Context(), name, instanceSecret)
+		if allocErr != nil {
+			return allocErr
+		}
+		// Insert the deployment row + enqueue the provisioning job in a
+		// single transaction so we never end up with a row that no worker
+		// will pick up (or a queue entry that points at nothing).
+		tx, txErr := h.DB.Begin(r.Context())
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback(r.Context())
+
+		if txErr = tx.QueryRow(r.Context(), `
+			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
+			                          admin_key, instance_secret, is_default, reference,
+			                          creator_user_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
+			RETURNING id, created_at
+		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, port,
+			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
+		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
+			return txErr
+		}
+		if txErr = provisioner.Enqueue(r.Context(), tx, d.ID, h.HealthcheckViaNetwork); txErr != nil {
+			return txErr
+		}
+		return tx.Commit(r.Context())
+	})
 	if err != nil {
 		logErr("insert deployment", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to record deployment")
 		return
 	}
+	d.Name = name
+	d.HostPort = port
+	d.AdminKey = adminKey
 
-	// Provisioning runs in the background so the handler returns instantly.
-	// We hand the goroutine its own context (the request context dies when
-	// we write the response below) with a generous deadline that covers a
-	// cold image pull on a slow link.
-	go h.provisionInBackground(d.ID, dockerprov.DeploymentSpec{
-		Name:                  name,
-		InstanceSecret:        instanceSecret,
-		HostPort:              port,
-		EnvVars:               map[string]string{},
-		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
+	// The provisioner.Worker on this (or any) Synapse process will dequeue
+	// the job and drive Docker.Provision. The dashboard's existing SWR
+	// polling on /list_deployments picks up the status flip from
+	// 'provisioning' to 'running' or 'failed' without any handler-side
+	// coordination — same UX as before, just resilient to crashes.
+
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata: map[string]any{
+			"name":           name,
+			"deploymentType": req.Type,
+			"projectId":      projectID,
+		},
 	})
-
 	// Return the row in 'provisioning' state. The dashboard polls and will
 	// flip to 'running' (or 'failed') when the goroutine updates the row.
 	writeJSON(w, http.StatusCreated, d)
 }
 
-// provisionInBackground runs Docker.Provision off the request goroutine and
-// reconciles the deployment row when it finishes. Errors are swallowed into
-// status="failed" + a slog event — there's no caller to return them to.
+// (provisionInBackground was removed in favour of internal/provisioner —
+// the same logic now lives in provisioner.Worker, dequeued from the
+// `provisioning_jobs` table instead of being spawned as a per-handler
+// goroutine. Survival across process restarts; multi-node sharding via
+// SELECT FOR UPDATE SKIP LOCKED.)
+
+// ---------- POST /v1/projects/{id}/adopt_deployment ----------
+
+// adoptDeploymentReq registers an existing Convex backend (running outside
+// Synapse) into Synapse's catalog. Synapse stores the URL + admin key, never
+// touches the container, and skips Docker calls in delete / health flows.
 //
-// Race with delete: a user can call /delete while we're mid-provision. We
-// detect that by re-reading status after Provision returns; if the row has
-// flipped to "deleted", we tear down whatever we just built.
-func (h *DeploymentsHandler) provisionInBackground(deploymentID string, spec dockerprov.DeploymentSpec) {
-	logger := slog.Default()
-	// Recover from panics in Docker SDK or our own code so a single bad
-	// deployment can't kill the process. The recovered row is marked
-	// 'failed' with a stack trace in the logs for forensics.
-	defer func() {
-		if rec := recover(); rec != nil {
-			logger.Error("provision goroutine panicked",
-				"deployment_id", deploymentID,
-				"name", spec.Name,
-				"panic", rec,
-				"stack", string(debug.Stack()))
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_, _ = h.DB.Exec(ctx, `
-				UPDATE deployments
-				   SET status = $1,
-				       last_deploy_at = now()
-				 WHERE id = $2
-			`, models.DeploymentStatusFailed, deploymentID)
-		}
-	}()
+// Use case: an operator was running self-hosted Convex by hand, then installs
+// Synapse and wants to manage existing deployments through the dashboard.
+type adoptDeploymentReq struct {
+	DeploymentURL  string `json:"deploymentUrl"`
+	AdminKey       string `json:"adminKey"`
+	DeploymentType string `json:"deploymentType,omitempty"` // dev|prod|preview|custom (default dev)
+	// Name is the externally-facing identifier; if omitted Synapse allocates
+	// one. When supplied it must be unique across all deployments — Synapse
+	// uses the name for routing (`/d/{name}/*` proxy mode) and as the value
+	// of CONVEX_DEPLOYMENT in CLI snippets, so collisions break tools.
+	Name      string `json:"name,omitempty"`
+	IsDefault bool   `json:"isDefault,omitempty"`
+	Reference string `json:"reference,omitempty"`
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), provisionTimeout)
-	defer cancel()
-
-	info, provErr := h.Docker.Provision(ctx, spec)
-	if provErr != nil {
-		logger.Error("provision failed",
-			"deployment_id", deploymentID, "name", spec.Name, "err", provErr)
-		_, dbErr := h.DB.Exec(ctx, `
-			UPDATE deployments
-			   SET status = $1,
-			       last_deploy_at = now()
-			 WHERE id = $2
-		`, models.DeploymentStatusFailed, deploymentID)
-		if dbErr != nil {
-			logger.Error("mark provision failed",
-				"deployment_id", deploymentID, "err", dbErr)
-		}
-		return
-	}
-
-	// Atomically flip provisioning → running. The WHERE clause guards
-	// against a concurrent delete: if the row is already 'deleted', we
-	// don't resurrect it; instead we tear down the container we just made.
-	tag, err := h.DB.Exec(ctx, `
-		UPDATE deployments
-		   SET status = $1,
-		       container_id = $2,
-		       deployment_url = $3,
-		       last_deploy_at = now()
-		 WHERE id = $4
-		   AND status = $5
-	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL,
-		deploymentID, models.DeploymentStatusProvisioning)
+func (h *DeploymentsHandler) adoptDeployment(w http.ResponseWriter, r *http.Request) {
+	uid, err := auth.UserID(r.Context())
 	if err != nil {
-		logger.Error("mark provision running",
-			"deployment_id", deploymentID, "err", err)
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Not authenticated")
 		return
 	}
-	if tag.RowsAffected() == 0 {
-		// Either the row vanished or someone (delete handler) already
-		// flipped it to 'deleted'. Either way, our container is now an
-		// orphan — remove it.
-		logger.Warn("provision finished but row is no longer provisioning; cleaning up",
-			"deployment_id", deploymentID, "name", spec.Name)
-		if destroyErr := h.Docker.Destroy(ctx, spec.Name); destroyErr != nil {
-			logger.Error("orphan cleanup failed",
-				"deployment_id", deploymentID, "name", spec.Name, "err", destroyErr)
+	projectID := chi.URLParam(r, "projectID")
+
+	var teamID string
+	err = h.DB.QueryRow(r.Context(),
+		`SELECT p.team_id FROM projects p WHERE p.id::text = $1`, projectID,
+	).Scan(&teamID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "project_not_found", "Project not found")
+		return
+	}
+	if err != nil {
+		logErr("lookup project", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to load project")
+		return
+	}
+	var role string
+	err = h.DB.QueryRow(r.Context(),
+		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
+		teamID, uid).Scan(&role)
+	if errors.Is(err, pgx.ErrNoRows) || role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can adopt deployments")
+		return
+	}
+	if err != nil {
+		logErr("check role", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to check role")
+		return
+	}
+
+	var req adoptDeploymentReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.DeploymentURL = strings.TrimRight(strings.TrimSpace(req.DeploymentURL), "/")
+	req.AdminKey = strings.TrimSpace(req.AdminKey)
+	req.Name = strings.TrimSpace(req.Name)
+
+	if req.DeploymentURL == "" {
+		writeError(w, http.StatusBadRequest, "missing_url", "deploymentUrl is required")
+		return
+	}
+	if !strings.HasPrefix(req.DeploymentURL, "http://") && !strings.HasPrefix(req.DeploymentURL, "https://") {
+		writeError(w, http.StatusBadRequest, "invalid_url", "deploymentUrl must be http:// or https://")
+		return
+	}
+	if req.AdminKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_admin_key", "adminKey is required")
+		return
+	}
+	switch req.DeploymentType {
+	case "":
+		req.DeploymentType = models.DeploymentTypeDev
+	case models.DeploymentTypeDev, models.DeploymentTypeProd, models.DeploymentTypePreview, models.DeploymentTypeCustom:
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_type", "deploymentType must be dev|prod|preview|custom")
+		return
+	}
+
+	// Smoke-test the URL + admin key BEFORE creating the row. Keeps a typo'd
+	// URL from creating an unusable deployment that would just sit in the
+	// dashboard returning errors. Both probes share a single 5-second
+	// budget — we don't need to be patient with an "is this URL alive?" call.
+	probeCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := probeAdoptedBackend(probeCtx, req.DeploymentURL, req.AdminKey); err != nil {
+		var perr *adoptProbeError
+		if errors.As(err, &perr) {
+			writeError(w, perr.status, perr.code, perr.message)
+			return
 		}
+		logErr("probe adopted backend", err)
+		writeError(w, http.StatusBadGateway, "probe_failed", "Failed to reach the deployment URL")
+		return
+	}
+
+	// Allocate (or validate) the name. UNIQUE on deployments.name catches
+	// races against concurrent provisions / adoptions; the retry helper
+	// regenerates only when the name was auto-allocated.
+	var d models.Deployment
+	d.ProjectID = projectID
+	d.DeploymentType = req.DeploymentType
+	d.Status = models.DeploymentStatusRunning
+	d.IsDefault = req.IsDefault
+	d.Reference = req.Reference
+	d.CreatorUserID = uid
+	d.DeploymentURL = req.DeploymentURL
+	d.AdminKey = req.AdminKey
+	d.Adopted = true
+
+	finalName := req.Name
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
+		var insertName string
+		if req.Name != "" {
+			insertName = req.Name
+		} else {
+			alloc, allocErr := h.allocateDeploymentName(r.Context())
+			if allocErr != nil {
+				return allocErr
+			}
+			insertName = alloc
+		}
+		// instance_secret is NOT NULL in the schema; adopted rows don't have
+		// one (Synapse never generated it), so we store an empty string.
+		// Nothing in the codebase uses instance_secret on adopted=true rows.
+		err := h.DB.QueryRow(r.Context(), `
+			INSERT INTO deployments (project_id, name, deployment_type, status,
+			                          admin_key, instance_secret, deployment_url,
+			                          is_default, reference, creator_user_id,
+			                          adopted)
+			VALUES ($1, $2, $3, $4, $5, '', $6, $7, NULLIF($8, ''), $9, true)
+			RETURNING id, created_at
+		`, projectID, insertName, req.DeploymentType, models.DeploymentStatusRunning,
+			req.AdminKey, req.DeploymentURL, req.IsDefault, req.Reference, uid,
+		).Scan(&d.ID, &d.CreatedAt)
+		if err != nil {
+			return err
+		}
+		finalName = insertName
+		return nil
+	})
+	if err != nil {
+		// A user-supplied name that collides surfaces here as a unique
+		// violation that the retry helper couldn't paper over (since we
+		// don't regenerate user-chosen names). Map to a friendly 409.
+		if synapsedb.IsUniqueViolation(err) && req.Name != "" {
+			writeError(w, http.StatusConflict, "name_taken", "A deployment with that name already exists")
+			return
+		}
+		logErr("insert adopted deployment", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to record deployment")
+		return
+	}
+	d.Name = finalName
+
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionAdoptDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata: map[string]any{
+			"name":           d.Name,
+			"deploymentType": d.DeploymentType,
+			"projectId":      projectID,
+			"deploymentUrl":  d.DeploymentURL,
+		},
+	})
+	writeJSON(w, http.StatusCreated, d)
+}
+
+// adoptProbeError carries a writeError-shaped triple out of the probe so the
+// handler can emit the precise client error (bad URL vs bad admin key vs
+// unreachable) without duplicating the if-chain at every call site.
+type adoptProbeError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e *adoptProbeError) Error() string { return e.code + ": " + e.message }
+
+// probeAdoptedBackend hits two endpoints on the supplied URL: GET /version (is
+// this a live Convex backend?) and POST /api/check_admin_key (does the supplied
+// key work?). Either failure is mapped to a 4xx for the caller — we never want
+// to record an adopted row that points at a bad URL or a wrong key.
+func probeAdoptedBackend(ctx context.Context, baseURL, adminKey string) error {
+	client := &http.Client{Timeout: 4 * time.Second}
+
+	// /version — quick reachability check. Convex backends respond with
+	// {"version": "0.x.y"}; we don't parse, just want a 2xx so we know the
+	// URL is real and the cert (if https) validates.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/version", nil)
+	if err != nil {
+		return &adoptProbeError{http.StatusBadRequest, "invalid_url", "deploymentUrl is not a valid URL"}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return &adoptProbeError{http.StatusBadGateway, "probe_failed", "Could not reach deploymentUrl"}
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return &adoptProbeError{http.StatusBadGateway, "probe_failed",
+			"deploymentUrl returned HTTP " + http.StatusText(resp.StatusCode) + " for /version"}
+	}
+
+	// /api/check_admin_key — Convex's admin-key validator. The backend
+	// expects GET with the admin key either as `Authorization: Convex <key>`
+	// or as a `?adminKey=` query param. 200 = valid, 401 = invalid. Any
+	// other code means the URL responds but isn't a Convex backend.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/check_admin_key", nil)
+	if err != nil {
+		return &adoptProbeError{http.StatusBadRequest, "invalid_url", "deploymentUrl is not a valid URL"}
+	}
+	req.Header.Set("Authorization", "Convex "+adminKey)
+	resp, err = client.Do(req)
+	if err != nil {
+		return &adoptProbeError{http.StatusBadGateway, "probe_failed", "Could not reach deploymentUrl"}
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return nil
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return &adoptProbeError{http.StatusBadRequest, "invalid_admin_key", "adminKey was rejected by the deployment"}
+	default:
+		return &adoptProbeError{http.StatusBadGateway, "probe_failed",
+			"deploymentUrl /api/check_admin_key returned HTTP " + http.StatusText(resp.StatusCode)}
 	}
 }
+
 
 // ---------- GET /v1/projects/{id}/deployment ----------
 
@@ -436,7 +636,8 @@ func (h *DeploymentsHandler) getProjectDeployment(w http.ResponseWriter, r *http
 	}
 	query := `
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
-		       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at
+		       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at,
+		       d.adopted
 		  FROM deployments d
 		 WHERE ` + joinAnd(where) + `
 		 ORDER BY d.is_default DESC, d.created_at DESC
@@ -446,7 +647,7 @@ func (h *DeploymentsHandler) getProjectDeployment(w http.ResponseWriter, r *http
 	var url, refDB, creator *string
 	err := h.DB.QueryRow(r.Context(), query, args...).Scan(
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
-		&url, &d.IsDefault, &refDB, &creator, &d.CreatedAt,
+		&url, &d.IsDefault, &refDB, &creator, &d.CreatedAt, &d.Adopted,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "deployment_not_found", "No matching deployment")
@@ -493,7 +694,7 @@ func (h *DeploymentsHandler) getDeployment(w http.ResponseWriter, r *http.Reques
 // ---------- POST /v1/deployments/{name}/delete ----------
 
 func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Request) {
-	d, _, _, role, ok := h.loadDeploymentForRequest(w, r)
+	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -518,16 +719,31 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusInternalServerError, "internal", "Database error")
 			return
 		}
+		uid, _ := auth.UserID(r.Context())
+		_ = audit.Record(r.Context(), h.DB, audit.Options{
+			TeamID:     t.ID,
+			ActorID:    uid,
+			Action:     audit.ActionDeleteDeployment,
+			TargetType: audit.TargetDeployment,
+			TargetID:   d.ID,
+			Metadata:   map[string]any{"name": d.Name, "wasProvisioning": true},
+		})
 		writeJSON(w, http.StatusOK, map[string]string{"name": d.Name, "status": "deleted"})
 		return
 	}
 
-	// Tear down the container/volume first; if that fails, leave the row
-	// alone so the operator can retry. A successful Destroy is idempotent.
-	if err := h.Docker.Destroy(r.Context(), d.Name); err != nil {
-		logErr("docker destroy", err)
-		writeError(w, http.StatusInternalServerError, "destroy_failed", err.Error())
-		return
+	// Adopted deployments are external — Synapse never created the
+	// container or volume, so there's nothing to tear down. Just unregister
+	// the row. The actual backend keeps running until the operator who
+	// owns it stops it.
+	if !d.Adopted {
+		// Tear down the container/volume first; if that fails, leave the row
+		// alone so the operator can retry. A successful Destroy is idempotent.
+		if err := h.Docker.Destroy(r.Context(), d.Name); err != nil {
+			logErr("docker destroy", err)
+			writeError(w, http.StatusInternalServerError, "destroy_failed", err.Error())
+			return
+		}
 	}
 
 	_, err := h.DB.Exec(r.Context(), `
@@ -543,6 +759,15 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionDeleteDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata:   map[string]any{"name": d.Name},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"name": d.Name, "status": "deleted"})
 }
 

@@ -56,6 +56,9 @@ services:
       SYNAPSE_PORT_RANGE_MIN: ${SYNAPSE_PORT_RANGE_MIN:-3210}
       SYNAPSE_PORT_RANGE_MAX: ${SYNAPSE_PORT_RANGE_MAX:-3500}
       SYNAPSE_HEALTHCHECK_VIA_NETWORK: "true"
+      # Mount /d/{name}/* on the API listener. Required for the proxy.spec.ts
+      # e2e test; safe to leave on in dev — when off, /d/* simply 404s.
+      SYNAPSE_PROXY_ENABLED: ${SYNAPSE_PROXY_ENABLED:-true}
       SYNAPSE_LOG_LEVEL: ${SYNAPSE_LOG_LEVEL:-info}
     volumes:
       # Synapse provisions sibling containers via the host docker daemon.

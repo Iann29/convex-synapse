@@ -36,11 +36,17 @@ go build ./... && go vet ./...
 ```bash
 PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
   "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, \
-   team_invites, deploy_keys, access_tokens, audit_events RESTART IDENTITY;"
+   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs \
+   RESTART IDENTITY;"
+docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
+docker volume ls -q --filter name=synapse-data- | xargs -r docker volume rm
 ```
 
 Plain `DELETE FROM users` will fail because `teams.creator_user_id` has
 `ON DELETE RESTRICT`. Either delete teams first or `TRUNCATE … RESTART IDENTITY`.
+
+If you're between Playwright runs and the worker has in-flight goroutines
+from prior jobs, also `docker compose restart synapse` to nuke them.
 
 ## Smoke test the API
 
@@ -72,10 +78,28 @@ authenticated endpoint.
 - **JWT signing** uses `SYNAPSE_JWT_SECRET`. Changing it invalidates every
   outstanding session.
 
+## Multi-node dev
+
+To verify the v0.3 hygiene work locally, run two synapse processes:
+
+```bash
+# Terminal A
+cd synapse && SYNAPSE_HTTP_ADDR=:8080 go run ./cmd/server
+
+# Terminal B
+cd synapse && SYNAPSE_HTTP_ADDR=:8081 go run ./cmd/server
+```
+
+Both connect to the same postgres + docker daemon. Hammer
+`/v1/teams/create_team` from N curl loops simultaneously: every request
+should get 201 with a unique slug; no 500s. Periodic worker logs should
+show only ONE node logging "health sweep" per tick — the other observes
+"another node holds the sweep lock; skipping" at DEBUG level.
+
 ## When NOT to use this skill
 
 - Production deploy decisions — see `docs/ARCHITECTURE.md`.
-- Editing the dashboard fork (separate workflow once it lands).
+- Editing the dashboard (separate skill once we have one).
 - Anything inside the provisioner that requires a live Docker daemon —
   the smoke flow does not exercise `Provision`/`Destroy`. Use real
   Convex backend image tests for that.

@@ -10,7 +10,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	"github.com/Iann29/synapse/internal/models"
 )
 
@@ -72,8 +74,10 @@ func (h *AuthHandler) register(w http.ResponseWriter, r *http.Request) {
 		RETURNING id, email, name, created_at, updated_at
 	`, req.Email, hash, req.Name).Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
-		// Unique violation on the email index.
-		if strings.Contains(err.Error(), "users_email_key") {
+		// Detect duplicate-email collisions by SQLSTATE + constraint name
+		// rather than by string-matching the message text — Postgres minor
+		// versions can rephrase errors, the protocol fields are stable.
+		if synapsedb.IsUniqueViolationOn(err, "users_email_key") {
 			writeError(w, http.StatusConflict, "email_taken", "An account with that email already exists")
 			return
 		}
@@ -117,6 +121,12 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		ActorID:    u.ID,
+		Action:     audit.ActionLogin,
+		TargetType: audit.TargetUser,
+		TargetID:   u.ID,
+	})
 	h.respondTokenPair(w, http.StatusOK, u)
 }
 

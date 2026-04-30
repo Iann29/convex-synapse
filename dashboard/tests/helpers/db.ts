@@ -9,6 +9,7 @@ const DB_URL =
 
 const TABLES = [
   "audit_events",
+  "provisioning_jobs",
   "deploy_keys",
   "deployments",
   "project_env_vars",

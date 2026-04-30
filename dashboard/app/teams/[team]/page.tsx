@@ -40,6 +40,15 @@ export default function TeamHomePage({ params }: { params: Promise<Params> }) {
             Projects and deployments owned by this team.
           </p>
         </div>
+        {/* Audit log lives next to the team title — admin-only feature, but
+            the link itself is unconditional so non-admins still see why
+            they get a 403 when they click. */}
+        <Link
+          href={`/teams/${encodeURIComponent(teamRef)}/audit`}
+          className="text-sm text-neutral-400 hover:text-neutral-200"
+        >
+          Audit log
+        </Link>
       </div>
 
       <SubTabs value={tab} onChange={setTab} />

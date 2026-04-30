@@ -18,7 +18,8 @@ Each handler's commit message lists the canonical curl flow. The pattern is:
 # Reset
 PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
   "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, \
-   team_invites, deploy_keys, access_tokens, audit_events RESTART IDENTITY;"
+   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs \
+   RESTART IDENTITY;"
 
 # Register
 REG=$(curl -sf -X POST http://localhost:8080/v1/auth/register \
@@ -58,8 +59,22 @@ If the same logic needs verifying across many inputs (e.g. the slug allocator),
 write a Go unit test. curl flows are for *integration* coverage; pure-function
 correctness belongs in `_test.go`.
 
+## Test harness for Go integration tests
+
+The `synapse/internal/test/` package builds a fresh isolated database per
+test, a real chi router, a `FakeDocker` provisioner, and a parallel-poll
+provisioner.Worker. Use `Setup(t)` and the existing helpers
+(`createTeam`, `createProject`, `RegisterRandomUser`, `SeedDeployment`).
+
+Concurrency / race coverage:
+- `internal/test/race_test.go` — N goroutines hammering the same allocator
+- `internal/test/advisorylock_test.go` — mutual exclusion under contention
+- `internal/test/provisioner_test.go` — SKIP LOCKED + recovery + double-claim
+
+Mirror those when you add a new feature with concurrent access.
+
 ## What this skill does NOT cover
 
-- Provisioner tests — those need a Docker daemon and a Convex backend image.
-- Dashboard tests — that fork lives under `dashboard/` and uses a Next.js
-  test stack.
+- Provisioner tests against a real Docker daemon — those happen via the
+  Playwright suite (which provisions live containers).
+- Dashboard tests — see the `dashboard/tests/` Playwright spec for that.

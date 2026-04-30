@@ -108,6 +108,26 @@ export type ListTokensResponse = {
   nextCursor?: string;
 };
 
+// AuditEvent maps GET /v1/teams/{ref}/audit_log items. Action names mirror
+// the convex-backend audit-log vocabulary (createTeam, createProject, etc.)
+// — see synapse/internal/audit/audit.go for the canonical list. The id is a
+// stringified BIGSERIAL; opaque to clients.
+export type AuditEvent = {
+  id: string;
+  createTime: string;
+  action: string;
+  actorId?: string;
+  actorEmail?: string;
+  targetType?: string;
+  targetId?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type ListAuditLogResponse = {
+  items: AuditEvent[];
+  nextCursor?: string;
+};
+
 class ApiError extends Error {
   status: number;
   code?: string;
@@ -271,6 +291,18 @@ export const api = {
       return request<void>(
         `/v1/teams/${encodeURIComponent(ref)}/invites/${encodeURIComponent(inviteId)}/cancel`,
         { method: "POST", body: {} },
+      );
+    },
+    auditLog(
+      ref: string,
+      opts: { cursor?: string; limit?: number } = {},
+    ): Promise<ListAuditLogResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListAuditLogResponse>(
+        `/v1/teams/${encodeURIComponent(ref)}/audit_log${qs ? `?${qs}` : ""}`,
       );
     },
   },

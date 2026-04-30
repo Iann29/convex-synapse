@@ -19,6 +19,7 @@ import (
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/health"
+	"github.com/Iann29/synapse/internal/provisioner"
 	"github.com/Iann29/synapse/internal/proxy"
 )
 
@@ -87,18 +88,50 @@ func run() error {
 		Version:               Version,
 	})
 
+	// Provisioning worker — dequeues 'provision' jobs inserted by the
+	// /create_deployment handler and drives Docker.Provision to completion.
+	// Survives process restarts (jobs persisted as rows) and shards across
+	// nodes via SELECT FOR UPDATE SKIP LOCKED.
+	if dockerClient != nil {
+		hostName, _ := os.Hostname()
+		nodeID := hostName
+		if nodeID == "" {
+			nodeID = "synapse"
+		}
+		pworker := &provisioner.Worker{
+			DB:     pool,
+			Docker: dockerClient,
+			Config: provisioner.Config{
+				PollInterval:          time.Second,
+				JobTimeout:            5 * time.Minute,
+				NodeID:                nodeID,
+				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
+			},
+			Logger: logger,
+		}
+		go pworker.Run(rootCtx)
+	}
+
 	// Health worker — periodic reconciler that flips deployment rows to
 	// 'stopped' / 'failed' when the underlying Docker container has gone
 	// missing. Skipped if no Docker daemon was reachable at startup; the
 	// API still works for read-only / metadata operations in that case.
 	if dockerClient != nil {
 		worker := &health.Worker{
-			DB:     pool,
-			Docker: dockerClient,
-			Config: health.Config{Interval: 30 * time.Second, StatusTimeout: 5 * time.Second},
+			DB:        pool,
+			Docker:    dockerClient,
+			Restarter: dockerClient,
+			Config: health.Config{
+				Interval:      30 * time.Second,
+				StatusTimeout: 5 * time.Second,
+				AutoRestart:   cfg.HealthAutoRestart,
+			},
 			Logger: logger,
 		}
 		go worker.Run(rootCtx)
+		if cfg.HealthAutoRestart {
+			logger.Info("health worker auto-restart enabled")
+		}
 	}
 
 	// Reverse-proxy mux: route /d/{name}/* to the proxy package, everything
@@ -159,19 +192,33 @@ func run() error {
 // crashes where the goroutine driving Provision dies before it can update
 // the row. Single SQL UPDATE — no Docker calls; the operator (or a future
 // reconciler) can decide whether the underlying container is salvageable.
+//
+// Multi-node coordination: 3 nodes booting at the same time would each issue
+// the same UPDATE — idempotent, but noisy. Wrap in an advisory lock so only
+// one node runs it; followers see acquired=false and move on.
 func sweepOrphanedProvisioning(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
-	tag, err := pool.Exec(ctx, `
-		UPDATE deployments
-		   SET status = 'failed',
-		       last_deploy_at = now()
-		 WHERE status = 'provisioning'
-		   AND created_at < now() - interval '10 minutes'
-	`)
+	acquired, err := db.WithTryAdvisoryLock(ctx, pool, db.LockOrphanSweep,
+		func(ctx context.Context) error {
+			tag, err := pool.Exec(ctx, `
+				UPDATE deployments
+				   SET status = 'failed',
+				       last_deploy_at = now()
+				 WHERE status = 'provisioning'
+				   AND created_at < now() - interval '10 minutes'
+			`)
+			if err != nil {
+				return err
+			}
+			if n := tag.RowsAffected(); n > 0 {
+				logger.Warn("swept orphaned provisioning deployments", "count", n)
+			}
+			return nil
+		})
 	if err != nil {
 		return err
 	}
-	if n := tag.RowsAffected(); n > 0 {
-		logger.Warn("swept orphaned provisioning deployments", "count", n)
+	if !acquired {
+		logger.Debug("orphan sweep: another node holds the lock; skipping")
 	}
 	return nil
 }

@@ -87,9 +87,13 @@ type Deployment struct {
 	IsDefault      bool       `json:"isDefault"`
 	Reference      string     `json:"reference,omitempty"`
 	CreatorUserID  string     `json:"creator,omitempty"`
-	CreatedAt      time.Time  `json:"createTime"`
-	LastDeployAt   *time.Time `json:"lastDeployTime,omitempty"`
-	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
+	// Adopted deployments are external backends registered into Synapse
+	// (rather than provisioned by it). Lifecycle hooks like delete skip
+	// Docker calls for these rows; the operator manages the container.
+	Adopted      bool       `json:"adopted,omitempty"`
+	CreatedAt    time.Time  `json:"createTime"`
+	LastDeployAt *time.Time `json:"lastDeployTime,omitempty"`
+	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
 }
 
 const (

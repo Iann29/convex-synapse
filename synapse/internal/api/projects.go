@@ -1,15 +1,16 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -108,7 +109,7 @@ type updateProjectReq struct {
 }
 
 func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -121,6 +122,8 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	renamed := false
+	oldName := p.Name
 	if req.Name != nil {
 		newName := strings.TrimSpace(*req.Name)
 		if newName == "" {
@@ -134,7 +137,19 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
 			return
 		}
+		renamed = newName != oldName
 		p.Name = newName
+	}
+	if renamed {
+		uid, _ := auth.UserID(r.Context())
+		_ = audit.Record(r.Context(), h.DB, audit.Options{
+			TeamID:     t.ID,
+			ActorID:    uid,
+			Action:     audit.ActionRenameProject,
+			TargetType: audit.TargetProject,
+			TargetID:   p.ID,
+			Metadata:   map[string]any{"oldName": oldName, "newName": p.Name},
+		})
 	}
 	writeJSON(w, http.StatusOK, p)
 }
@@ -142,7 +157,7 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 // ---------- POST /v1/projects/{id}/delete ----------
 
 func (h *ProjectsHandler) deleteProject(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -181,6 +196,15 @@ func (h *ProjectsHandler) deleteProject(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionDeleteProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"name": p.Name, "slug": p.Slug},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"id": p.ID, "status": "deleted"})
 }
 
@@ -191,35 +215,66 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	deployments, err := loadProjectDeployments(r.Context(), h.DB, p.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, project_id, name, deployment_type, status,
+			       deployment_url, is_default, reference, creator_user_id, created_at,
+			       adopted
+			  FROM deployments
+			 WHERE project_id = $1 AND status <> 'deleted'
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $2
+		`, p.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM deployments WHERE id::text = $1 AND project_id = $2 AND status <> 'deleted'`,
+			cursor, p.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a deployment in this project")
+			return
+		}
+		if err != nil {
+			logErr("resolve project deployments cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, project_id, name, deployment_type, status,
+			       deployment_url, is_default, reference, creator_user_id, created_at,
+			       adopted
+			  FROM deployments
+			 WHERE project_id = $1
+			   AND status <> 'deleted'
+			   AND (created_at, id) > ($2, $3)
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $4
+		`, p.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list deployments", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list deployments")
 		return
 	}
-	writeJSON(w, http.StatusOK, deployments)
-}
-
-func loadProjectDeployments(ctx context.Context, db *pgxpool.Pool, projectID string) ([]models.Deployment, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, project_id, name, deployment_type, status,
-		       deployment_url, is_default, reference, creator_user_id, created_at
-		  FROM deployments
-		 WHERE project_id = $1 AND status <> 'deleted'
-		 ORDER BY created_at ASC
-	`, projectID)
-	if err != nil {
-		return nil, err
-	}
 	defer rows.Close()
 
-	out := make([]models.Deployment, 0)
+	deployments := make([]models.Deployment, 0, limit)
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
 		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
-			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt); err != nil {
-			return nil, err
+			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt, &d.Adopted); err != nil {
+			logErr("scan deployment", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan deployments")
+			return
 		}
 		if url != nil {
 			d.DeploymentURL = *url
@@ -230,9 +285,18 @@ func loadProjectDeployments(ctx context.Context, db *pgxpool.Pool, projectID str
 		if creator != nil {
 			d.CreatorUserID = *creator
 		}
-		out = append(out, d)
+		deployments = append(deployments, d)
 	}
-	return out, nil
+	if err := rows.Err(); err != nil {
+		logErr("iterate deployments", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read deployments")
+		return
+	}
+	if len(deployments) > limit {
+		setNextCursor(w, deployments[limit-1].ID)
+		deployments = deployments[:limit]
+	}
+	writeJSON(w, http.StatusOK, deployments)
 }
 
 // ---------- GET /v1/projects/{id}/list_default_environment_variables ----------
@@ -295,7 +359,7 @@ type updateEnvVarsReq struct {
 }
 
 func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -357,5 +421,20 @@ func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "internal", "Database error")
 		return
 	}
+	uid, _ := auth.UserID(r.Context())
+	// Capture the count + change names so admins can audit which keys
+	// were touched without leaking values (which often contain secrets).
+	names := make([]string, 0, len(req.Changes))
+	for _, c := range req.Changes {
+		names = append(names, c.Name)
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpdateEnvVars,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"applied": len(req.Changes), "names": names},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"applied": len(req.Changes)})
 }

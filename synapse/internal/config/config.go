@@ -52,6 +52,12 @@ type Config struct {
 	// API, forwarding to the deployment's internal address. Lets operators
 	// expose a single host port instead of one per deployment.
 	ProxyEnabled bool
+
+	// HealthAutoRestart, when true, has the health worker call docker
+	// `start` on a deployment whose status just flipped to "stopped". A
+	// missing container is promoted to "failed" instead — restart loops
+	// are deliberately out of scope.
+	HealthAutoRestart bool
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -110,6 +116,7 @@ func Load() (*Config, error) {
 		HealthcheckViaNetwork: getEnvDefault("SYNAPSE_HEALTHCHECK_VIA_NETWORK", "") == "true",
 		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
 		ProxyEnabled:          getEnvDefault("SYNAPSE_PROXY_ENABLED", "") == "true",
+		HealthAutoRestart:     getEnvDefault("SYNAPSE_HEALTH_AUTO_RESTART", "") == "true",
 	}, nil
 }
 

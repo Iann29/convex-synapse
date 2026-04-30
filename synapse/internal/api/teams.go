@@ -11,7 +11,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	"github.com/Iann29/synapse/internal/models"
 )
 
@@ -39,6 +41,7 @@ func (h *TeamsHandler) Routes() chi.Router {
 		r.Post("/create_project", h.createProject)
 		r.Get("/invites", h.listInvites)
 		r.Post("/invites/{inviteID}/cancel", h.cancelInvite)
+		r.Get("/audit_log", h.listAuditLog)
 	})
 
 	return r
@@ -71,61 +74,71 @@ func (h *TeamsHandler) createTeam(w http.ResponseWriter, r *http.Request) {
 		req.DefaultRegion = "self-hosted"
 	}
 
-	slug, err := h.allocateTeamSlug(r.Context(), req.Name)
-	if err != nil {
-		logErr("alloc team slug", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate team slug")
-		return
-	}
-
-	tx, err := h.DB.Begin(r.Context())
-	if err != nil {
-		logErr("tx begin", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Database error")
-		return
-	}
-	defer tx.Rollback(r.Context())
-
+	// Slug allocation (SELECT-EXISTS pre-check) races with concurrent creates.
+	// Wrap the SELECT-then-INSERT pair in the retry helper so two callers
+	// landing on the same slug (e.g. "acme-corp") don't surface a 500 — the
+	// loser regenerates and retries.
 	var t models.Team
-	err = tx.QueryRow(r.Context(), `
-		INSERT INTO teams (name, slug, creator_user_id, default_region)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, name, slug, creator_user_id, default_region, suspended, created_at
-	`, req.Name, slug, uid, req.DefaultRegion).Scan(
-		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
-	)
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 10, func() error {
+		slug, allocErr := h.allocateTeamSlug(r.Context(), req.Name)
+		if allocErr != nil {
+			return allocErr
+		}
+		tx, txErr := h.DB.Begin(r.Context())
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback(r.Context())
+
+		txErr = tx.QueryRow(r.Context(), `
+			INSERT INTO teams (name, slug, creator_user_id, default_region)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, name, slug, creator_user_id, default_region, suspended, created_at
+		`, req.Name, slug, uid, req.DefaultRegion).Scan(
+			&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
+		)
+		if txErr != nil {
+			return txErr
+		}
+		if _, txErr = tx.Exec(r.Context(), `
+			INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin')
+		`, t.ID, uid); txErr != nil {
+			return txErr
+		}
+		return tx.Commit(r.Context())
+	})
 	if err != nil {
-		logErr("insert team", err)
+		logErr("create team", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create team")
 		return
 	}
-
-	_, err = tx.Exec(r.Context(), `
-		INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin')
-	`, t.ID, uid)
-	if err != nil {
-		logErr("insert team member", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to add team member")
-		return
-	}
-
-	if err := tx.Commit(r.Context()); err != nil {
-		logErr("tx commit", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Database error")
-		return
-	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateTeam,
+		TargetType: audit.TargetTeam,
+		TargetID:   t.ID,
+		Metadata:   map[string]any{"name": t.Name, "slug": t.Slug},
+	})
 	writeJSON(w, http.StatusCreated, t)
 }
 
-// allocateTeamSlug returns a slug derived from name, appending a numeric
-// suffix if needed. Races with concurrent inserts are caught by the unique
-// index — caller should treat duplicate-key errors as a retry signal.
+// allocateTeamSlug returns a slug derived from name. The walk is "base",
+// "base-1", "base-2", ... up to 8; past that we switch to random suffixes
+// ("base-a3f7") to break convoy collisions when many writers race the same
+// allocator. The UNIQUE index on `teams.slug` is the source of truth — this
+// function only chooses a candidate, the INSERT is the commit point.
 func (h *TeamsHandler) allocateTeamSlug(ctx context.Context, name string) (string, error) {
 	base := slugify(name)
 	for i := 0; i < 50; i++ {
-		candidate := base
-		if i > 0 {
+		var candidate string
+		switch {
+		case i == 0:
+			candidate = base
+		case i < 8:
 			candidate = withSuffix(base, i)
+		default:
+			candidate = withRandomSuffix(base)
 		}
 		var exists bool
 		if err := h.DB.QueryRow(ctx,
@@ -148,13 +161,56 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Not authenticated")
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
-		  FROM teams t
-		  JOIN team_members m ON m.team_id = t.id
-		 WHERE m.user_id = $1
-		 ORDER BY t.created_at ASC
-	`, uid)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	// Keyset pagination on (team.created_at ASC, team.id ASC). The membership
+	// row's created_at is irrelevant to ordering — what we expose is "teams I
+	// belong to in creation order", so the team's own timestamp anchors the
+	// page boundary. Cursor is the team id from the previous page.
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE m.user_id = $1
+			 ORDER BY t.created_at ASC, t.id ASC
+			 LIMIT $2
+		`, uid, limit+1)
+	} else {
+		// Resolve cursor → (created_at, id) of the team. We require membership
+		// in the lookup to avoid leaking timestamps for teams the caller can't
+		// see — same defence as the PAT cursor.
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(), `
+			SELECT t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE t.id::text = $1 AND m.user_id = $2
+		`, cursor, uid).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a team you belong to")
+			return
+		}
+		if err != nil {
+			logErr("resolve teams cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
+			  FROM teams t
+			  JOIN team_members m ON m.team_id = t.id
+			 WHERE m.user_id = $1
+			   AND (t.created_at, t.id) > ($2, $3)
+			 ORDER BY t.created_at ASC, t.id ASC
+			 LIMIT $4
+		`, uid, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list teams", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list teams")
@@ -162,7 +218,7 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	teams := make([]models.Team, 0)
+	teams := make([]models.Team, 0, limit)
 	for rows.Next() {
 		var t models.Team
 		if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt); err != nil {
@@ -171,6 +227,15 @@ func (h *TeamsHandler) listMyTeams(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		teams = append(teams, t)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate teams", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read teams")
+		return
+	}
+	if len(teams) > limit {
+		setNextCursor(w, teams[limit-1].ID)
+		teams = teams[:limit]
 	}
 	writeJSON(w, http.StatusOK, teams)
 }
@@ -251,12 +316,45 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT id, team_id, name, slug, is_demo, created_at
-		  FROM projects
-		 WHERE team_id = $1
-		 ORDER BY created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, team_id, name, slug, is_demo, created_at
+			  FROM projects
+			 WHERE team_id = $1
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM projects WHERE id::text = $1 AND team_id = $2`,
+			cursor, t.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a project in this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve projects cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT id, team_id, name, slug, is_demo, created_at
+			  FROM projects
+			 WHERE team_id = $1
+			   AND (created_at, id) > ($2, $3)
+			 ORDER BY created_at ASC, id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list projects", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list projects")
@@ -264,7 +362,7 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	projects := make([]models.Project, 0)
+	projects := make([]models.Project, 0, limit)
 	for rows.Next() {
 		var p models.Project
 		if err := rows.Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt); err != nil {
@@ -274,6 +372,15 @@ func (h *TeamsHandler) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		p.TeamSlug = t.Slug
 		projects = append(projects, p)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate projects", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read projects")
+		return
+	}
+	if len(projects) > limit {
+		setNextCursor(w, projects[limit-1].ID)
+		projects = projects[:limit]
 	}
 	writeJSON(w, http.StatusOK, projects)
 }
@@ -285,13 +392,50 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT u.id, u.email, u.name, m.role, m.created_at
-		  FROM team_members m
-		  JOIN users u ON u.id = m.user_id
-		 WHERE m.team_id = $1
-		 ORDER BY m.created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	// Cursor here is the member's user_id. Membership rows are unique on
+	// (team_id, user_id), so user_id alone disambiguates the position when
+	// paired with the membership's created_at.
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT u.id, u.email, u.name, m.role, m.created_at
+			  FROM team_members m
+			  JOIN users u ON u.id = m.user_id
+			 WHERE m.team_id = $1
+			 ORDER BY m.created_at ASC, u.id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(),
+			`SELECT created_at FROM team_members WHERE team_id = $1 AND user_id::text = $2`,
+			t.ID, cursor).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a member of this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve members cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT u.id, u.email, u.name, m.role, m.created_at
+			  FROM team_members m
+			  JOIN users u ON u.id = m.user_id
+			 WHERE m.team_id = $1
+			   AND (m.created_at, u.id) > ($2, $3)
+			 ORDER BY m.created_at ASC, u.id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list members", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list members")
@@ -299,7 +443,7 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	members := make([]models.TeamMember, 0)
+	members := make([]models.TeamMember, 0, limit)
 	for rows.Next() {
 		var m models.TeamMember
 		if err := rows.Scan(&m.UserID, &m.Email, &m.Name, &m.Role, &m.CreatedAt); err != nil {
@@ -309,6 +453,15 @@ func (h *TeamsHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 		}
 		m.TeamID = t.ID
 		members = append(members, m)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate members", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read members")
+		return
+	}
+	if len(members) > limit {
+		setNextCursor(w, members[limit-1].UserID)
+		members = members[:limit]
 	}
 	writeJSON(w, http.StatusOK, members)
 }
@@ -320,15 +473,58 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `
-		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
-		       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at
-		  FROM deployments d
-		  JOIN projects p ON p.id = d.project_id
-		 WHERE p.team_id = $1
-		   AND d.status <> 'deleted'
-		 ORDER BY d.created_at ASC
-	`, t.ID)
+	limit, ok := parseListLimit(w, r)
+	if !ok {
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+	var rows pgx.Rows
+	var err error
+	if cursor == "" {
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
+			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at,
+			       d.adopted
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE p.team_id = $1
+			   AND d.status <> 'deleted'
+			 ORDER BY d.created_at ASC, d.id ASC
+			 LIMIT $2
+		`, t.ID, limit+1)
+	} else {
+		// Cursor must refer to a non-deleted deployment in this team — keeps
+		// callers from probing other teams' deployment timestamps.
+		var cursorAt time.Time
+		err = h.DB.QueryRow(r.Context(), `
+			SELECT d.created_at
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE d.id::text = $1 AND p.team_id = $2 AND d.status <> 'deleted'
+		`, cursor, t.ID).Scan(&cursorAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a deployment in this team")
+			return
+		}
+		if err != nil {
+			logErr("resolve deployments cursor", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
+			return
+		}
+		rows, err = h.DB.Query(r.Context(), `
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
+			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at,
+			       d.adopted
+			  FROM deployments d
+			  JOIN projects p ON p.id = d.project_id
+			 WHERE p.team_id = $1
+			   AND d.status <> 'deleted'
+			   AND (d.created_at, d.id) > ($2, $3)
+			 ORDER BY d.created_at ASC, d.id ASC
+			 LIMIT $4
+		`, t.ID, cursorAt, cursor, limit+1)
+	}
 	if err != nil {
 		logErr("list deployments", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list deployments")
@@ -336,12 +532,12 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	deployments := make([]models.Deployment, 0)
+	deployments := make([]models.Deployment, 0, limit)
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
 		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
-			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt); err != nil {
+			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt, &d.Adopted); err != nil {
 			logErr("scan deployment", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan deployments")
 			return
@@ -356,6 +552,15 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 			d.CreatorUserID = *creator
 		}
 		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		logErr("iterate deployments", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to read deployments")
+		return
+	}
+	if len(deployments) > limit {
+		setNextCursor(w, deployments[limit-1].ID)
+		deployments = deployments[:limit]
 	}
 	writeJSON(w, http.StatusOK, deployments)
 }
@@ -391,26 +596,37 @@ func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slug, err := h.allocateProjectSlug(r.Context(), t.ID, req.ProjectName)
-	if err != nil {
-		logErr("alloc project slug", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to allocate project slug")
-		return
-	}
-
+	// Project slug uniqueness is enforced by `UNIQUE (team_id, slug)`. Two
+	// concurrent creates of "My App" within the same team race the
+	// SELECT-EXISTS pre-check; the loser hits the constraint and retries.
 	var p models.Project
-	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO projects (team_id, name, slug)
-		VALUES ($1, $2, $3)
-		RETURNING id, team_id, name, slug, is_demo, created_at
-	`, t.ID, req.ProjectName, slug).Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt)
+	err := synapsedb.WithRetryOnUniqueViolation(r.Context(), 10, func() error {
+		slug, allocErr := h.allocateProjectSlug(r.Context(), t.ID, req.ProjectName)
+		if allocErr != nil {
+			return allocErr
+		}
+		return h.DB.QueryRow(r.Context(), `
+			INSERT INTO projects (team_id, name, slug)
+			VALUES ($1, $2, $3)
+			RETURNING id, team_id, name, slug, is_demo, created_at
+		`, t.ID, req.ProjectName, slug).Scan(&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt)
+	})
 	if err != nil {
-		logErr("insert project", err)
+		logErr("create project", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create project")
 		return
 	}
 	p.TeamSlug = t.Slug
 
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata:   map[string]any{"name": p.Name, "slug": p.Slug},
+	})
 	writeJSON(w, http.StatusCreated, createProjectResp{
 		ProjectID:   p.ID,
 		ProjectSlug: p.Slug,
@@ -421,9 +637,14 @@ func (h *TeamsHandler) createProject(w http.ResponseWriter, r *http.Request) {
 func (h *TeamsHandler) allocateProjectSlug(ctx context.Context, teamID, name string) (string, error) {
 	base := slugify(name)
 	for i := 0; i < 50; i++ {
-		candidate := base
-		if i > 0 {
+		var candidate string
+		switch {
+		case i == 0:
+			candidate = base
+		case i < 8:
 			candidate = withSuffix(base, i)
+		default:
+			candidate = withRandomSuffix(base)
 		}
 		var exists bool
 		if err := h.DB.QueryRow(ctx,
@@ -496,6 +717,14 @@ func (h *TeamsHandler) inviteMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionInviteTeamMember,
+		TargetType: audit.TargetInvite,
+		TargetID:   inviteID,
+		Metadata:   map[string]any{"email": req.Email, "role": req.Role},
+	})
 	writeJSON(w, http.StatusOK, map[string]string{
 		"inviteId":    inviteID,
 		"email":       req.Email,
@@ -577,5 +806,13 @@ func (h *TeamsHandler) cancelInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "invite_not_found", "Invite not found or already accepted")
 		return
 	}
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionCancelInvite,
+		TargetType: audit.TargetInvite,
+		TargetID:   id,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "cancelled"})
 }

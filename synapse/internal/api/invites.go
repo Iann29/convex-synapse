@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 )
 
@@ -121,6 +122,14 @@ func (h *InvitesHandler) accept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionAcceptInvite,
+		TargetType: audit.TargetTeam,
+		TargetID:   teamID,
+		Metadata:   map[string]any{"role": role, "inviteId": inviteID},
+	})
 	writeJSON(w, http.StatusOK, acceptInviteResp{
 		TeamID:   teamID,
 		TeamSlug: teamSlug,

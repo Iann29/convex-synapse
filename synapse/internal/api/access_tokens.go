@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -148,6 +149,16 @@ func (h *AccessTokensHandler) create(w http.ResponseWriter, r *http.Request) {
 		view.ScopeID = *dbScopeID
 	}
 
+	// PATs are user-scoped, not team-scoped — TeamID stays empty so the row
+	// shows up in the per-account audit feed (when we expose one), not under
+	// any individual team.
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		ActorID:    uid,
+		Action:     audit.ActionCreatePersonalAccessToken,
+		TargetType: audit.TargetAccessToken,
+		TargetID:   view.ID,
+		Metadata:   map[string]any{"name": view.Name, "scope": view.Scope},
+	})
 	writeJSON(w, http.StatusCreated, createTokenResp{
 		Token:       plain,
 		AccessToken: view,
@@ -295,5 +306,11 @@ func (h *AccessTokensHandler) delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "token_not_found", "Token not found")
 		return
 	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		ActorID:    uid,
+		Action:     audit.ActionDeletePersonalAccessToken,
+		TargetType: audit.TargetAccessToken,
+		TargetID:   req.ID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"id": req.ID})
 }

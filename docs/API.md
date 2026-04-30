@@ -57,6 +57,32 @@ Lists teams the caller belongs to.
 ### `GET /v1/teams/{ref}/list_members` ✅
 ### `GET /v1/teams/{ref}/list_deployments` ✅
 
+These (plus `GET /v1/teams` and `GET /v1/projects/{id}/list_deployments`) are
+**bounded** lists. The response shape is still a bare JSON array (matches
+Cloud's `list_*` endpoints — no breaking change for existing tools), but the
+server caps each page and signals continuation via a header:
+
+- Query `?limit=N` (default 100, max 500). Negative / non-numeric is 400
+  `invalid_limit`.
+- Query `?cursor=<id>` to fetch the page after the row with that id. The
+  cursor must refer to a row the caller can see (a team they're a member of,
+  a project in that team, etc); a bogus cursor returns 400 `invalid_cursor`.
+- Response header `X-Next-Cursor: <id>` is set when more rows exist after
+  this page. Absent header = end of results.
+
+Walk pattern (shell):
+
+```bash
+NEXT=""
+while :; do
+  RESP=$(curl -sfD - "http://localhost:8080/v1/teams${NEXT:+?cursor=$NEXT}" \
+    -H "Authorization: Bearer $TOKEN")
+  echo "$RESP" | sed -n '/^\r$/,$p' | tail -n +2 | jq .
+  NEXT=$(echo "$RESP" | tr -d '\r' | awk -F': ' '/^X-Next-Cursor/ {print $2}')
+  [ -z "$NEXT" ] && break
+done
+```
+
 ### `POST /v1/teams/{ref}/create_project` ✅
 
 Body: `{projectName, deploymentType?, deploymentClass?, deploymentRegion?}`.
@@ -75,6 +101,45 @@ Tokens are sensitive: anyone who has one can join the team.
 ### `POST /v1/teams/{ref}/invites/{inviteID}/cancel` 🔧 (admins only)
 
 Deletes a pending invite. 404 if it was already accepted or never existed.
+
+### `GET /v1/teams/{ref}/audit_log` ✅ (admins only)
+
+Lists audit events for the team, newest first. Admin-only — audit data is
+privileged. Members get 403 (matches Cloud's behavior; auditing is a
+trust-anchor function).
+
+Query params:
+- `limit` (default 50, max 200) — page size.
+- `cursor` — opaque continuation token returned as `nextCursor` from the
+  previous page.
+
+Response (200):
+
+```json
+{
+  "items": [
+    {
+      "id": "12",
+      "createTime": "2026-04-29T12:00:00Z",
+      "action": "createProject",
+      "actorId": "…",
+      "actorEmail": "ian@example.com",
+      "targetType": "project",
+      "targetId": "…",
+      "metadata": { "name": "my-app", "slug": "my-app" }
+    }
+  ],
+  "nextCursor": "…"
+}
+```
+
+Action names mirror Cloud's `auditLogActions` vocabulary where it exists:
+`createTeam`, `inviteTeamMember`, `cancelInvite`, `createProject`,
+`deleteProject`, `renameProject`, `updateProjectEnvVars`, `createDeployment`,
+`deleteDeployment`, `acceptInvite`, `login`. Synapse-specific extensions
+(no Cloud counterpart): `createPersonalAccessToken`,
+`deletePersonalAccessToken`. Audit writes are best-effort: a transient DB
+error during the audit insert never fails the user-visible request.
 
 ### `POST /v1/team_invites/accept` 🔧
 
@@ -103,6 +168,52 @@ Allocates a name, picks a free host port from the configured range,
 provisions a Convex backend container via Docker, and returns the
 `Deployment` row once `/version` responds (or after a 60s healthcheck
 warning, whichever comes first).
+
+### `POST /v1/projects/{id}/adopt_deployment` 🔧 (admins only)
+
+Registers an existing Convex backend (running outside Synapse) under this
+project. Synapse stores the URL + admin key as a regular deployment row
+flagged `adopted=true`. The dashboard, CLI credentials endpoint, and
+reverse proxy all work as if Synapse had provisioned it — but Synapse
+never touches the underlying container: `delete` only unregisters the
+row, the health worker skips adopted rows, and there is no auto-restart.
+
+Body:
+
+```json
+{
+  "deploymentUrl": "https://convex.my-server.example:3210",
+  "adminKey": "self-hosted-admin-key-…",
+  "deploymentType": "prod",
+  "name": "my-existing-app",
+  "isDefault": false,
+  "reference": ""
+}
+```
+
+- `deploymentUrl` (required) — http or https; trailing slash is stripped.
+- `adminKey` (required) — must succeed against `<url>/api/check_admin_key`.
+- `deploymentType` (default `dev`) — one of `dev|prod|preview|custom`.
+- `name` (optional) — externally-facing identifier. If omitted, Synapse
+  allocates a `friendly-cat-1234`-style name. If provided and a collision
+  exists, returns `409 name_taken`.
+- `isDefault`, `reference` — optional, same semantics as `create_deployment`.
+
+Before inserting the row, Synapse hits `GET <url>/version` (proves the URL
+is a live Convex backend) and `GET <url>/api/check_admin_key` with
+`Authorization: Convex <adminKey>` (proves the key works). Failures map to
+client errors:
+
+| code | status | meaning |
+|---|---|---|
+| `missing_url` / `missing_admin_key` | 400 | required field empty |
+| `invalid_url` | 400 | not http/https, or unparseable |
+| `invalid_admin_key` | 400 | the deployment rejected the key |
+| `probe_failed` | 502 | URL didn't respond, or returned non-2xx |
+| `name_taken` | 409 | `name` collides with another deployment |
+
+Response (201): the `Deployment` row, with `status: "running"`,
+`adopted: true`, and the supplied URL.
 
 ### `GET /v1/projects/{id}/deployment` ✅
 

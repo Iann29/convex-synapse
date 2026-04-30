@@ -49,6 +49,20 @@ Use these utilities:
 - `auth.UserID(r.Context())` to get the caller
 - `loadTeamForRequest`, `loadProjectForRequest` to resolve + assert membership
 - `slugify(name)` for slug allocation
+- `db.WithRetryOnUniqueViolation(ctx, n, fn)` — wrap any SELECT-then-INSERT
+  resource allocator (port, name, slug). UNIQUE-constraint races retry
+  transparently. NEVER use `strings.Contains` on the error message — use
+  `db.IsUniqueViolationOn(err, "users_email_key")` instead.
+- `db.WithTryAdvisoryLock(ctx, pool, key, fn)` — wrap periodic workers so
+  multi-node coordination is one round-trip instead of a custom protocol.
+  Keys live in `internal/db/advisorylock.go` as constants.
+- `audit.Record(ctx, db, audit.Options{...})` — call on every mutating
+  success path. Best-effort, never fails the user request.
+
+If your feature does long async work, do NOT spawn a per-handler goroutine.
+Enqueue a row in a job table and run a `Worker` with
+`SELECT FOR UPDATE SKIP LOCKED` + parallel goroutines. See
+`internal/provisioner/worker.go` for the template.
 
 ### 4. Run the test until green
 
@@ -93,7 +107,10 @@ docker compose build synapse dashboard
 docker compose up -d synapse dashboard
 sleep 4
 PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
-  "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, team_invites, deploy_keys, access_tokens, audit_events RESTART IDENTITY;"
+  "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, \
+   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs \
+   RESTART IDENTITY;"
+docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
 cd dashboard && npx playwright test --reporter=list
 ```
 

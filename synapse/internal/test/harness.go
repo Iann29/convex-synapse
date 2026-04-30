@@ -37,6 +37,7 @@ import (
 	"github.com/Iann29/synapse/internal/auth"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
+	"github.com/Iann29/synapse/internal/provisioner"
 )
 
 // defaultDSN is the local docker-compose postgres. Override with
@@ -140,6 +141,23 @@ func Setup(t *testing.T) *Harness {
 	})
 	srv := httptest.NewServer(router)
 
+	// Provisioner worker — drives the persistent job queue. Tests that
+	// don't care about provisioning still get one running; it's harmless
+	// when there are no jobs. Use 50ms poll so e2e flow completes
+	// snappily within test timeouts.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	pworker := &provisioner.Worker{
+		DB:     pool,
+		Docker: fake,
+		Config: provisioner.Config{
+			PollInterval: 50 * time.Millisecond,
+			JobTimeout:   30 * time.Second,
+			NodeID:       "test-" + dbName,
+		},
+		Logger: logger,
+	}
+	go pworker.Run(workerCtx)
+
 	h := &Harness{
 		T:       t,
 		Server:  srv,
@@ -151,6 +169,7 @@ func Setup(t *testing.T) *Harness {
 		rootCtx: context.Background(),
 	}
 	t.Cleanup(func() {
+		workerCancel()
 		srv.Close()
 		pool.Close()
 		dropDatabase(rootDSN, dbName)
@@ -355,9 +374,10 @@ func randHex(n int) string {
 // It records calls so tests can assert on what the handler did, and lets each
 // test override behavior (e.g. force Provision to fail).
 type FakeDocker struct {
-	ProvisionFn func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
-	DestroyFn   func(ctx context.Context, name string) error
-	StatusFn    func(ctx context.Context, name string) (string, error)
+	ProvisionFn        func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
+	DestroyFn          func(ctx context.Context, name string) error
+	StatusFn           func(ctx context.Context, name string) (string, error)
+	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 
 	Provisioned []dockerprov.DeploymentSpec
 	Destroyed   []string
@@ -392,6 +412,15 @@ func (f *FakeDocker) Status(ctx context.Context, name string) (string, error) {
 		return f.StatusFn(ctx, name)
 	}
 	return "running", nil
+}
+
+// GenerateAdminKey: tests can override; default returns a deterministic
+// placeholder that's enough for code that just persists & echoes the value.
+func (f *FakeDocker) GenerateAdminKey(ctx context.Context, name, secret string) (string, error) {
+	if f.GenerateAdminKeyFn != nil {
+		return f.GenerateAdminKeyFn(ctx, name, secret)
+	}
+	return "fake-admin-key-" + name, nil
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising
