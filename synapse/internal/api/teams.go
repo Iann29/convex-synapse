@@ -18,8 +18,16 @@ import (
 )
 
 // TeamsHandler exposes team CRUD and member management.
+//
+// Deployments is set by router.go after DeploymentsHandler exists,
+// solely so listDeployments can call publicDeploymentURL — the same
+// rewrite logic /auth and /cli_credentials use to turn the
+// container-internal "http://127.0.0.1:<port>" URL into something a
+// remote browser/CLI can actually reach. Without this, the dashboard
+// renders loopback URLs that nobody outside the VPS can use.
 type TeamsHandler struct {
-	DB *pgxpool.Pool
+	DB          *pgxpool.Pool
+	Deployments *DeploymentsHandler
 }
 
 func (h *TeamsHandler) Routes() chi.Router {
@@ -550,6 +558,12 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 		}
 		if creator != nil {
 			d.CreatorUserID = *creator
+		}
+		// Same rewrite the create/get handlers apply — turn the
+		// container-internal "http://127.0.0.1:<port>" into something
+		// the dashboard's browser can hit.
+		if h.Deployments != nil {
+			d.DeploymentURL = h.Deployments.publicDeploymentURL(&d)
 		}
 		deployments = append(deployments, d)
 	}

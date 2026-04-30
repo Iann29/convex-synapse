@@ -285,6 +285,12 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 		if creator != nil {
 			d.CreatorUserID = *creator
 		}
+		// Same rewrite the create/get handlers apply — turn the
+		// container-internal "http://127.0.0.1:<port>" into something
+		// the dashboard's browser can hit.
+		if h.Deployments != nil {
+			d.DeploymentURL = h.Deployments.publicDeploymentURL(&d)
+		}
 		deployments = append(deployments, d)
 	}
 	if err := rows.Err(); err != nil {

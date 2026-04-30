@@ -79,7 +79,7 @@ type Harness struct {
 // single-replica behavior keep using Setup.
 func SetupHA(t *testing.T) *Harness {
 	t.Helper()
-	return setup(t, true)
+	return setup(t, true, SetupOpts{})
 }
 
 // Setup creates a fresh database, applies migrations, and returns a Harness
@@ -95,10 +95,32 @@ func SetupHA(t *testing.T) *Harness {
 // compose running.
 func Setup(t *testing.T) *Harness {
 	t.Helper()
-	return setup(t, false)
+	return setup(t, false, SetupOpts{})
 }
 
-func setup(t *testing.T, haEnabled bool) *Harness {
+// SetupOpts is the optional knob bag for SetupWithOpts. Tests that want
+// the default harness keep using Setup / SetupHA.
+type SetupOpts struct {
+	// PublicURL mirrors api.RouterDeps.PublicURL — when set, GET
+	// handlers (and /auth and /cli_credentials) return rewritten URLs
+	// instead of the raw container-internal "http://127.0.0.1:<port>".
+	PublicURL string
+	// ProxyEnabled mirrors api.RouterDeps.ProxyEnabled. With PublicURL
+	// set + ProxyEnabled true, the rewrite becomes
+	// "<PublicURL>/d/<name>". With ProxyEnabled false, it becomes
+	// "<PublicURL>:<host_port>".
+	ProxyEnabled bool
+}
+
+// SetupWithOpts is Setup + opts, used by tests that need to drive the
+// PublicURL rewrite path (otherwise they'd need to instantiate the
+// router by hand).
+func SetupWithOpts(t *testing.T, opts SetupOpts) *Harness {
+	t.Helper()
+	return setup(t, false, opts)
+}
+
+func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 	t.Helper()
 	// Each Setup call gets its own database, so tests are independent and can
 	// run in parallel. The marginal cost (a CREATE DATABASE + migrate) is
@@ -162,6 +184,8 @@ func setup(t *testing.T, haEnabled bool) *Harness {
 		HealthcheckViaNetwork: false,
 		AllowedOrigins:        "*",
 		Version:               "test",
+		PublicURL:             opts.PublicURL,
+		ProxyEnabled:          opts.ProxyEnabled,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a
