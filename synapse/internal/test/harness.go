@@ -35,6 +35,7 @@ import (
 
 	"github.com/Iann29/synapse/internal/api"
 	"github.com/Iann29/synapse/internal/auth"
+	cryptopkg "github.com/Iann29/synapse/internal/crypto"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/provisioner"
@@ -57,10 +58,28 @@ type Harness struct {
 	DB     *pgxpool.Pool
 	JWT    *auth.JWTIssuer
 	Docker *FakeDocker
+	// Crypto is the AES-GCM box that the harness uses for
+	// deployment_storage. Non-nil only on HA harnesses (SetupHA);
+	// tests can use it to decrypt deployment_storage values when
+	// asserting on what the handler persisted.
+	Crypto *cryptopkg.SecretBox
 
-	dsn    string // DSN of the per-test database
-	dbName string // name of the per-test database (for DROP)
+	dsn     string // DSN of the per-test database
+	dbName  string // name of the per-test database (for DROP)
 	rootCtx context.Context
+}
+
+// SetupHA is the HA-enabled variant of Setup. The router is wired with
+// HA.Enabled=true plus stub Postgres + S3 cluster credentials and a
+// freshly-generated AES-GCM SecretBox so create_deployment can persist
+// encrypted deployment_storage rows. The provisioner worker shares the
+// same SecretBox so it can decrypt the values when claiming HA jobs.
+//
+// Tests that need HA flow end-to-end use this; tests that only exercise
+// single-replica behavior keep using Setup.
+func SetupHA(t *testing.T) *Harness {
+	t.Helper()
+	return setup(t, true)
 }
 
 // Setup creates a fresh database, applies migrations, and returns a Harness
@@ -75,6 +94,11 @@ type Harness struct {
 // failing — keeping `go test ./...` green on dev machines without docker
 // compose running.
 func Setup(t *testing.T) *Harness {
+	t.Helper()
+	return setup(t, false)
+}
+
+func setup(t *testing.T, haEnabled bool) *Harness {
 	t.Helper()
 	// Each Setup call gets its own database, so tests are independent and can
 	// run in parallel. The marginal cost (a CREATE DATABASE + migrate) is
@@ -128,7 +152,7 @@ func Setup(t *testing.T) *Harness {
 	jwt := auth.NewJWTIssuer([]byte(jwtSecret), 15*time.Minute, 24*time.Hour)
 	fake := NewFakeDocker()
 
-	router := api.NewRouter(api.RouterDeps{
+	deps := api.RouterDeps{
 		Logger:                logger,
 		DB:                    pool,
 		JWT:                   jwt,
@@ -138,7 +162,36 @@ func Setup(t *testing.T) *Harness {
 		HealthcheckViaNetwork: false,
 		AllowedOrigins:        "*",
 		Version:               "test",
-	})
+	}
+
+	// HA wiring (only when SetupHA was called). The crypto box is a
+	// fresh per-test 32-byte key — encrypted material in
+	// deployment_storage rows is meaningless to other tests, but stays
+	// inspectable through the harness's `cryptoBox` field.
+	var box *cryptopkg.SecretBox
+	if haEnabled {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			t.Fatalf("rand key: %v", err)
+		}
+		var berr error
+		box, berr = cryptopkg.New(key)
+		if berr != nil {
+			t.Fatalf("crypto.New: %v", berr)
+		}
+		deps.HA = api.HAConfig{
+			Enabled:             true,
+			BackendPostgresURL:  "postgres://synapse:synapse@cluster-pg.test:5432/convex_admin?sslmode=disable",
+			BackendS3Endpoint:   "http://minio.test:9000",
+			BackendS3Region:     "us-east-1",
+			BackendS3AccessKey:  "test-access-key",
+			BackendS3SecretKey:  "test-secret-key",
+			BackendBucketPrefix: "convex",
+		}
+		deps.Crypto = box
+	}
+
+	router := api.NewRouter(deps)
 	srv := httptest.NewServer(router)
 
 	// Provisioner worker — drives the persistent job queue. Tests that
@@ -156,6 +209,9 @@ func Setup(t *testing.T) *Harness {
 		},
 		Logger: logger,
 	}
+	if box != nil {
+		pworker.Crypto = box
+	}
 	go pworker.Run(workerCtx)
 
 	h := &Harness{
@@ -164,6 +220,7 @@ func Setup(t *testing.T) *Harness {
 		DB:      pool,
 		JWT:     jwt,
 		Docker:  fake,
+		Crypto:  box,
 		dsn:     testDSN,
 		dbName:  dbName,
 		rootCtx: context.Background(),
