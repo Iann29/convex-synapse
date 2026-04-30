@@ -42,36 +42,54 @@ Synapse fills that gap.
 
 ## Status
 
-**v0.3 — multi-node ready.** A `docker compose up -d` plus a register call
-gets you a control-plane API, a dashboard, and the ability to provision real
-Convex backend containers in about a second per deployment. The control plane
-is also safe to run with N processes against one Postgres + one Docker daemon
-— resource allocators retry on conflict, periodic workers coordinate via
-Postgres advisory locks, and async provisioning is a persistent queue with
-parallel `SELECT FOR UPDATE SKIP LOCKED` consumers.
+**v0.4 — UI redesigned, v0.2 leftovers cleared.** The dashboard now matches
+the Convex Cloud aesthetic (top app bar, team picker, redesigned home,
+team-settings shell). The control plane is multi-node-safe (v0.3) and the
+two long-standing v0.2 stragglers landed: paginated team/project listings
+and a migration helper that imports existing self-hosted backends.
+
+A `docker compose up -d` plus a register call gets you a control-plane API,
+a dashboard, and the ability to provision real Convex backend containers in
+about a second per deployment. Multiple Synapse processes can share one
+Postgres + one Docker daemon — resource allocators retry on conflict,
+periodic workers coordinate via Postgres advisory locks, and async
+provisioning is a persistent queue with parallel
+`SELECT FOR UPDATE SKIP LOCKED` consumers.
 
 What works today:
 - Email+password auth (JWT) and `syn_*` personal access tokens (hashed at rest)
 - Multi-team membership via opaque invite tokens (`/v1/team_invites/accept`)
 - Projects: CRUD, rename, delete, default env vars (set/delete batch)
 - Deployments: real Convex backend container per deployment, ~1s provisioning
+- **Adopt existing**: register a Convex backend running outside Synapse via
+  `POST /v1/projects/{id}/adopt_deployment` (probes `/version` +
+  `/api/check_admin_key` before persisting; UI dialog on the project page)
 - `npx convex` CLI compatibility (signed admin keys + `cli_credentials` endpoint)
 - Reverse proxy mode (`/d/{name}/*`) so deployments share a single host port
 - Health worker that reconciles `deployments.status` with Docker reality
+  (skips adopted rows — Synapse never touches external containers)
 - Optional auto-restart for stopped containers
-- Audit log (Cloud-vocabulary actions: `createTeam`, `createProject`, …)
-- 100+ Go integration tests + 16 Playwright e2e green in CI
+- Audit log (Cloud-vocabulary actions: `createTeam`, `createProject`,
+  `adoptDeployment`, …)
+- **Paginated listings** on `/v1/teams`, `/v1/teams/{ref}/list_projects`,
+  `list_members`, `list_deployments`, `/v1/projects/{id}/list_deployments` —
+  `?limit&?cursor` + `X-Next-Cursor` header (response stays a bare array)
+- Redesigned dashboard: top app bar with team picker, home with
+  Projects/Deployments tabs, team-settings shell with sidebar, deterministic
+  avatar gradients
+- ~110 Go integration tests + 18 Playwright e2e green in CI
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and what's deliberately
-out of scope.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next (v0.5 HA-per-deployment
+plan in [docs/V0_5_PLAN.md](docs/V0_5_PLAN.md)) and what's deliberately out of
+scope.
 
 ## Repo layout
 
 | Path | Purpose |
 |---|---|
 | `synapse/` | Go backend — the control plane (REST API + provisioner) |
-| `dashboard/` | Next.js frontend — fork of the Convex Cloud dashboard, repointed at Synapse |
-| `docs/` | Architecture notes, quickstart, roadmap |
+| `dashboard/` | Next.js frontend — original app talking to Synapse's REST surface |
+| `docs/` | Architecture notes, quickstart, roadmap, v0.5 plan |
 | `docker-compose.yml` | One-command local stack |
 
 ## Quickstart
