@@ -86,6 +86,15 @@ func run() error {
 		HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
 		AllowedOrigins:        cfg.AllowedOrigins,
 		Version:               Version,
+		HA: api.HAConfig{
+			Enabled:             cfg.HAEnabled,
+			BackendPostgresURL:  cfg.BackendPostgresURL,
+			BackendS3Endpoint:   cfg.BackendS3Endpoint,
+			BackendS3Region:     cfg.BackendS3Region,
+			BackendS3AccessKey:  cfg.BackendS3AccessKey,
+			BackendS3SecretKey:  cfg.BackendS3SecretKey,
+			BackendBucketPrefix: cfg.BackendS3BucketPrefix,
+		},
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the

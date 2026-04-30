@@ -27,6 +27,26 @@ type RouterDeps struct {
 	HealthcheckViaNetwork bool
 	AllowedOrigins        string
 	Version               string
+
+	// HA configuration (v0.5+). Zero value = HA disabled, behaves
+	// exactly like pre-v0.5. When HA.Enabled is true, create_deployment
+	// honours the `ha:true` flag in the request body and provisions
+	// replicas backed by the configured Postgres + S3.
+	HA HAConfig
+}
+
+// HAConfig carries cluster-wide defaults for the per-deployment Postgres
+// + S3 backing. Each value can be overridden on a per-deployment basis
+// through the create-deployment payload (operator can register a
+// different Postgres for a specific tenant).
+type HAConfig struct {
+	Enabled            bool
+	BackendPostgresURL string
+	BackendS3Endpoint  string
+	BackendS3Region    string
+	BackendS3AccessKey string
+	BackendS3SecretKey string
+	BackendBucketPrefix string
 }
 
 // NewRouter builds the top-level chi router. Sub-handlers are mounted by
@@ -59,6 +79,7 @@ func NewRouter(d RouterDeps) http.Handler {
 		PortRangeMin:          d.PortRangeMin,
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
+		HA:                    d.HA,
 	}
 	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
 

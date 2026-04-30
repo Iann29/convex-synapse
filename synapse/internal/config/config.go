@@ -58,6 +58,25 @@ type Config struct {
 	// missing container is promoted to "failed" instead — restart loops
 	// are deliberately out of scope.
 	HealthAutoRestart bool
+
+	// HA configuration (v0.5+). Off by default — Synapse continues to
+	// behave exactly like v0.4 when SYNAPSE_HA_ENABLED is unset. When
+	// enabled, create_deployment accepts a `ha:true` flag in the body
+	// and provisions N replicas backed by Postgres + S3.
+	HAEnabled bool
+
+	// Cluster-wide defaults for the per-deployment Postgres + S3 backing.
+	// Each value is overridable on a per-deployment basis through the
+	// create-deployment payload (operator can register a different
+	// Postgres for a specific tenant). All cluster defaults must be set
+	// when HAEnabled is true; the create-deployment handler refuses to
+	// proceed with HA otherwise.
+	BackendPostgresURL    string
+	BackendS3Endpoint     string
+	BackendS3Region       string
+	BackendS3AccessKey    string
+	BackendS3SecretKey    string
+	BackendS3BucketPrefix string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -117,6 +136,14 @@ func Load() (*Config, error) {
 		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
 		ProxyEnabled:          getEnvDefault("SYNAPSE_PROXY_ENABLED", "") == "true",
 		HealthAutoRestart:     getEnvDefault("SYNAPSE_HEALTH_AUTO_RESTART", "") == "true",
+
+		HAEnabled:             getEnvDefault("SYNAPSE_HA_ENABLED", "") == "true",
+		BackendPostgresURL:    os.Getenv("SYNAPSE_BACKEND_POSTGRES_URL"),
+		BackendS3Endpoint:     os.Getenv("SYNAPSE_BACKEND_S3_ENDPOINT"),
+		BackendS3Region:       getEnvDefault("SYNAPSE_BACKEND_S3_REGION", "us-east-1"),
+		BackendS3AccessKey:    os.Getenv("SYNAPSE_BACKEND_S3_ACCESS_KEY"),
+		BackendS3SecretKey:    os.Getenv("SYNAPSE_BACKEND_S3_SECRET_KEY"),
+		BackendS3BucketPrefix: getEnvDefault("SYNAPSE_BACKEND_S3_BUCKET_PREFIX", "convex"),
 	}, nil
 }
 

@@ -49,6 +49,10 @@ type DeploymentsHandler struct {
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
+
+	// HA carries cluster-wide HA defaults. Empty when HA isn't enabled
+	// — the handler refuses requests that ask for ha:true in that case.
+	HA HAConfig
 }
 
 func (h *DeploymentsHandler) Routes() chi.Router {
@@ -210,6 +214,25 @@ type createDeploymentReq struct {
 	Type      string `json:"type"`               // dev | prod | preview | custom
 	Reference string `json:"reference,omitempty"`
 	IsDefault bool   `json:"isDefault,omitempty"`
+
+	// HA, if true, provisions the deployment with replica_count=2 backed
+	// by Postgres + S3 instead of SQLite + local volume. Refused with
+	// 400 ha_disabled when SYNAPSE_HA_ENABLED isn't true on this Synapse
+	// instance. Default false → existing single-replica behavior.
+	HA bool `json:"ha,omitempty"`
+
+	// Per-deployment overrides for the cluster-wide HA defaults. All
+	// optional; any field left empty falls back to the value configured
+	// at the Synapse-process level (SYNAPSE_BACKEND_POSTGRES_URL etc).
+	HAOverrides *haOverrides `json:"haOverrides,omitempty"`
+}
+
+type haOverrides struct {
+	PostgresURL string `json:"postgresUrl,omitempty"`
+	S3Endpoint  string `json:"s3Endpoint,omitempty"`
+	S3Region    string `json:"s3Region,omitempty"`
+	S3AccessKey string `json:"s3AccessKey,omitempty"`
+	S3SecretKey string `json:"s3SecretKey,omitempty"`
 }
 
 func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +282,31 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		req.Type = models.DeploymentTypeDev
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_type", "deploymentType must be dev|prod|preview|custom")
+		return
+	}
+	if req.HA {
+		// HA-aware provisioning lands across v0.5 chunks 4-5 (replica
+		// allocation + worker rewrite + proxy picker). The body field is
+		// accepted now so the dashboard doesn't have to do feature
+		// detection later, but actual HA flows are gated on flag + plan.
+		// Until those land, refuse loudly so an operator who turns on
+		// HA in their config doesn't get a silent fallback to a single
+		// SQLite replica that can't survive a host loss.
+		if !h.HA.Enabled {
+			writeError(w, http.StatusBadRequest, "ha_disabled",
+				"HA-per-deployment is disabled on this Synapse instance (set SYNAPSE_HA_ENABLED=true)")
+			return
+		}
+		if missing := missingHAClusterFields(h.HA); missing != "" {
+			writeError(w, http.StatusBadRequest, "ha_misconfigured",
+				"HA is enabled but cluster config is incomplete: "+missing)
+			return
+		}
+		// Implementation lands in v0.5 chunks 4-5. Refusing now is the
+		// honest answer; we'll flip this to the actual flow when the
+		// replica-aware provisioner + proxy picker are in place.
+		writeError(w, http.StatusNotImplemented, "ha_not_yet_implemented",
+			"HA provisioning is in flight; see docs/V0_5_PLAN.md")
 		return
 	}
 
@@ -366,6 +414,35 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 // `provisioning_jobs` table instead of being spawned as a per-handler
 // goroutine. Survival across process restarts; multi-node sharding via
 // SELECT FOR UPDATE SKIP LOCKED.)
+
+// missingHAClusterFields returns "" when every required HA cluster
+// default is populated, or a human-readable list of the missing fields
+// otherwise. Used to gate HA create_deployment requests behind a
+// well-configured Synapse process — partial config (e.g. Postgres URL
+// but no S3 endpoint) gets a 400 with a precise hint instead of a
+// stack trace from a half-provisioned container.
+func missingHAClusterFields(c HAConfig) string {
+	missing := make([]string, 0, 5)
+	if c.BackendPostgresURL == "" {
+		missing = append(missing, "SYNAPSE_BACKEND_POSTGRES_URL")
+	}
+	if c.BackendS3Endpoint == "" {
+		missing = append(missing, "SYNAPSE_BACKEND_S3_ENDPOINT")
+	}
+	if c.BackendS3AccessKey == "" {
+		missing = append(missing, "SYNAPSE_BACKEND_S3_ACCESS_KEY")
+	}
+	if c.BackendS3SecretKey == "" {
+		missing = append(missing, "SYNAPSE_BACKEND_S3_SECRET_KEY")
+	}
+	if c.BackendBucketPrefix == "" {
+		missing = append(missing, "SYNAPSE_BACKEND_S3_BUCKET_PREFIX")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return strings.Join(missing, ", ")
+}
 
 // ---------- POST /v1/projects/{id}/adopt_deployment ----------
 
