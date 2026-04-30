@@ -64,6 +64,19 @@ Enqueue a row in a job table and run a `Worker` with
 `SELECT FOR UPDATE SKIP LOCKED` + parallel goroutines. See
 `internal/provisioner/worker.go` for the template.
 
+If your feature touches HA (v0.5+):
+- Read replica info via `deployment_replicas`, not `deployments.host_port`.
+  The legacy column is kept populated for back-compat but new readers go
+  through the replica join (see `proxy.Resolver.ResolveAll` for the pattern).
+- Aggregate replica statuses up to deployment status via the same logic
+  as `health.Worker.recomputeDeploymentStatus`: any-running wins; failed
+  beats stopped on tie.
+- Use `crypto.SecretBox.EncryptString` / `DecryptString` for any secret
+  that ends up in `deployment_storage`. Never log the plaintext.
+- Single-replica deployments leave `HAReplica=false` so `docker.ContainerName`
+  returns the legacy `convex-{name}` shape — keeps existing operator
+  scripts and dashboards working.
+
 ### 4. Run the test until green
 
 `cd synapse && go test ./internal/test/... -run TestYourThing -v -count=1`.
@@ -108,8 +121,9 @@ docker compose up -d synapse dashboard
 sleep 4
 PGPASSWORD=synapse psql -h localhost -U synapse -d synapse -c \
   "TRUNCATE users, teams, projects, team_members, deployments, project_env_vars, \
-   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs \
-   RESTART IDENTITY;"
+   team_invites, deploy_keys, access_tokens, audit_events, provisioning_jobs, \
+   deployment_replicas, deployment_storage \
+   RESTART IDENTITY CASCADE;"
 docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
 cd dashboard && npx playwright test --reporter=list
 ```

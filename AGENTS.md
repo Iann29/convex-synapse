@@ -29,22 +29,24 @@ synapse/                Go backend (chi, pgx, docker SDK)
   internal/api/         HTTP handlers
   internal/audit/       Best-effort audit-log writer
   internal/auth/        JWT + bcrypt + opaque PAT helpers
+  internal/crypto/      AES-GCM SecretBox for HA storage secrets (v0.5+)
   internal/db/          pgx pool, migrations, retry/advisory-lock helpers
-  internal/docker/      Docker SDK + Provision/Destroy/Restart/GenerateAdminKey
-  internal/health/      Periodic reconciler worker
+  internal/docker/      Docker SDK + Provision/Destroy/Restart (single + replica variants)
+  internal/health/      Periodic reconciler — replica-aware aggregate roll-up
   internal/middleware/  chi middleware (auth, logging, CORS)
-  internal/provisioner/ Persistent job queue + parallel worker
-  internal/proxy/       Optional /d/{name}/* reverse proxy
-  internal/test/        Integration test harness (package synapsetest)
+  internal/provisioner/ Persistent job queue + parallel worker (HA-aware claim path)
+  internal/proxy/       /d/{name}/* reverse proxy with multi-replica failover
+  internal/test/        Integration test harness (Setup + SetupHA), package synapsetest
 
 dashboard/              Next.js 16 + Tailwind 4 + Playwright
-docs/                   Architecture, roadmap, design notes, quickstart, API ref
-docker-compose.yml      Local stack
+docs/                   Architecture, roadmap, design, quickstart, API,
+                        V0_5_PLAN.md (HA scoping), HA_TESTING.md (operator setup)
+docker-compose.yml      Local stack + optional `ha` profile (backend-postgres + minio)
 ```
 
-Read `docs/ARCHITECTURE.md` and `docs/DESIGN.md` end-to-end before making
-non-trivial changes — the trade-offs are explained there and not always
-re-stated in the code.
+Read `docs/ARCHITECTURE.md`, `docs/DESIGN.md`, and (for HA work)
+`docs/V0_5_PLAN.md` end-to-end before making non-trivial changes — the
+trade-offs are explained there and not always re-stated in the code.
 
 ## Multi-node ground rules
 
@@ -53,7 +55,9 @@ Docker daemon. Three patterns to follow when you write new code:
 
 - **Resource allocators** (anything that does "SELECT to find a free X, then
   INSERT it"): wrap in `db.WithRetryOnUniqueViolation`. UNIQUE catches the
-  race; retry generates a fresh candidate.
+  race; retry generates a fresh candidate. v0.5: `allocatePorts(N)` is the
+  multi-port variant; UNIQUE constraints live on both
+  `deployments.host_port` (legacy) and `deployment_replicas.host_port`.
 - **Periodic workers**: wrap each tick in `db.WithTryAdvisoryLock(pool, key, fn)`.
   Single-node always acquires; multi-node coordinates.
 - **Long async work**: enqueue a row, run a worker with
@@ -61,6 +65,27 @@ Docker daemon. Three patterns to follow when you write new code:
   per-handler goroutine.
 
 See `internal/provisioner/` for the canonical example of all three.
+
+## HA ground rules (v0.5+)
+
+HA-per-deployment is opt-in via `SYNAPSE_HA_ENABLED=true` +
+`SYNAPSE_STORAGE_KEY=<32 bytes hex>`. Single-replica deployments are
+unaffected — but every NEW code path should:
+
+- **Read replicas, not legacy columns.** `deployment_replicas` is the
+  source of truth for `host_port` / `container_id` / replica `status`.
+  `deployments.host_port` is kept populated for back-compat with v0.4
+  callers; new readers go through the replica join.
+- **Aggregate up to deployment status.** A deployment is `running` if
+  any replica is `running`; `failed` only when all are
+  `failed`/`stopped`. See `health.Worker.recomputeDeploymentStatus`.
+- **Never log decrypted secrets.** `crypto.SecretBox.DecryptString`
+  returns plaintext that goes into a container's env vars and nowhere
+  else. No `slog.Info("worker: provisioning", "url", postgresURL)`.
+- **Single-replica is HAReplica=false, ReplicaIndex=0.** The naming
+  helpers (`docker.ContainerName`, `docker.VolumeName`) keep legacy
+  names unchanged for non-HA — don't break existing operator scripts
+  that filter `convex-{name}` containers.
 
 ## What "done" looks like
 
