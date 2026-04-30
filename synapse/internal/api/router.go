@@ -87,7 +87,6 @@ func NewRouter(d RouterDeps) http.Handler {
 
 	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
 	meH := &MeHandler{DB: d.DB}
-	teamsH := &TeamsHandler{DB: d.DB}
 	invitesH := &InvitesHandler{DB: d.DB}
 	tokensH := &AccessTokensHandler{DB: d.DB}
 	deploymentsH := &DeploymentsHandler{
@@ -101,6 +100,11 @@ func NewRouter(d RouterDeps) http.Handler {
 		HA:                    d.HA,
 		Crypto:                d.Crypto,
 	}
+	// teamsH + projectsH carry a *DeploymentsHandler reference so their
+	// listDeployments handlers can call publicDeploymentURL — same
+	// rewrite as /auth and /cli_credentials so dashboards and CLIs see
+	// public URLs instead of the loopback "http://127.0.0.1:<port>".
+	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH}
 	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
 
 	r.Route("/v1", func(r chi.Router) {

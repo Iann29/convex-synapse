@@ -694,6 +694,10 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	})
 	// Return the row in 'provisioning' state. The dashboard polls and will
 	// flip to 'running' (or 'failed') when the goroutine updates the row.
+	// Rewrite DeploymentURL to the public-reachable form so the dashboard
+	// renders something the operator's browser can actually hit (PR #10
+	// added the helper but only wired it into /auth + /cli_credentials).
+	d.DeploymentURL = h.publicDeploymentURL(&d)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -904,9 +908,18 @@ func (h *DeploymentsHandler) adoptDeployment(w http.ResponseWriter, r *http.Requ
 			"name":           d.Name,
 			"deploymentType": d.DeploymentType,
 			"projectId":      projectID,
+			// Audit the *original* operator-supplied URL, not the
+			// rewritten one — the audit log should record what the
+			// caller actually adopted.
 			"deploymentUrl":  d.DeploymentURL,
 		},
 	})
+	// Adopted deployments keep d.DeploymentURL by design (see
+	// publicDeploymentURL — it short-circuits on `Adopted == true`).
+	// Calling the helper anyway is the explicit contract: same code
+	// path as the other handlers so a future change to the rewrite
+	// rules doesn't accidentally diverge here.
+	d.DeploymentURL = h.publicDeploymentURL(&d)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -1032,6 +1045,7 @@ func (h *DeploymentsHandler) getProjectDeployment(w http.ResponseWriter, r *http
 	if creator != nil {
 		d.CreatorUserID = *creator
 	}
+	d.DeploymentURL = h.publicDeploymentURL(&d)
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -1053,6 +1067,7 @@ func (h *DeploymentsHandler) getDeployment(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	d.DeploymentURL = h.publicDeploymentURL(d)
 	writeJSON(w, http.StatusOK, d)
 }
 
