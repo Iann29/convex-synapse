@@ -216,6 +216,23 @@ EOF
     assert_line "UNSET="
 }
 
+@test "env.tmpl: header comment must not contain {{PLACEHOLDER}} tokens" {
+    # Caught on a real-VPS smoke test: a literal `{{PLACEHOLDERS}}` in
+    # the header comment got matched by the renderer and turned into
+    # an empty string, leaving "# are filled in by ...". The comment
+    # was cosmetic — but if it ever sneaks back, it does the same
+    # thing again. Assert the header (everything up to the first
+    # `# ---` section divider) has no `{{...}}` tokens.
+    local header
+    header="$(awk '/^# ---/ { exit } { print }' "$INSTALLER_DIR/templates/env.tmpl")"
+    if grep -qE '\{\{[A-Z_][A-Z0-9_]*\}\}' <<<"$header"; then
+        echo "header contains a {{...}} placeholder — renderer will eat it" >&2
+        echo "--- header ---" >&2
+        printf '%s\n' "$header" >&2
+        return 1
+    fi
+}
+
 # ---- ensure_env: end-to-end ----------------------------------------
 
 @test "ensure_env: fresh file gets JWT + PG password generated" {
