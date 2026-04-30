@@ -128,7 +128,10 @@ secrets::render_env_tmpl() {
     placeholders="$(grep -oE '\{\{[A-Z_][A-Z0-9_]*\}\}' "$tmpl" | sort -u)"
     local ph key val
     while IFS= read -r ph; do
-        [[ -z "$ph" ]] && continue
+        # `[[ ]] && cmd` pattern is a set -e footgun (returns the
+        # test's exit code when false, aborting the loop). Use the
+        # explicit form everywhere.
+        if [[ -z "$ph" ]]; then continue; fi
         key="${ph#\{\{}"; key="${key%\}\}}"
         val="${!key:-}"
         # sed-escape val: backslashes, ampersands, and the chosen
@@ -155,15 +158,25 @@ secrets::ensure_env() {
         esac
         shift
     done
+    # `[[ -z "$x" ]] && cmd` returns 1 (the test's exit code) when
+    # $x is non-empty, which under set -e aborts the function. Use
+    # explicit `if`/`fi` for any conditional whose downstream caller
+    # has set -e enabled (every consumer of these helpers does).
     local jwt
     jwt="$(secrets::env_get "$file" SYNAPSE_JWT_SECRET)"
-    [[ -z "$jwt" ]] && secrets::ensure_env_var "$file" SYNAPSE_JWT_SECRET "$(secrets::gen_jwt)"
+    if [[ -z "$jwt" ]]; then
+        secrets::ensure_env_var "$file" SYNAPSE_JWT_SECRET "$(secrets::gen_jwt)"
+    fi
     local pwd
     pwd="$(secrets::env_get "$file" POSTGRES_PASSWORD)"
-    [[ -z "$pwd" ]] && secrets::ensure_env_var "$file" POSTGRES_PASSWORD "$(secrets::gen_db_password)"
+    if [[ -z "$pwd" ]]; then
+        secrets::ensure_env_var "$file" POSTGRES_PASSWORD "$(secrets::gen_db_password)"
+    fi
     if (( ha )); then
         local sk
         sk="$(secrets::env_get "$file" SYNAPSE_STORAGE_KEY)"
-        [[ -z "$sk" ]] && secrets::ensure_env_var "$file" SYNAPSE_STORAGE_KEY "$(secrets::gen_storage_key)"
+        if [[ -z "$sk" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_STORAGE_KEY "$(secrets::gen_storage_key)"
+        fi
     fi
 }

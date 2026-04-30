@@ -47,11 +47,18 @@ EOF
 
 # ---- register / create_team / create_project / create_deployment ---
 
-@test "register: extracts access_token from response" {
-    mock_cmd curl 0 '{"access_token":"abc-123","refresh_token":"r"}'
+@test "register: extracts accessToken (camelCase, Convex Cloud shape)" {
+    mock_cmd curl 0 '{"accessToken":"abc-123","refreshToken":"r"}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::register http://x a@b.com pw Name
     assert_success
     assert_output "abc-123"
+}
+
+@test "register: snake_case access_token still accepted (forward-compat)" {
+    mock_cmd curl 0 '{"access_token":"abc-snake","refresh_token":"r"}'
+    VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::register http://x a@b.com pw Name
+    assert_success
+    assert_output "abc-snake"
 }
 
 @test "register: curl failure propagates" {
@@ -67,15 +74,22 @@ EOF
     assert_output "default"
 }
 
-@test "create_project: extracts id" {
-    mock_cmd curl 0 '{"id":42,"name":"Demo"}'
+@test "create_project: extracts projectId (camelCase, Convex Cloud shape)" {
+    mock_cmd curl 0 '{"projectId":"42","projectSlug":"demo","project":{"id":"42","name":"Demo"}}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::create_project http://x default Demo
     assert_success
     assert_output "42"
 }
 
-@test "create_deployment: extracts name" {
-    mock_cmd curl 0 '{"name":"happy-cat-1234","status":"provisioning"}'
+@test "create_project: nested project.id fallback works" {
+    mock_cmd curl 0 '{"project":{"id":"99","name":"Demo"}}'
+    VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::create_project http://x default Demo
+    assert_success
+    assert_output "99"
+}
+
+@test "create_deployment: extracts name from Deployment object" {
+    mock_cmd curl 0 '{"id":"u","name":"happy-cat-1234","status":"provisioning"}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::create_deployment http://x 42 dev
     assert_success
     assert_output "happy-cat-1234"
@@ -103,22 +117,22 @@ EOF
 
 # ---- check_cli_creds -----------------------------------------------
 
-@test "check_cli_creds: public URL -> echoes URL + success" {
-    mock_cmd curl 0 '{"convex_url":"https://synapse.example.com/d/happy-cat"}'
+@test "check_cli_creds: convexUrl public -> echoes URL + success" {
+    mock_cmd curl 0 '{"convexUrl":"https://synapse.example.com/d/happy-cat","adminKey":"k"}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::check_cli_creds http://x happy-cat
     assert_success
     assert_output "https://synapse.example.com/d/happy-cat"
 }
 
-@test "check_cli_creds: 127.0.0.1 URL -> failure (PUBLIC_URL not wired)" {
-    mock_cmd curl 0 '{"convex_url":"http://127.0.0.1:3210"}'
+@test "check_cli_creds: convexUrl 127.0.0.1 -> failure (PUBLIC_URL not wired)" {
+    mock_cmd curl 0 '{"convexUrl":"http://127.0.0.1:3210","adminKey":"k"}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::check_cli_creds http://x happy-cat
     assert_failure 1
     assert_output --partial "loopback"
 }
 
-@test "check_cli_creds: localhost URL -> failure" {
-    mock_cmd curl 0 '{"convex_url":"http://localhost:3210"}'
+@test "check_cli_creds: convexUrl localhost -> failure" {
+    mock_cmd curl 0 '{"convexUrl":"http://localhost:3210","adminKey":"k"}'
     VERIFY_CURL="$SYN_MOCK_BIN/curl" run verify::check_cli_creds http://x happy-cat
     assert_failure 1
 }
@@ -143,12 +157,12 @@ for arg in "$@"; do
     esac
 done
 case "$url" in
-    *auth/register)       echo '{"access_token":"tok-self","refresh_token":"r"}' ;;
-    *teams/create_team)   echo '{"slug":"default","name":"Default"}' ;;
-    *create_project)      echo '{"id":1,"name":"Demo"}' ;;
-    *create_deployment)   echo '{"name":"happy-cat-self","status":"provisioning"}' ;;
+    *auth/register)       echo '{"accessToken":"tok-self","refreshToken":"r"}' ;;
+    *teams/create_team)   echo '{"slug":"default","name":"Default","id":"t-1"}' ;;
+    *create_project)      echo '{"projectId":"p-1","projectSlug":"demo","project":{"id":"p-1","name":"Demo"}}' ;;
+    *create_deployment)   echo '{"id":"d-1","name":"happy-cat-self","status":"provisioning"}' ;;
     */deployments/happy-cat-self/cli_credentials)
-                          echo '{"convex_url":"https://synapse.example.com/d/happy-cat-self"}' ;;
+                          echo '{"convexUrl":"https://synapse.example.com/d/happy-cat-self","adminKey":"k","deploymentName":"happy-cat-self"}' ;;
     */deployments/happy-cat-self)
                           echo '{"status":"running","name":"happy-cat-self"}' ;;
     *)                    echo '{}'; exit 1 ;;
