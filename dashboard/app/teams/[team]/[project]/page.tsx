@@ -66,6 +66,17 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   const [openingName, setOpeningName] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Adopt-existing modal state. Kept separate from the create-deployment
+  // state because the two forms have different fields and we don't want a
+  // submit on one to leak the other's "pending" spinner.
+  const [adoptOpen, setAdoptOpen] = useState(false);
+  const [adoptUrl, setAdoptUrl] = useState("");
+  const [adoptAdminKey, setAdoptAdminKey] = useState("");
+  const [adoptType, setAdoptType] = useState<"dev" | "prod">("prod");
+  const [adoptName, setAdoptName] = useState("");
+  const [adoptPending, setAdoptPending] = useState(false);
+  const [adoptError, setAdoptError] = useState<string | null>(null);
+
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
@@ -80,6 +91,32 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
       );
     } finally {
       setPending(false);
+    }
+  };
+
+  const adopt = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAdoptError(null);
+    setAdoptPending(true);
+    try {
+      await api.projects.adoptDeployment(projectId, {
+        deploymentUrl: adoptUrl.trim(),
+        adminKey: adoptAdminKey.trim(),
+        deploymentType: adoptType,
+        name: adoptName.trim() || undefined,
+      });
+      setAdoptOpen(false);
+      setAdoptUrl("");
+      setAdoptAdminKey("");
+      setAdoptName("");
+      setAdoptType("prod");
+      await mutate();
+    } catch (err) {
+      setAdoptError(
+        err instanceof ApiError ? err.message : "Could not adopt deployment"
+      );
+    } finally {
+      setAdoptPending(false);
     }
   };
 
@@ -209,6 +246,13 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             <Button onClick={() => setOpen(true)}>New deployment</Button>
             <Button
               variant="secondary"
+              onClick={() => setAdoptOpen(true)}
+              aria-label="Adopt existing deployment"
+            >
+              Adopt existing
+            </Button>
+            <Button
+              variant="secondary"
               onClick={() => {
                 setRenameValue(project?.name ?? "");
                 setRenameOpen(true);
@@ -294,6 +338,7 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                         <Badge tone={statusTone(d.status)}>{d.status}</Badge>
                       )}
                       {d.isDefault && <Badge tone="neutral">default</Badge>}
+                      {d.adopted && <Badge tone="neutral">adopted</Badge>}
                     </div>
                     {(d.deploymentUrl || d.url) && (
                       <div className="mt-1 flex items-center gap-2">
@@ -383,6 +428,89 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? "Creating..." : "Create"}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+
+      <Dialog
+        open={adoptOpen}
+        onClose={() => setAdoptOpen(false)}
+        title="Adopt existing deployment"
+      >
+        <form onSubmit={adopt} className="space-y-4">
+          <p className="text-xs text-neutral-400">
+            Register a Convex backend that&apos;s already running outside Synapse.
+            Synapse stores the URL + admin key and skips Docker for delete /
+            health on this row — the backend stays under your control.
+          </p>
+          <div className="space-y-2">
+            <label htmlFor="adopt-url" className="block text-xs text-neutral-400">
+              Deployment URL
+            </label>
+            <Input
+              id="adopt-url"
+              value={adoptUrl}
+              onChange={(e) => setAdoptUrl(e.target.value)}
+              placeholder="https://convex.example.com:3210"
+              required
+              autoFocus
+            />
+          </div>
+          <div className="space-y-2">
+            <label htmlFor="adopt-admin-key" className="block text-xs text-neutral-400">
+              Admin key
+            </label>
+            <Input
+              id="adopt-admin-key"
+              type="password"
+              value={adoptAdminKey}
+              onChange={(e) => setAdoptAdminKey(e.target.value)}
+              required
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="block text-xs text-neutral-400">Type</label>
+            <div className="flex gap-2">
+              {(["dev", "prod"] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setAdoptType(t)}
+                  className={`h-9 flex-1 rounded-md border text-sm transition-colors ${
+                    adoptType === t
+                      ? "border-neutral-300 bg-neutral-800 text-neutral-100"
+                      : "border-neutral-700 bg-neutral-900 text-neutral-400 hover:bg-neutral-800"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <label htmlFor="adopt-name" className="block text-xs text-neutral-400">
+              Name <span className="text-neutral-600">(optional — auto-allocated if blank)</span>
+            </label>
+            <Input
+              id="adopt-name"
+              value={adoptName}
+              onChange={(e) => setAdoptName(e.target.value)}
+              placeholder="my-existing-app"
+            />
+          </div>
+          {adoptError && <p className="text-xs text-red-400">{adoptError}</p>}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setAdoptOpen(false)}
+              disabled={adoptPending}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={adoptPending || !adoptUrl.trim() || !adoptAdminKey.trim()}>
+              {adoptPending ? "Verifying…" : "Adopt"}
             </Button>
           </div>
         </form>

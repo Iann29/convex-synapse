@@ -42,6 +42,19 @@ export type Deployment = {
   deploymentUrl?: string;
   createdAt?: string;
   isDefault?: boolean;
+  // True for deployments registered via /adopt_deployment — Synapse points
+  // at an external Convex backend rather than a container it provisioned.
+  adopted?: boolean;
+};
+
+// Body shape for POST /v1/projects/{id}/adopt_deployment.
+export type AdoptDeploymentInput = {
+  deploymentUrl: string;
+  adminKey: string;
+  deploymentType?: "dev" | "prod" | "preview" | "custom";
+  name?: string;
+  isDefault?: boolean;
+  reference?: string;
 };
 
 export type DeploymentAuth = {
@@ -332,6 +345,18 @@ export const api = {
     ): Promise<Deployment> {
       return request<Deployment>(
         `/v1/projects/${encodeURIComponent(id)}/create_deployment`,
+        { method: "POST", body }
+      );
+    },
+    // Register an existing Convex backend (running outside Synapse) as a
+    // deployment under this project. The backend stores the URL + admin key
+    // and skips Docker calls in delete / health flows.
+    adoptDeployment(
+      id: string,
+      body: AdoptDeploymentInput
+    ): Promise<Deployment> {
+      return request<Deployment>(
+        `/v1/projects/${encodeURIComponent(id)}/adopt_deployment`,
         { method: "POST", body }
       );
     },
