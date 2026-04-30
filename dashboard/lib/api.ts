@@ -45,6 +45,10 @@ export type Deployment = {
   // True for deployments registered via /adopt_deployment — Synapse points
   // at an external Convex backend rather than a container it provisioned.
   adopted?: boolean;
+  // HA flags (v0.5+). Both are absent on legacy / single-replica deployments;
+  // present + true means the row is backed by Postgres + S3 with N replicas.
+  haEnabled?: boolean;
+  replicaCount?: number;
 };
 
 // Body shape for POST /v1/projects/{id}/adopt_deployment.
@@ -341,7 +345,14 @@ export const api = {
     },
     createDeployment(
       id: string,
-      body: { type: "dev" | "prod"; isDefault?: boolean }
+      body: {
+        type: "dev" | "prod";
+        isDefault?: boolean;
+        // HA mode (v0.5+). When true, the backend provisions 2 replicas
+        // backed by Postgres + S3. Refused with 400 ha_disabled when
+        // SYNAPSE_HA_ENABLED is not set on the cluster.
+        ha?: boolean;
+      }
     ): Promise<Deployment> {
       return request<Deployment>(
         `/v1/projects/${encodeURIComponent(id)}/create_deployment`,
