@@ -323,8 +323,38 @@ phase_secrets() {
         export POSTGRES_PORT="5432"
         export SYNAPSE_PORT="${SYNAPSE_PORT:-8080}"
         export DASHBOARD_PORT="${DASHBOARD_PORT:-6790}"
-        export SYNAPSE_PUBLIC_URL="${DOMAIN:+https://$DOMAIN}"
-        export SYNAPSE_ALLOWED_ORIGINS="${DOMAIN:+https://$DOMAIN}"
+        # Decide the public URL the operator's *browser* and *CLI* will
+        # use to reach this Synapse:
+        #   --domain set       -> https://<domain> (Caddy fronts it)
+        #   --no-tls + IP detected -> http://<public-ip>:<port> (no TLS,
+        #                              but reachable from outside the VPS)
+        #   --no-tls + IP undetectable -> "" (legacy localhost; install
+        #                              is local-only, dashboard won't
+        #                              load from a remote browser)
+        # The same value lands in BOTH SYNAPSE_PUBLIC_URL (server-side,
+        # used by /cli_credentials) and PUBLIC_SYNAPSE_URL (which
+        # docker-compose passes to the dashboard as
+        # NEXT_PUBLIC_SYNAPSE_URL — the URL the dashboard JS calls).
+        # Without this wiring, a remote browser hitting the dashboard
+        # at http://<vps-ip>:6790 silently fails because the JS tries
+        # to reach the API at localhost:8080 — the operator's own
+        # machine, where nothing is listening.
+        local public_url="" allowed_origins="*"
+        if [[ -n "$DOMAIN" ]]; then
+            public_url="https://$DOMAIN"
+            allowed_origins="https://$DOMAIN"
+        else
+            local detected_ip=""
+            if detected_ip="$(detect::public_ip 2>/dev/null)" && [[ -n "$detected_ip" ]]; then
+                public_url="http://${detected_ip}:${SYNAPSE_PORT}"
+                ui::info "Detected public IP $detected_ip — wiring dashboard to $public_url"
+            else
+                ui::warn "Public IP not detected — dashboard will only work from this VPS"
+                ui::info "  (set --domain=<host> for an externally-reachable install)"
+            fi
+        fi
+        export SYNAPSE_PUBLIC_URL="$public_url"
+        export SYNAPSE_ALLOWED_ORIGINS="$allowed_origins"
         local ha_flag="false"
         (( ENABLE_HA )) && ha_flag="true"
         export SYNAPSE_HA_ENABLED="$ha_flag"

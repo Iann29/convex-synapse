@@ -393,3 +393,63 @@ setup() {
     assert_failure
     assert_output "0"
 }
+
+# ---- public_ip ------------------------------------------------------
+
+@test "public_ip: DETECT_PUBLIC_IP_OVERRIDE short-circuits the curl call" {
+    DETECT_PUBLIC_IP_OVERRIDE="203.0.113.42" run detect::public_ip
+    assert_success
+    assert_output "203.0.113.42"
+}
+
+@test "public_ip: ipify returns valid IP -> echoed" {
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "198.51.100.7"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    run detect::public_ip
+    assert_success
+    assert_output "198.51.100.7"
+}
+
+@test "public_ip: ipify returns garbage -> falls through to next service" {
+    # First call (ipify) returns HTML, second (ifconfig.me) returns IP.
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+counter_file="$BATS_TEST_TMPDIR/curl-counter"
+n=0
+[[ -f "$counter_file" ]] && n=$(cat "$counter_file")
+n=$((n + 1))
+echo "$n" > "$counter_file"
+if (( n == 1 )); then
+    echo "<html>error</html>"
+else
+    echo "192.0.2.99"
+fi
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    run detect::public_ip
+    assert_success
+    assert_output "192.0.2.99"
+}
+
+@test "public_ip: both services return non-IP -> failure" {
+    mock_cmd curl 0 "<html>not an IP</html>"
+    run detect::public_ip
+    assert_failure
+}
+
+@test "public_ip: curl absent -> failure" {
+    # Pin PATH to mock dir only so command -v curl fails.
+    PATH="$SYN_MOCK_BIN" run detect::public_ip
+    assert_failure
+}
+
+@test "public_ip: rejects IPv6 (we only wire IPv4 ports today)" {
+    mock_cmd curl 0 "2001:db8::1"
+    run detect::public_ip
+    assert_failure
+}
