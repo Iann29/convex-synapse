@@ -533,4 +533,10 @@ main() {
     phase_success_screen
 }
 
-main "$@"
+# Skip the actual run when sourced from a test (so bats can probe
+# individual functions without triggering preflight + compose). The
+# Tailscale truncation-safety property is preserved: a half-downloaded
+# script still won't reach this line.
+if [[ -z "${__SETUP_NO_MAIN:-}" ]]; then
+    main "$@"
+fi
