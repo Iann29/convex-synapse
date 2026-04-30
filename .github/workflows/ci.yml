@@ -79,10 +79,15 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
-            -x installer/lib/detect.sh installer/lib/port.sh installer/test/helpers/load.bash
+            -x \
+            installer/lib/detect.sh \
+            installer/lib/port.sh \
+            installer/install/ui.sh \
+            installer/install/preflight.sh \
+            installer/test/helpers/load.bash
       - name: bats
         run: |
-          docker run --rm -v "$PWD:/code" -w /code bats/bats:latest installer/test/lib/
+          docker run --rm -v "$PWD:/code" -w /code bats/bats:latest -r installer/test/
 
   e2e:
     name: Playwright e2e
