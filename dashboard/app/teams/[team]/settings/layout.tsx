@@ -22,26 +22,17 @@ export default function TeamSettingsLayout({
   const pathname = usePathname() ?? "";
   const base = `/teams/${encodeURIComponent(teamRef)}/settings`;
 
-  // Items follow the Convex Cloud taxonomy. Items without dedicated pages in
-  // v0 are rendered disabled — the brief calls those out as "out of scope
-  // for the redesign PR" but we keep them in the IA so the structure
-  // matches Cloud and we can land them incrementally.
+  // Settings IA. Synapse is open-source self-hosted — Cloud-only concerns
+  // (Billing, Usage, Referrals, Applications, paid-tier SSO) are not on
+  // the roadmap and would just be dead UI. Audit Log lives at
+  // /teams/{ref}/audit (top-level link in the team header) so it's not
+  // duplicated here either.
   const groups: { items: NavItem[] }[] = [
     {
       items: [
         { href: `${base}/general`, label: "General" },
         { href: `${base}/members`, label: "Members" },
         { href: `${base}/access-tokens`, label: "Access Tokens" },
-      ],
-    },
-    {
-      items: [
-        { label: "Billing", disabled: true },
-        { label: "Usage", disabled: true },
-        { label: "Referrals", disabled: true },
-        { label: "Applications", disabled: true },
-        { label: "Audit Log", disabled: true, badge: "PRO" },
-        { label: "Single Sign-On", disabled: true },
       ],
     },
   ];
