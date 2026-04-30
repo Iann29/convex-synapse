@@ -38,12 +38,15 @@ verify::_jq() {
 }
 
 # verify::register <synapse_url> <email> <password> <name> → token on stdout
+# The Synapse API speaks the Convex Cloud OpenAPI v1 shape:
+# `accessToken` (camelCase). We accept both forms with `// .access_token`
+# so the smoke test stays robust against future-snake-case mirrors.
 verify::register() {
     local url="$1" email="$2" password="$3" name="$4"
     local body resp
     body="$(printf '{"email":"%s","password":"%s","name":"%s"}' "$email" "$password" "$name")"
     resp="$(verify::_curl POST "$url/v1/auth/register" "$body")" || return 1
-    printf '%s' "$resp" | verify::_jq '.access_token'
+    printf '%s' "$resp" | verify::_jq '.accessToken // .access_token // empty'
 }
 
 # verify::create_team <synapse_url> <name> → team_ref on stdout
@@ -55,22 +58,27 @@ verify::create_team() {
     printf '%s' "$resp" | verify::_jq '.slug // .team.slug // .reference'
 }
 
-# verify::create_project <synapse_url> <team_ref> <name> → project_id on stdout
+# verify::create_project <synapse_url> <team_ref> <name> → project_id
+# Synapse API uses Convex Cloud's camelCase shape: request takes
+# `projectName` (NOT `name`) and the response has `projectId` at the
+# top level plus a nested `project.id`.
 verify::create_project() {
     local url="$1" team="$2" name="$3"
     local body resp
-    body="$(printf '{"name":"%s"}' "$name")"
+    body="$(printf '{"projectName":"%s"}' "$name")"
     resp="$(verify::_curl POST "$url/v1/teams/$team/create_project" "$body")" || return 1
-    printf '%s' "$resp" | verify::_jq '.id // .project.id'
+    printf '%s' "$resp" | verify::_jq '.projectId // .project.id // empty'
 }
 
 # verify::create_deployment <synapse_url> <project_id> <type> → deployment_name
+# Convex Cloud OpenAPI shape: body takes `type` (not `deployment_type`),
+# response is the Deployment object with `name` at the top level.
 verify::create_deployment() {
     local url="$1" pid="$2" dtype="${3:-dev}"
     local body resp
-    body="$(printf '{"deployment_type":"%s"}' "$dtype")"
+    body="$(printf '{"type":"%s"}' "$dtype")"
     resp="$(verify::_curl POST "$url/v1/projects/$pid/create_deployment" "$body")" || return 1
-    printf '%s' "$resp" | verify::_jq '.name // .deployment.name'
+    printf '%s' "$resp" | verify::_jq '.name // .deployment.name // empty'
 }
 
 # verify::wait_deployment <synapse_url> <deployment_name> [timeout=120]
@@ -100,7 +108,10 @@ verify::check_cli_creds() {
     local url="$1" name="$2"
     local resp convex_url
     resp="$(verify::_curl GET "$url/v1/deployments/$name/cli_credentials")" || return 1
-    convex_url="$(printf '%s' "$resp" | verify::_jq '.convex_url // .ConvexURL // empty')"
+    # Synapse returns the Convex Cloud-shape `convexUrl` (camelCase);
+    # `.convex_url` and `.ConvexURL` are accepted as fallbacks for
+    # forward-compat with potential snake_case mirrors.
+    convex_url="$(printf '%s' "$resp" | verify::_jq '.convexUrl // .convex_url // .ConvexURL // empty')"
     if [[ -z "$convex_url" ]]; then
         return 1
     fi
@@ -113,18 +124,25 @@ verify::check_cli_creds() {
     printf '%s' "$convex_url"
 }
 
-# verify::run <synapse_url> [--keep-demo]
+# verify::run <synapse_url> [--keep-demo] [--skip-cli-url-check]
 # Full happy-path self-test. Registers a one-shot admin, creates a
 # team, project, deployment, waits for running, validates the CLI
 # credentials URL is publicly reachable. Tears the demo down at the
 # end unless --keep-demo. Returns 0 on success.
+#
+# --skip-cli-url-check: don't fail when the CLI URL is loopback. Use
+# this when SYNAPSE_PUBLIC_URL isn't expected to be set (e.g. the
+# operator ran setup.sh with --no-tls and accepts that the install
+# is local-only). Without the flag, a loopback URL is treated as a
+# misconfiguration and the install aborts.
 verify::run() {
     local url="$1"
     shift || true
-    local keep=0
+    local keep=0 skip_url=0
     while (( $# > 0 )); do
         case "$1" in
             --keep-demo) keep=1 ;;
+            --skip-cli-url-check) skip_url=1 ;;
         esac
         shift
     done
@@ -151,12 +169,17 @@ verify::run() {
         return 2
     fi
 
-    ui::info "Self-test: validating CLI credentials URL is publicly reachable"
-    if ! convex_url="$(verify::check_cli_creds "$url" "$dep")"; then
-        ui::fail "Self-test: CLI URL check failed"
-        return 2
+    if (( skip_url )); then
+        ui::info "Self-test: skipping CLI URL public-reachability check (--skip-cli-url-check)"
+        ui::success "Self-test passed: deployment $dep is running"
+    else
+        ui::info "Self-test: validating CLI credentials URL is publicly reachable"
+        if ! convex_url="$(verify::check_cli_creds "$url" "$dep")"; then
+            ui::fail "Self-test: CLI URL check failed"
+            return 2
+        fi
+        ui::success "Self-test passed: $convex_url"
     fi
-    ui::success "Self-test passed: $convex_url"
 
     if (( keep == 0 )); then
         ui::info "Self-test: tearing down demo deployment"

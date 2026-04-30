@@ -20,27 +20,32 @@ compose::pull() {
         "$cmd" compose -f "$dir/docker-compose.yml" pull
 }
 
-# compose::up <compose_dir> [--profile name]...
-# Brings the stack up in detached mode. Multiple --profile flags pass
-# straight through. The default `caddy` profile activation is the
-# caller's job (setup.sh decides based on caddy::detect_mode).
+# compose::up <compose_dir> [--profile name]... [--build] [extra args]
+# Brings the stack up in detached mode. --profile flags accumulate
+# (the v0.6 caddy + ha profiles can be combined). Other unknown
+# args pass through verbatim to `docker compose up` — this lets
+# callers add `--build` (which builds locally-defined services like
+# `synapse` and `dashboard` instead of trying to pull them, since
+# they have no published image) without us having to whitelist
+# every compose flag.
 compose::up() {
     local dir="${1:-.}"
     shift
     local cmd="${COMPOSE_CMD:-docker}"
-    local args=(compose -f "$dir/docker-compose.yml")
+    local profiles=() up_args=()
     while (( $# > 0 )); do
         case "$1" in
             --profile)
-                args+=(--profile "$2")
+                profiles+=(--profile "$2")
                 shift 2
                 ;;
             *)
+                up_args+=("$1")
                 shift
                 ;;
         esac
     done
-    args+=(up -d)
+    local args=(compose -f "$dir/docker-compose.yml" "${profiles[@]}" up -d "${up_args[@]}")
     ui::spin "Bringing up the stack" "$cmd" "${args[@]}"
 }
 

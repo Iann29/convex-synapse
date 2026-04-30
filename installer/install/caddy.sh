@@ -129,7 +129,9 @@ caddy::_render() {
     placeholders="$(grep -oE '\{\{[A-Z_][A-Z0-9_]*\}\}' "$tmpl" | sort -u)"
     local ph key val esc
     while IFS= read -r ph; do
-        [[ -z "$ph" ]] && continue
+        # Avoid `[[ ]] && cmd`: under set -e the test's exit code
+        # propagates and aborts the loop. Use explicit `if`/`fi`.
+        if [[ -z "$ph" ]]; then continue; fi
         key="${ph#\{\{}"; key="${key%\}\}}"
         val="${!key:-}"
         esc="$(printf '%s' "$val" | sed -e 's/[\&|]/\\&/g')"
