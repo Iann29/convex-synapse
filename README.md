@@ -50,21 +50,27 @@ proxy fails over between them on connection errors, health worker tracks replica
 state independently, dashboard toggle + `HA ×2` badge. Single-replica behavior
 is unchanged — HA is a per-deployment switch behind `SYNAPSE_HA_ENABLED`.
 
-**Next milestone: v0.6 — Auto-installer (top priority).** Today's install
-flow is "clone the repo, edit `.env`, edit Caddyfile, reload, run compose,
-smoke-test from a remote shell" — too many manual steps for a project whose
-whole point is making Convex self-hosting easy. The v0.6 plan replaces all
-of that with one command:
+**v0.6 (auto-installer) feature-complete for v0.6.0 — 10/10 chunks
+landed.** A fresh VPS goes from `git clone` to running Convex deployment
+with one command:
 
 ```
-$ curl -sf https://get.synapse.dev | sh
+$ ./setup.sh --domain=synapse.example.com
 ```
 
 Auto-detects Docker / Caddy / nginx / port conflicts / DNS, generates
-secrets, configures TLS, brings up the stack, runs a self-test, and
-prints the URL + admin credentials. See
-**[docs/V0_6_INSTALLER_PLAN.md](docs/V0_6_INSTALLER_PLAN.md)** for the
-full phased design.
+secrets (idempotent — never regenerates existing ones), configures TLS
+via Let's Encrypt, brings up the stack, pre-pulls the Convex backend
+image, runs a self-test (registers a one-shot admin → creates team →
+project → deployment → asserts cli_credentials URL is publicly
+reachable), and prints the URL + admin credentials. **Validated against
+a real Hetzner CPX22 — every chunk caught a different real-world bug
+the bats suite alone wouldn't have surfaced.**
+
+Hosted `curl -sf https://get.synapse.dev | sh` one-liner is reserved
+for v0.6.2 (just needs a static script host pinned to git tags). For
+the full phased design + chunk-by-chunk landing log, see
+**[docs/V0_6_INSTALLER_PLAN.md](docs/V0_6_INSTALLER_PLAN.md)**.
 
 The dashboard matches the Convex Cloud aesthetic (top app bar, team picker,
 redesigned home, team-settings shell), and the control plane is multi-node-safe
@@ -169,23 +175,44 @@ User-scoped personal access tokens for CLI / CI.
 | `docs/` | Architecture, quickstart, roadmap, API ref, v0.5 plan, HA testing guide |
 | `docker-compose.yml` | One-command local stack (+ optional `ha` profile for HA testing) |
 
-## Quickstart
+## Quickstart (production VPS)
+
+On a fresh Linux VPS with a domain pointing at it:
 
 ```bash
 git clone https://github.com/Iann29/convex-synapse.git
-cd convex-synapse
-cp .env.example .env
-echo "SYNAPSE_JWT_SECRET=$(openssl rand -hex 64)" >> .env
-docker compose up -d
+cd convex-synapse && ./setup.sh --domain=synapse.yourdomain.com
 ```
 
-Open `http://localhost:6790`, register, create a team → project → deployment.
-Synapse provisions a fresh Convex backend container in about a second.
+Two minutes later: stack up, TLS via Caddy + Let's Encrypt, admin user
+ready, demo Convex deployment self-tested. Re-runs are idempotent —
+existing secrets are preserved (Coolify-style `update_env_var`), the
+managed Caddyfile block is upserted, and the demo deployment isn't
+recreated. **Tested end-to-end against a real Hetzner CPX22.**
 
-For details (manual dev path, `curl` examples, `npx convex` integration), see
-[docs/QUICKSTART.md](docs/QUICKSTART.md). For deploying to a real VPS with
-TLS + a public domain, see [docs/PRODUCTION.md](docs/PRODUCTION.md). For
-HA mode, see [docs/HA_TESTING.md](docs/HA_TESTING.md).
+`setup.sh` flags worth knowing:
+
+- `--non-interactive` — no prompts; defaults everything except `--domain`
+- `--no-tls` — skip Caddy entirely (DIY ingress / local-only install)
+- `--skip-dns-check` — proceed before A-record propagates
+- `--enable-ha` — opt the install into HA-per-deployment mode (also needs `SYNAPSE_BACKEND_POSTGRES_URL` + `SYNAPSE_BACKEND_S3_*`)
+- `--doctor` — run preflight against an existing install, no mutations
+
+## Quickstart (local dev)
+
+```bash
+git clone https://github.com/Iann29/convex-synapse.git
+cd convex-synapse && ./setup.sh --no-tls --skip-dns-check --non-interactive
+```
+
+Open `http://localhost:6790`, log in with the admin user the installer
+created, click around the dashboard's demo deployment.
+
+For details (manual `.env` path, `curl` examples, `npx convex`
+integration), see [docs/QUICKSTART.md](docs/QUICKSTART.md). For VPS
+specifics (Caddy override, nginx alternative, `synapse upgrade`), see
+[docs/PRODUCTION.md](docs/PRODUCTION.md). For HA, see
+[docs/HA_TESTING.md](docs/HA_TESTING.md).
 
 ## Tests
 
