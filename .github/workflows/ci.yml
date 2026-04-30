@@ -66,6 +66,24 @@ jobs:
         env:
           SYNAPSE_JWT_SECRET: dummy-jwt-secret-for-ci-builds-only-do-not-use-in-prod-x
 
+  installer:
+    # v0.6 auto-installer — pure-bash helpers + bats unit tests.
+    # We intentionally pin the bats and shellcheck Docker images
+    # (rather than installing apt packages) so the same toolchain runs
+    # locally and in CI; reproducing a CI failure on a developer
+    # machine is `docker run ...` against the same digest.
+    name: installer (bats + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
+            -x installer/lib/detect.sh installer/lib/port.sh installer/test/helpers/load.bash
+      - name: bats
+        run: |
+          docker run --rm -v "$PWD:/code" -w /code bats/bats:latest installer/test/lib/
+
   e2e:
     name: Playwright e2e
     runs-on: ubuntu-latest
