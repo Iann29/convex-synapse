@@ -1,0 +1,27 @@
+# Standalone Caddyfile — used when Synapse brings its own Caddy via
+# the docker-compose `caddy` profile. The Caddy container joins the
+# synapse-network bridge, so it reaches the API and dashboard via
+# their service names (NOT localhost — that would resolve inside the
+# Caddy container itself).
+
+{
+    # Email used for Let's Encrypt account registration. Cert renewal
+    # warnings go here.
+    email {{ACME_EMAIL}}
+}
+
+{{DOMAIN}} {
+    # /v1/*   → Synapse REST API
+    # /d/*    → Convex backend reverse proxy (per-deployment routing)
+    # /health → Synapse healthcheck endpoint
+    # everything else → the dashboard
+    @dashboard {
+        not path /v1/* /d/* /health
+    }
+    handle @dashboard {
+        reverse_proxy synapse-dashboard:3000
+    }
+    handle {
+        reverse_proxy synapse-api:8080
+    }
+}

@@ -1,0 +1,15 @@
+{{DOMAIN}} {
+    # /v1/*  → Synapse REST API
+    # /d/*   → Convex backend reverse proxy (per-deployment routing)
+    # /health → Synapse healthcheck endpoint
+    # everything else → the dashboard
+    @dashboard {
+        not path /v1/* /d/* /health
+    }
+    handle @dashboard {
+        reverse_proxy localhost:{{DASHBOARD_PORT}}
+    }
+    handle {
+        reverse_proxy localhost:{{SYNAPSE_PORT}}
+    }
+}
