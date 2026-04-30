@@ -221,6 +221,40 @@ detect::has_systemd() {
     [[ -d /run/systemd/system ]]
 }
 
+# detect::public_ip — Echoes the host's externally-visible IPv4 to
+# stdout. Used by setup.sh in --no-tls mode to wire the dashboard +
+# CLI URLs to a value the operator's browser can reach (instead of
+# the docker-compose default `localhost:8080`, which resolves to the
+# operator's own machine). Tries api.ipify.org first; falls back to
+# ifconfig.me. Both are well-known no-rate-limit echoes. Returns 1
+# if neither responds within 5s — the caller is expected to fall
+# back to legacy loopback URLs (and accept that the install is
+# local-only).
+#
+# Tests inject DETECT_PUBLIC_IP_OVERRIDE to short-circuit the curl
+# call deterministically.
+detect::public_ip() {
+    if [[ -n "${DETECT_PUBLIC_IP_OVERRIDE:-}" ]]; then
+        echo "$DETECT_PUBLIC_IP_OVERRIDE"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        return 1
+    fi
+    local ip
+    for url in https://api.ipify.org https://ifconfig.me; do
+        ip="$(curl -sf --max-time 5 "$url" 2>/dev/null)" || continue
+        # Validate IPv4 shape — reject HTML error pages, empty
+        # responses, etc. IPv6 is intentionally excluded for now;
+        # the docker-compose port bindings are IPv4-only.
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---- Capacity -------------------------------------------------------
 
 # detect::disk_free_gb [path] — Free GB on the filesystem holding

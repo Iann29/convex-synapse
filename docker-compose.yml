@@ -73,14 +73,23 @@ services:
   dashboard:
     build:
       context: ./dashboard
+      # NEXT_PUBLIC_* vars are inlined into the JS bundle at *build*
+      # time — Next.js doesn't read them at runtime. We MUST pass the
+      # public URL as a build arg, not just as a runtime env. The
+      # `environment:` block below is kept as a hint for any code
+      # path that still consults process.env at runtime, but the
+      # browser-shipped JS comes from this build arg.
+      args:
+        NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
     image: synapse-dashboard:${SYNAPSE_VERSION:-dev}
     container_name: synapse-dashboard
     restart: unless-stopped
     depends_on:
       - synapse
     environment:
-      # The browser talks to Synapse via the host port mapping. If you put
-      # a reverse proxy in front, override this to the public URL.
+      # Same value as the build arg above; redundant for the
+      # browser bundle but useful if any server-side render path
+      # reads it at runtime.
       NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
     ports:
       - "${DASHBOARD_PORT:-6790}:3000"
