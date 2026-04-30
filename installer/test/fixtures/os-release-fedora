@@ -1,0 +1,11 @@
+NAME="Fedora Linux"
+VERSION="40 (Workstation Edition)"
+ID=fedora
+VERSION_ID=40
+VERSION_CODENAME=""
+PRETTY_NAME="Fedora Linux 40 (Workstation Edition)"
+ANSI_COLOR="0;38;2;60;110;180"
+LOGO=fedora-logo-icon
+CPE_NAME="cpe:/o:fedoraproject:fedora:40"
+DEFAULT_HOSTNAME="fedora"
+HOME_URL="https://fedoraproject.org/"

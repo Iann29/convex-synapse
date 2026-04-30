@@ -1,0 +1,329 @@
+#!/usr/bin/env bats
+#
+# Unit tests for installer/lib/detect.sh.
+#
+# These run inside the bats/bats:latest image (Alpine + bats-core
+# 1.13 + bats-assert/support/file). Pure-function tests — no Docker
+# socket, no network. The PATH-shadow mock in helpers/load.bash lets us
+# fake `uname`, `df`, package managers, etc., without container
+# fixtures. Distro-specific behaviour is exercised via the os-release
+# fixtures under installer/test/fixtures/.
+
+load '../helpers/load'
+
+setup() {
+    synapse_mock_setup
+    # shellcheck source=../../lib/detect.sh
+    source "$INSTALLER_LIB/detect.sh"
+}
+
+# ---- os_id ----------------------------------------------------------
+
+@test "os_id: debian fixture -> debian" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-debian" run detect::os_id
+    assert_success
+    assert_output "debian"
+}
+
+@test "os_id: ubuntu fixture -> ubuntu" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-ubuntu" run detect::os_id
+    assert_success
+    assert_output "ubuntu"
+}
+
+@test "os_id: fedora fixture -> fedora" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-fedora" run detect::os_id
+    assert_success
+    assert_output "fedora"
+}
+
+@test "os_id: pop fixture -> pop (preserves derivative ID)" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-pop" run detect::os_id
+    assert_success
+    assert_output "pop"
+}
+
+@test "os_id: missing file -> unknown" {
+    DETECT_OS_RELEASE="/nonexistent/file" run detect::os_id
+    assert_success
+    assert_output "unknown"
+}
+
+# ---- os_family ------------------------------------------------------
+
+@test "os_family: debian -> debian" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-debian" run detect::os_family
+    assert_success
+    assert_output "debian"
+}
+
+@test "os_family: ubuntu -> debian" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-ubuntu" run detect::os_family
+    assert_success
+    assert_output "debian"
+}
+
+@test "os_family: pop -> debian (via ID_LIKE)" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-pop" run detect::os_family
+    assert_success
+    assert_output "debian"
+}
+
+@test "os_family: fedora -> redhat" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-fedora" run detect::os_family
+    assert_success
+    assert_output "redhat"
+}
+
+@test "os_family: rocky -> redhat (via ID, not ID_LIKE)" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-rocky" run detect::os_family
+    assert_success
+    assert_output "redhat"
+}
+
+@test "os_family: arch -> arch" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-arch" run detect::os_family
+    assert_success
+    assert_output "arch"
+}
+
+@test "os_family: alpine -> alpine" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-alpine" run detect::os_family
+    assert_success
+    assert_output "alpine"
+}
+
+@test "os_family: missing file -> unknown" {
+    DETECT_OS_RELEASE="/nonexistent" run detect::os_family
+    assert_success
+    assert_output "unknown"
+}
+
+# ---- os_version / codename ------------------------------------------
+
+@test "os_version: debian fixture -> 12" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-debian" run detect::os_version
+    assert_success
+    assert_output "12"
+}
+
+@test "os_version: ubuntu fixture -> 24.04" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-ubuntu" run detect::os_version
+    assert_success
+    assert_output "24.04"
+}
+
+@test "os_codename: debian -> bookworm" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-debian" run detect::os_codename
+    assert_success
+    assert_output "bookworm"
+}
+
+@test "os_codename: pop -> jammy" {
+    # Pop sets both VERSION_CODENAME=jammy and UBUNTU_CODENAME=jammy.
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-pop" run detect::os_codename
+    assert_success
+    assert_output "jammy"
+}
+
+@test "os_codename: arch (no codename) -> empty" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-arch" run detect::os_codename
+    assert_success
+    assert_output ""
+}
+
+# ---- arch -----------------------------------------------------------
+
+@test "arch: x86_64 -> amd64" {
+    mock_cmd uname 0 "x86_64"
+    run detect::arch
+    assert_success
+    assert_output "amd64"
+}
+
+@test "arch: aarch64 -> arm64" {
+    mock_cmd uname 0 "aarch64"
+    run detect::arch
+    assert_success
+    assert_output "arm64"
+}
+
+@test "arch: armv7l -> armv7" {
+    mock_cmd uname 0 "armv7l"
+    run detect::arch
+    assert_success
+    assert_output "armv7"
+}
+
+@test "arch: i686 -> i386" {
+    mock_cmd uname 0 "i686"
+    run detect::arch
+    assert_success
+    assert_output "i386"
+}
+
+@test "arch: unknown machine echoes raw" {
+    mock_cmd uname 0 "riscv64"
+    run detect::arch
+    assert_success
+    assert_output "riscv64"
+}
+
+# ---- pkg_manager ----------------------------------------------------
+
+@test "pkg_manager: apt wins when apt-get is on PATH" {
+    mock_cmd apt-get 0
+    mock_cmd dnf 0
+    run detect::pkg_manager
+    assert_success
+    assert_output "apt"
+}
+
+@test "pkg_manager: dnf when only dnf" {
+    mock_cmd dnf 0
+    run detect::pkg_manager
+    assert_success
+    assert_output "dnf"
+}
+
+@test "pkg_manager: pacman when only pacman" {
+    mock_cmd pacman 0
+    run detect::pkg_manager
+    assert_success
+    assert_output "pacman"
+}
+
+# NOTE: zypper isn't tested in isolation because the bats/bats:latest
+# image is Alpine, which has `apk` natively — the dispatch table
+# always lands on apk before reaching zypper. Faking "all package
+# managers absent" requires shadowing `command` itself, which is
+# fragile across bash versions. The four tests above cover the branch
+# logic adequately.
+
+# ---- is_root / sudo_cmd ---------------------------------------------
+#
+# We use DETECT_UID rather than EUID because bash treats EUID as a
+# readonly variable; trying to reassign it from a test fails with
+# `EUID: readonly variable`. detect::is_root reads DETECT_UID first so
+# tests can simulate any UID without spawning a child shell.
+
+@test "is_root: DETECT_UID=0 -> success" {
+    DETECT_UID=0 run detect::is_root
+    assert_success
+}
+
+@test "is_root: DETECT_UID=1000 -> failure" {
+    DETECT_UID=1000 run detect::is_root
+    assert_failure
+}
+
+@test "sudo_cmd: root -> empty stdout, success" {
+    DETECT_UID=0 run detect::sudo_cmd
+    assert_success
+    assert_output ""
+}
+
+@test "sudo_cmd: non-root + sudo present -> 'sudo'" {
+    mock_cmd sudo 0
+    DETECT_UID=1000 run detect::sudo_cmd
+    assert_success
+    assert_output "sudo"
+}
+
+@test "sudo_cmd: non-root + only doas -> 'doas'" {
+    mock_cmd doas 0
+    DETECT_UID=1000 run detect::sudo_cmd
+    assert_success
+    assert_output "doas"
+}
+
+# ---- has_X ----------------------------------------------------------
+
+@test "has_cmd: existing cmd -> success" {
+    mock_cmd foobar 0
+    run detect::has_cmd foobar
+    assert_success
+}
+
+@test "has_cmd: missing cmd -> failure" {
+    run detect::has_cmd this-cmd-does-not-exist-9876
+    assert_failure
+}
+
+@test "has_docker: mocked -> success" {
+    mock_cmd docker 0
+    run detect::has_docker
+    assert_success
+}
+
+@test "has_caddy: mocked -> success" {
+    mock_cmd caddy 0
+    run detect::has_caddy
+    assert_success
+}
+
+@test "has_nginx: mocked -> success" {
+    mock_cmd nginx 0
+    run detect::has_nginx
+    assert_success
+}
+
+@test "has_ufw: mocked -> success" {
+    mock_cmd ufw 0
+    run detect::has_ufw
+    assert_success
+}
+
+# has_systemd uses the canonical /run/systemd/system check. Inside
+# bats/bats:latest (Alpine, no systemd), this should return false.
+@test "has_systemd: alpine container -> failure" {
+    run detect::has_systemd
+    assert_failure
+}
+
+# ---- disk_free_gb ---------------------------------------------------
+
+@test "disk_free_gb: parses POSIX df output (50 GB free)" {
+    # 52428800 KB / 1024 / 1024 = 50 GB
+    mock_cmd df 0 "Filesystem 1K-blocks Used Available Use% Mounted on
+/dev/foo   100000000 0    52428800  0%   /"
+    run detect::disk_free_gb /
+    assert_success
+    assert_output "50"
+}
+
+@test "disk_free_gb: tiny disk rounds down" {
+    # 524288 KB = 512 MB; integer division by 1024² -> 0.
+    mock_cmd df 0 "Filesystem 1K-blocks Used Available Use% Mounted on
+/dev/tiny  1000000  0    524288    50%  /"
+    run detect::disk_free_gb /
+    assert_success
+    assert_output "0"
+}
+
+@test "disk_free_gb: df returns empty -> 0 + failure" {
+    mock_cmd df 1 ""
+    run detect::disk_free_gb /
+    assert_failure
+    assert_output "0"
+}
+
+# ---- ram_total_gb ---------------------------------------------------
+
+@test "ram_total_gb: 2 GB fixture -> 2" {
+    DETECT_MEMINFO="$INSTALLER_FIXTURES/meminfo-2gb" run detect::ram_total_gb
+    assert_success
+    assert_output "2"
+}
+
+@test "ram_total_gb: 512 MB fixture -> 0 (rounds down)" {
+    DETECT_MEMINFO="$INSTALLER_FIXTURES/meminfo-512mb" run detect::ram_total_gb
+    assert_success
+    assert_output "0"
+}
+
+@test "ram_total_gb: missing file -> 0 + failure" {
+    DETECT_MEMINFO="/nonexistent/meminfo" run detect::ram_total_gb
+    assert_failure
+    assert_output "0"
+}
