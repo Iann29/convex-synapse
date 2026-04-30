@@ -87,8 +87,62 @@ services:
     networks:
       - synapse-network
 
+  # ----------------------------------------------------------------
+  # HA test profile (v0.5+). Started with `docker compose --profile ha
+  # up -d`; idle when the profile isn't selected. These services back
+  # the SYNAPSE_HA_E2E real-backend test (see docs/HA_TESTING.md);
+  # they are NOT what Synapse-managed deployments use as their backing
+  # store in production — the operator points Synapse at managed
+  # Postgres + S3 there.
+  # ----------------------------------------------------------------
+
+  backend-postgres:
+    image: postgres:16-alpine
+    container_name: synapse-backend-pg
+    profiles: ["ha"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${HA_PG_USER:-convex}
+      POSTGRES_PASSWORD: ${HA_PG_PASSWORD:-convex}
+      POSTGRES_DB: postgres
+    volumes:
+      - synapse-backend-pgdata:/var/lib/postgresql/data
+    ports:
+      - "${HA_PG_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HA_PG_USER:-convex} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: synapse-minio
+    profiles: ["ha"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${HA_S3_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${HA_S3_SECRET:-minioadmin}
+    volumes:
+      - synapse-minio-data:/data
+    ports:
+      - "${HA_S3_PORT:-9000}:9000"
+      - "${HA_S3_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-network
+
 volumes:
   synapse-pgdata:
+  synapse-backend-pgdata:
+  synapse-minio-data:
 
 networks:
   synapse-network:
