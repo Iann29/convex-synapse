@@ -59,6 +59,19 @@ services:
       # Mount /d/{name}/* on the API listener. Required for the proxy.spec.ts
       # e2e test; safe to leave on in dev — when off, /d/* simply 404s.
       SYNAPSE_PROXY_ENABLED: ${SYNAPSE_PROXY_ENABLED:-true}
+      # SYNAPSE_PUBLIC_URL controls how /auth, /cli_credentials, and the
+      # GET /v1/deployments/* handlers rewrite the deployment URL the
+      # provisioner stored ("http://127.0.0.1:<port>") into something a
+      # remote browser/CLI can reach. Without this passthrough the
+      # backend has no way to know what hostname operators front it
+      # with, and the dashboard/CLI render loopback URLs. Empty in
+      # local dev (no rewrite); setup.sh sets it to "https://<domain>"
+      # or "http://<public-ip>:<port>" depending on --no-tls.
+      SYNAPSE_PUBLIC_URL: ${SYNAPSE_PUBLIC_URL:-}
+      # CORS — locked to the dashboard origin in production. Defaults
+      # to "*" for local dev so a browser opened against an arbitrary
+      # IP/port can still call the API.
+      SYNAPSE_ALLOWED_ORIGINS: ${SYNAPSE_ALLOWED_ORIGINS:-*}
       SYNAPSE_LOG_LEVEL: ${SYNAPSE_LOG_LEVEL:-info}
     volumes:
       # Synapse provisions sibling containers via the host docker daemon.
