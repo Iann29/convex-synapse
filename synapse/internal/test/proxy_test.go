@@ -124,9 +124,15 @@ func TestProxy_ResolverCaches(t *testing.T) {
 		t.Errorf("got %q; want 127.0.0.1:4242", got1)
 	}
 
-	// Mutate the row directly. With cache active, Resolve should still return the OLD address.
+	// Mutate the replica's port directly. With cache active, Resolve should
+	// still return the OLD address. (Post-v0.5 the proxy reads from
+	// deployment_replicas, not deployments.host_port — see chunk 5.)
 	if _, err := h.DB.Exec(context.Background(),
-		`UPDATE deployments SET host_port = 5252 WHERE name = 'cached-owl-1234'`); err != nil {
+		`UPDATE deployment_replicas
+		    SET host_port = 5252
+		   FROM deployments
+		  WHERE deployment_replicas.deployment_id = deployments.id
+		    AND deployments.name = 'cached-owl-1234'`); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	got2, _ := resolver.Resolve(context.Background(), "cached-owl-1234")

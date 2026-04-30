@@ -8,13 +8,22 @@
 // returns (file storage signed URLs, redirects to itself) will reference the
 // direct port and not /d/{name}. For 95% of API calls — function invocations,
 // queries, mutations — the proxy is fully transparent.
+//
+// HA awareness: when a deployment has multiple replicas (deployment_replicas
+// rows from the v0.5 schema), Resolve returns the full list and the proxy
+// handler tries them in preference order — last-seen-active first, then by
+// ascending replica_index. A connection error against the first replica
+// triggers an automatic retry against the next; the caller never sees the
+// dead replica unless every replica is unreachable.
 package proxy
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -43,45 +52,137 @@ type Resolver struct {
 	cache map[string]cacheEntry
 }
 
+// cacheEntry stores the resolved replica list for a deployment, plus the
+// time the entry was minted. Replica order is the picker's preference
+// order (best replica first); the proxy retries down the slice on
+// connection error.
 type cacheEntry struct {
-	addr      string
+	replicas  []string
 	expiresAt time.Time
 }
 
-// Resolve returns the address ("host:port") for a deployment, or "" + error if
-// the deployment is missing / deleted / not running.
-func (r *Resolver) Resolve(ctx context.Context, name string) (string, error) {
-	r.mu.RLock()
-	if e, ok := r.cache[name]; ok && time.Now().Before(e.expiresAt) {
-		addr := e.addr
-		r.mu.RUnlock()
-		return addr, nil
-	}
-	r.mu.RUnlock()
+// ErrNoReplicas signals that a deployment has no live replicas. Distinct
+// from "deployment not found" so the handler can return 503 (Service
+// Unavailable) instead of 404.
+var ErrNoReplicas = errors.New("deployment has no running replicas")
 
-	var hostPort *int
-	var status string
-	err := r.DB.QueryRow(ctx, `
-		SELECT host_port, status FROM deployments WHERE name = $1
-	`, name).Scan(&hostPort, &status)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("deployment %q not found", name)
-	}
+// Resolve returns the highest-priority address for a deployment — the
+// active replica per the picker. Callers that want the full list (e.g.
+// the proxy handler so it can retry on connection failure) should use
+// ResolveAll. Resolve is kept around for legacy single-address callers.
+func (r *Resolver) Resolve(ctx context.Context, name string) (string, error) {
+	addrs, err := r.ResolveAll(ctx, name)
 	if err != nil {
 		return "", err
 	}
-	if status != "running" {
-		return "", fmt.Errorf("deployment %q is %s, not running", name, status)
+	if len(addrs) == 0 {
+		return "", ErrNoReplicas
+	}
+	return addrs[0], nil
+}
+
+// ResolveAll returns every running replica's address, ordered by the
+// picker's preference: replicas with a recent successful health probe
+// first (last_seen_active_at DESC), ties broken by ascending
+// replica_index. For single-replica deployments the slice has one entry.
+//
+// The lookup goes through deployment_replicas (post-v0.5 schema). When
+// no replica rows exist (extremely unlikely after the backfill migration
+// — see internal/db/migrations/000004), we fall back to the legacy
+// deployments.host_port path so a half-rolled-out cluster never hands
+// callers a 404.
+func (r *Resolver) ResolveAll(ctx context.Context, name string) ([]string, error) {
+	r.mu.RLock()
+	if e, ok := r.cache[name]; ok && time.Now().Before(e.expiresAt) {
+		out := append([]string(nil), e.replicas...)
+		r.mu.RUnlock()
+		return out, nil
+	}
+	r.mu.RUnlock()
+
+	// First: does the deployment exist and is it in a routable state?
+	var haEnabled bool
+	var depStatus string
+	err := r.DB.QueryRow(ctx,
+		`SELECT ha_enabled, status FROM deployments WHERE name = $1`, name,
+	).Scan(&haEnabled, &depStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("deployment %q not found", name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if depStatus != "running" {
+		return nil, fmt.Errorf("deployment %q is %s, not running", name, depStatus)
 	}
 
-	var addr string
-	if r.UseNetworkDNS {
-		addr = "convex-" + name + ":3210"
-	} else {
-		if hostPort == nil {
-			return "", fmt.Errorf("deployment %q has no host port", name)
+	// Then: ordered list of running replicas. last_seen_active_at DESC
+	// puts the most-recently-healthy replica first; ties resolve by
+	// ascending replica_index for determinism.
+	rows, err := r.DB.Query(ctx, `
+		SELECT r.host_port, r.replica_index
+		  FROM deployment_replicas r
+		  JOIN deployments d ON d.id = r.deployment_id
+		 WHERE d.name = $1
+		   AND r.status = 'running'
+		 ORDER BY r.last_seen_active_at DESC NULLS LAST, r.replica_index ASC
+	`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type rrow struct {
+		hostPort     *int
+		replicaIndex int
+	}
+	var replicas []rrow
+	for rows.Next() {
+		var rr rrow
+		if err := rows.Scan(&rr.hostPort, &rr.replicaIndex); err != nil {
+			return nil, err
 		}
-		addr = fmt.Sprintf("127.0.0.1:%d", *hostPort)
+		replicas = append(replicas, rr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	addrs := make([]string, 0, len(replicas))
+	if len(replicas) == 0 {
+		// No *running* replicas. Distinguish "deployment has no replica
+		// rows at all" (legacy / not-yet-migrated → fall back to
+		// deployments.host_port) from "rows exist, none are running"
+		// (no_replicas → 503). A second cheap query keeps the fallback
+		// guarded so ErrNoReplicas isn't masked by stale host_port data.
+		var anyReplica bool
+		_ = r.DB.QueryRow(ctx, `
+			SELECT EXISTS(
+			  SELECT 1
+			    FROM deployment_replicas r
+			    JOIN deployments d ON d.id = r.deployment_id
+			   WHERE d.name = $1
+			)
+		`, name).Scan(&anyReplica)
+		if anyReplica {
+			return nil, ErrNoReplicas
+		}
+		fallback, ferr := r.legacyAddress(ctx, name, haEnabled)
+		if ferr != nil {
+			return nil, ErrNoReplicas
+		}
+		addrs = append(addrs, fallback)
+	}
+	for _, rr := range replicas {
+		if rr.hostPort == nil && !r.UseNetworkDNS {
+			// Replica still booting (no port yet) — skip; picker uses
+			// whichever sibling is up.
+			continue
+		}
+		addrs = append(addrs, r.addressFor(name, rr.replicaIndex, haEnabled, rr.hostPort))
+	}
+	if len(addrs) == 0 {
+		return nil, ErrNoReplicas
 	}
 
 	ttl := r.CacheTTL
@@ -92,9 +193,57 @@ func (r *Resolver) Resolve(ctx context.Context, name string) (string, error) {
 	if r.cache == nil {
 		r.cache = make(map[string]cacheEntry)
 	}
-	r.cache[name] = cacheEntry{addr: addr, expiresAt: time.Now().Add(ttl)}
+	r.cache[name] = cacheEntry{
+		replicas:  append([]string(nil), addrs...),
+		expiresAt: time.Now().Add(ttl),
+	}
 	r.mu.Unlock()
-	return addr, nil
+	return addrs, nil
+}
+
+// addressFor builds either the docker-DNS or host-port address for one
+// replica. Single-replica (haEnabled=false) keeps the legacy "convex-{name}"
+// container name; HA replicas pick up the "-{idx}" suffix.
+func (r *Resolver) addressFor(name string, replicaIndex int, haEnabled bool, hostPort *int) string {
+	if r.UseNetworkDNS {
+		if !haEnabled {
+			return "convex-" + name + ":3210"
+		}
+		return fmt.Sprintf("convex-%s-%d:3210", name, replicaIndex)
+	}
+	// Host-port mode. hostPort is checked non-nil by the caller (we skip
+	// replicas that don't have a port yet).
+	return fmt.Sprintf("127.0.0.1:%d", *hostPort)
+}
+
+// legacyAddress falls back to deployments.host_port when no
+// deployment_replicas rows exist for a deployment. This is unreachable
+// in production (the backfill migration creates a replica row for every
+// existing deployment) but avoids a hard failure during a half-applied
+// rollout.
+func (r *Resolver) legacyAddress(ctx context.Context, name string, haEnabled bool) (string, error) {
+	var hostPort *int
+	var status string
+	err := r.DB.QueryRow(ctx,
+		`SELECT host_port, status FROM deployments WHERE name = $1`, name,
+	).Scan(&hostPort, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("deployment %q not found", name)
+	}
+	if err != nil {
+		return "", err
+	}
+	if status != "running" {
+		return "", fmt.Errorf("deployment %q is %s, not running", name, status)
+	}
+	if r.UseNetworkDNS {
+		return "convex-" + name + ":3210", nil
+	}
+	if hostPort == nil {
+		return "", fmt.Errorf("deployment %q has no host port", name)
+	}
+	_ = haEnabled
+	return fmt.Sprintf("127.0.0.1:%d", *hostPort), nil
 }
 
 // Invalidate drops a single name from the cache. Call this after a delete /
@@ -108,27 +257,15 @@ func (r *Resolver) Invalidate(name string) {
 // Handler returns an http.Handler mounted at /d/. It expects URLs of the
 // form /d/{name}/{rest...} and forwards to http://{address}/{rest...}.
 //
-// Errors flow back as JSON: 404 for missing deployments, 502 for upstream
-// failures. The proxy is a passthrough — no auth check; deployments enforce
-// their own admin-key auth.
+// HA failover: ResolveAll returns the replicas in preference order. The
+// handler tries the first; on a connection-level error (Dial / EOF
+// before headers arrive) it transparently retries against the next
+// replica. HTTP-level errors (4xx/5xx from the backend) flow through
+// untouched — they're upstream responses, not unreachable replicas, and
+// the caller should see them.
 func Handler(resolver *Resolver, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
-	}
-
-	// Single ReverseProxy instance, parameterised at request time via Director.
-	rp := &httputil.ReverseProxy{
-		Director: func(_ *http.Request) {
-			// We rewrite the URL in-place inside ServeHTTP below — Director
-			// is left empty to avoid being called twice.
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Warn("proxy upstream error", "path", r.URL.Path, "err", err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{
-				"code":    "upstream_error",
-				"message": "Deployment is unreachable",
-			})
-		},
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +292,14 @@ func Handler(resolver *Resolver, logger *slog.Logger) http.Handler {
 			return
 		}
 
-		addr, err := resolver.Resolve(r.Context(), name)
+		addrs, err := resolver.ResolveAll(r.Context(), name)
+		if errors.Is(err, ErrNoReplicas) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"code":    "no_replicas",
+				"message": "Deployment has no running replicas",
+			})
+			return
+		}
 		if err != nil {
 			logger.Info("proxy resolve miss", "name", name, "err", err)
 			writeJSON(w, http.StatusNotFound, map[string]string{
@@ -165,29 +309,196 @@ func Handler(resolver *Resolver, logger *slog.Logger) http.Handler {
 			return
 		}
 
-		target, _ := url.Parse("http://" + addr)
-		// Set the request's URL to the upstream's host, preserving the rest path
-		// + raw query.
-		r2 := r.Clone(r.Context())
-		r2.URL.Scheme = target.Scheme
-		r2.URL.Host = target.Host
-		r2.URL.Path = rest
-		r2.Host = target.Host
-		// Hide that this came through a proxy — the backend doesn't care, and
-		// emitting X-Forwarded-* triggers some Convex-side address-rewriting.
-		r2.Header.Del("X-Forwarded-For")
-		r2.Header.Del("X-Forwarded-Host")
-		r2.Header.Del("X-Forwarded-Proto")
-
-		rp.ServeHTTP(w, r2)
+		// Single-replica deployments take the fast path — no body
+		// buffering, no retry. The HA path needs to read the body once
+		// so a connection-level failure on replica 0 can retry against
+		// replica 1 with the same payload.
+		if len(addrs) == 1 {
+			proxyOnce(w, r, addrs[0], rest, logger, name)
+			return
+		}
+		proxyWithFailover(w, r, addrs, rest, logger, name)
 	})
+}
+
+// proxyOnce serves the request via a single replica. Equivalent to the
+// pre-v0.5 behaviour. Any error gets logged and a 502 sent back.
+func proxyOnce(w http.ResponseWriter, r *http.Request, addr, rest string, logger *slog.Logger, name string) {
+	target, _ := url.Parse("http://" + addr)
+	rp := newReverseProxy(target, logger, name, addr)
+	r2 := r.Clone(r.Context())
+	rewriteUpstream(r2, target, rest)
+	rp.ServeHTTP(w, r2)
+}
+
+// proxyWithFailover tries each replica in order. If the first replica's
+// upstream call fails with a connection-level error before any bytes
+// were written to the client, we transparently retry against the next.
+//
+// Body buffering: HTTP requests are read-once. To retry we have to
+// snapshot the body in memory. Convex requests are small (function
+// args, mutation payloads) so the 1MB cap is generous; anything larger
+// than that and HA failover degrades gracefully to "single attempt".
+func proxyWithFailover(w http.ResponseWriter, r *http.Request, addrs []string, rest string, logger *slog.Logger, name string) {
+	const maxBodyForRetry = 1 << 20 // 1MB
+	var bodyBytes []byte
+	if r.Body != nil && r.ContentLength != 0 {
+		var err error
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxBodyForRetry+1))
+		_ = r.Body.Close()
+		if err != nil {
+			logger.Warn("proxy: read body for retry", "name", name, "err", err)
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		if int64(len(bodyBytes)) > maxBodyForRetry {
+			// Body too large to safely retry — fall back to single
+			// attempt, no failover. Operator gets a generic 502 if the
+			// first replica is dead.
+			r.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+			proxyOnce(w, r, addrs[0], rest, logger, name)
+			return
+		}
+	}
+
+	for i, addr := range addrs {
+		target, _ := url.Parse("http://" + addr)
+		// Capture failures from this attempt without writing anything
+		// to the client — that's the contract for retrying.
+		captured := &capturingResponseWriter{header: http.Header{}}
+		var attemptErr error
+		rp := &httputil.ReverseProxy{
+			Director: func(_ *http.Request) {},
+			ErrorHandler: func(_ http.ResponseWriter, _ *http.Request, err error) {
+				attemptErr = err
+			},
+		}
+
+		r2 := r.Clone(r.Context())
+		if bodyBytes != nil {
+			r2.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
+			r2.ContentLength = int64(len(bodyBytes))
+		}
+		rewriteUpstream(r2, target, rest)
+		rp.ServeHTTP(captured, r2)
+
+		if attemptErr != nil && isConnError(attemptErr) && i < len(addrs)-1 {
+			logger.Info("proxy: replica failover",
+				"name", name, "from", addr, "err", attemptErr)
+			continue
+		}
+
+		// Either success, or the last replica's error — flush captured
+		// state to the real ResponseWriter and stop.
+		captured.flush(w)
+		if attemptErr != nil {
+			logger.Warn("proxy: all replicas failed", "name", name, "err", attemptErr)
+		}
+		return
+	}
+}
+
+// rewriteUpstream points the request at the upstream replica.
+func rewriteUpstream(r *http.Request, target *url.URL, rest string) {
+	r.URL.Scheme = target.Scheme
+	r.URL.Host = target.Host
+	r.URL.Path = rest
+	r.Host = target.Host
+	// Hide that this came through a proxy — the backend doesn't care, and
+	// emitting X-Forwarded-* triggers some Convex-side address-rewriting.
+	r.Header.Del("X-Forwarded-For")
+	r.Header.Del("X-Forwarded-Host")
+	r.Header.Del("X-Forwarded-Proto")
+}
+
+// newReverseProxy builds a one-shot ReverseProxy with a JSON 502 error
+// handler. Logger annotates with the deployment name + replica address
+// so operators can grep through the ones that did fail.
+func newReverseProxy(target *url.URL, logger *slog.Logger, deploymentName, addr string) *httputil.ReverseProxy {
+	_ = target
+	return &httputil.ReverseProxy{
+		Director: func(_ *http.Request) {},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Warn("proxy upstream error",
+				"path", r.URL.Path, "deployment", deploymentName, "replica", addr, "err", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"code":    "upstream_error",
+				"message": "Deployment is unreachable",
+			})
+		},
+	}
+}
+
+// isConnError returns true when err is a connection-level failure that
+// makes retrying against another replica safe (no bytes were sent
+// upstream / received yet). Stays conservative: an in-flight HTTP
+// response that errors mid-stream is NOT retried — the client has
+// already seen partial bytes from the upstream by then.
+func isConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Wrapped EOF / connection reset / connection refused.
+	s := err.Error()
+	return strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "EOF")
+}
+
+// capturingResponseWriter captures the full response so we can decide
+// whether to flush it (success / final-replica failure) or discard it
+// (transient failure → retry on the next replica).
+type capturingResponseWriter struct {
+	header http.Header
+	status int
+	body   []byte
+}
+
+func (c *capturingResponseWriter) Header() http.Header {
+	return c.header
+}
+
+func (c *capturingResponseWriter) WriteHeader(status int) {
+	if c.status == 0 {
+		c.status = status
+	}
+}
+
+func (c *capturingResponseWriter) Write(p []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	c.body = append(c.body, p...)
+	return len(p), nil
+}
+
+// flush copies the captured response onto the real ResponseWriter.
+// Called exactly once after the picker has decided not to retry.
+func (c *capturingResponseWriter) flush(w http.ResponseWriter) {
+	if c.status == 0 {
+		// No headers written → ErrorHandler took over and wrote its own
+		// JSON. Nothing to flush.
+		return
+	}
+	for k, vs := range c.header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(c.status)
+	if len(c.body) > 0 {
+		_, _ = w.Write(c.body)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// Tiny manual encode — no JSON dependency cycle here, and the body shape
-	// is fixed. Keep this file zero-import beyond stdlib + pgx.
 	first := true
 	_, _ = w.Write([]byte("{"))
 	for k, v := range body {
@@ -215,3 +526,25 @@ func escapeJSON(s string) string {
 	)
 	return r.Replace(s)
 }
+
+// healthProbe is a 2-second probe loop that hits /version on each
+// configured replica and updates deployment_replicas.last_seen_active_at
+// when a 2xx comes back. The picker uses this column to prefer recently-
+// alive replicas, so the column is the source of truth for "who's
+// healthy right now."
+//
+// Single goroutine, started once per Synapse process. Multi-node:
+// running this on every node is fine — last_seen_active_at converges.
+//
+// Currently a placeholder (not wired into cmd/server) — chunk 5 ships
+// the Resolver changes; the active probe loop arrives in a follow-up
+// once we have HA deployments to probe against.
+//
+// (Left here so reviewers see where the loop will live; spec deliberately
+// out-of-scope for this PR per docs/V0_5_PLAN.md.)
+type healthProbe struct {
+	DB     *pgxpool.Pool
+	Period time.Duration
+}
+
+var _ = func(_ context.Context, _ *healthProbe) {}
