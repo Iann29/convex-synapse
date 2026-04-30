@@ -28,6 +28,17 @@ type RouterDeps struct {
 	AllowedOrigins        string
 	Version               string
 
+	// PublicURL is the externally-reachable origin of the Synapse instance
+	// (e.g. "https://synapse.example.com"). When set, /auth and
+	// /cli_credentials return URLs the caller's machine can reach instead
+	// of the container-internal "http://127.0.0.1:<port>". See
+	// config.PublicURL for the full rules.
+	PublicURL string
+	// ProxyEnabled mirrors config.ProxyEnabled. With PublicURL set, the
+	// rewrite becomes "<PublicURL>/d/<name>"; without proxy mode it's
+	// "<PublicURL>:<port>" (operator still has to expose the port).
+	ProxyEnabled bool
+
 	// HA configuration (v0.5+). Zero value = HA disabled, behaves
 	// exactly like pre-v0.5. When HA.Enabled is true, create_deployment
 	// honours the `ha:true` flag in the request body and provisions
@@ -85,6 +96,8 @@ func NewRouter(d RouterDeps) http.Handler {
 		PortRangeMin:          d.PortRangeMin,
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
+		PublicURL:             d.PublicURL,
+		ProxyEnabled:          d.ProxyEnabled,
 		HA:                    d.HA,
 		Crypto:                d.Crypto,
 	}

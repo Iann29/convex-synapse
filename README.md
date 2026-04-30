@@ -174,8 +174,9 @@ Open `http://localhost:6790`, register, create a team → project → deployment
 Synapse provisions a fresh Convex backend container in about a second.
 
 For details (manual dev path, `curl` examples, `npx convex` integration), see
-[docs/QUICKSTART.md](docs/QUICKSTART.md). For HA mode, see
-[docs/HA_TESTING.md](docs/HA_TESTING.md).
+[docs/QUICKSTART.md](docs/QUICKSTART.md). For deploying to a real VPS with
+TLS + a public domain, see [docs/PRODUCTION.md](docs/PRODUCTION.md). For
+HA mode, see [docs/HA_TESTING.md](docs/HA_TESTING.md).
 
 ## Tests
 
