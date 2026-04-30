@@ -72,65 +72,70 @@ PR #1 on 2026-04-29.
 
 ## v0.5 — "HA-per-deployment" ✅ DONE
 
-The control plane is multi-node-safe (v0.3); the Convex backend itself is
-single-writer per deployment by design (lease in `crates/postgres/src/lib.rs`
-of `get-convex/convex-backend`). Active-passive failover is achievable on
-top of upstream as-is — see [docs/V0_5_PLAN.md](V0_5_PLAN.md) for the
-detailed scoping. This is the right bet for moving the user-perceived
-reliability needle.
+10/10 chunks merged. `ha:true` on `create_deployment` now provisions 2
+replicas backed by Postgres + S3 (AES-GCM-encrypted creds at rest);
+proxy fails over between replicas on connection error; health worker
+rolls up replica statuses into the deployment-level status; dashboard
+exposes a toggle + `HA ×N` badge. Single-replica deployments unchanged.
 
-Chunks landed:
-- [x] **Chunk 1** — Schema + models + AES-GCM secrets helper. Migration
-  000004 adds `deployment_storage` + `deployment_replicas` tables and
-  `deployments.ha_enabled` / `replica_count` columns; backfills one
-  replica row per existing deployment. `internal/crypto/secrets.go`
-  envelopes connection material with `SYNAPSE_STORAGE_KEY`. (commit
-  `8fbba60`)
-- [x] **Chunk 2** — Replica-aware Docker provisioner. `DeploymentSpec`
-  grows `ReplicaIndex`, `HAReplica`, `Storage` (Postgres + S3 env vars).
-  `ContainerName` / `VolumeName` keep the legacy single-replica naming
-  unchanged; HA replicas pick up the `-{idx}` suffix. New
-  `DestroyReplica` / `RestartReplica` / `StatusReplica` methods.
-  (commit `421bd4a`)
-- [x] **Chunk 3** — Cluster config + `ha:true` request gate.
-  `SYNAPSE_HA_ENABLED` + `SYNAPSE_BACKEND_*` envs propagate to the
-  handler; `create_deployment` validates and refuses with
-  `ha_disabled` / `ha_misconfigured`. (commit `c9f04cb`)
-- [x] **Chunk 4** — Replica-aware health worker. Iterates
-  `deployment_replicas` rows, rolls up replica statuses into the
-  deployment-level status, calls `Restart` / `RestartReplica` based on
-  HA mode. (commit `47614a3`)
-- [x] **Chunk 5** — Replica-aware proxy resolver + failover. `ResolveAll`
-  returns the ordered replica list (`last_seen_active_at DESC`); proxy
-  retries down the slice on connection-level errors. New
-  `ErrNoReplicas` → 503 distinct from 404. (PR #2, commit on `main`)
-- [x] **Chunks 6+7** — `ha:true` provisions for real. `provisioner.Worker`
-  reads replica jobs, decrypts `deployment_storage`, calls Provision
-  with HA spec; `create_deployment` allocates 2 ports, writes the
-  storage row encrypted, inserts 2 replica rows + 2 jobs in one tx;
-  the replica-aware pre-check stops siblings from skipping each other.
-  (PR #3, commit on `main`)
-- [x] **Chunk 8** — Dashboard HA toggle + badge. "High availability (2
-  replicas + Postgres + S3)" checkbox in the create-deployment dialog;
-  `HA ×N` badge on deployment rows. Backend errors surface inline.
-  (PR #4, merged)
-- [x] **Chunk 9** — Gated real-backend e2e + `ha` compose profile.
-  `docker compose --profile ha up` brings up backend-postgres + minio;
-  `synapse/internal/test/ha_real_e2e_test.go` is gated by
-  `SYNAPSE_HA_E2E=1`. Operator setup walkthrough lives in
-  [docs/HA_TESTING.md](HA_TESTING.md). (PR #6, merged)
-- [x] **Chunk 10** — `POST /v1/deployments/{name}/upgrade_to_ha`
-  endpoint with full validation (`ha_disabled`, `ha_misconfigured`,
-  `already_ha`, `cannot_upgrade_adopted`, `deployment_not_running`)
-  and audit-event recording. Worker mechanics (snapshot_export →
-  re-provision → snapshot_import → swap) deferred to v0.5.1; today
-  the happy path returns `501 ha_upgrade_not_yet_implemented` with a
-  pointer to V0_5_PLAN.md. (PR #7, merged)
+`POST /v1/deployments/{name}/upgrade_to_ha` is reserved with full
+validation (ha_disabled / ha_misconfigured / already_ha /
+cannot_upgrade_adopted / deployment_not_running); the worker mechanics
+(snapshot_export → re-provision → snapshot_import → atomic swap) are
+deferred to v0.5.1.
 
-## v0.5.1 — "HA polish" 📋 NEXT
+Full design + chunk-by-chunk landing log:
+[docs/V0_5_PLAN.md](V0_5_PLAN.md). Operator guide:
+[docs/HA_TESTING.md](HA_TESTING.md).
 
-The mechanical pieces that didn't fit in v0.5's main slice. Both are
-behind already-shipped APIs, so adding them is a runtime-only change.
+## v0.6 — "Auto-installer" 🚀 PRIORITY
+
+> **The installer is now the single most important thing on the
+> roadmap.** Synapse's reason to exist is to make self-hosting Convex
+> painless. The current "clone the repo, edit .env, edit Caddyfile,
+> sudo reload, docker compose up, manually verify" flow is the exact
+> pain we're supposed to be solving. Operators should run **one
+> command** and get a fully-configured production-ready install.
+
+Full design + phased plan: **[docs/V0_6_INSTALLER_PLAN.md](V0_6_INSTALLER_PLAN.md)**.
+
+North star:
+
+```
+$ curl -sf https://get.synapse.dev | sh
+```
+
+Two minutes later, the operator's VPS has Synapse running on
+`https://<their-domain>` with TLS, a registered admin user, and the
+Convex backend image pre-pulled.
+
+Phased delivery (~8 dev-days, 3-4 calendar weeks part-time):
+
+- [ ] **v0.6.0 — Foundation.** `./setup.sh` script + supporting
+  compose changes. 90% of single-VPS installs work end-to-end without
+  manual file edits. Pre-flight checks (Docker, ports, DNS, disk),
+  Caddy auto-detection (use existing OR install fresh OR run in
+  compose), generated secrets, idempotent re-runs, post-install
+  self-test, pretty success screen.
+- [ ] **v0.6.1 — Lifecycle commands.** `synapse status` / `upgrade` /
+  `backup` / `restore` / `uninstall` / `logs` / `doctor`. The same
+  binary the installer drops, exposing maintenance subcommands.
+- [ ] **v0.6.2 — Hosted install script.** `curl -sf https://get.synapse.dev | sh`
+  one-liner pinned to git tags.
+- [ ] **v0.6.3 — Browser-driven first-run wizard.** Dashboard's
+  `/login` redirects to `/setup` when no users exist; walks the
+  operator through admin-create → optional HA → demo deployment +
+  CLI snippet. Operator never sees a config file.
+- [ ] **v0.6.4 — Cloud images (stretch).** Pre-built DigitalOcean /
+  Hetzner / Linode snapshots, Packer-built on each tag, listed in
+  each provider's marketplace. Out of scope for the initial v0.6
+  milestone; bookmarked for v0.7.
+
+## v0.5.1 — "HA polish" 📋 DEFERRED
+
+Bookmarked but lower priority than v0.6. Both pieces are behind
+already-shipped APIs (the wire surface exists — only the runtime
+behind it needs to land), so adding them is a runtime-only change.
 
 - [ ] Worker handler for `upgrade_to_ha` jobs: stream `snapshot_export`
   from the existing replica, provision 2 new HA replicas, run

@@ -50,12 +50,21 @@ proxy fails over between them on connection errors, health worker tracks replica
 state independently, dashboard toggle + `HA ×2` badge. Single-replica behavior
 is unchanged — HA is a per-deployment switch behind `SYNAPSE_HA_ENABLED`.
 
-The mechanical pieces deferred to **v0.5.1**: the real-backend `docker kill`
-failover test (skeleton + compose profile shipped, see
-[docs/HA_TESTING.md](docs/HA_TESTING.md)), and the `upgrade_to_ha` worker
-that migrates an existing single-replica deployment to HA via
-`snapshot_export`/`snapshot_import` (the endpoint is reserved with full
-validation; today returns 501).
+**Next milestone: v0.6 — Auto-installer (top priority).** Today's install
+flow is "clone the repo, edit `.env`, edit Caddyfile, reload, run compose,
+smoke-test from a remote shell" — too many manual steps for a project whose
+whole point is making Convex self-hosting easy. The v0.6 plan replaces all
+of that with one command:
+
+```
+$ curl -sf https://get.synapse.dev | sh
+```
+
+Auto-detects Docker / Caddy / nginx / port conflicts / DNS, generates
+secrets, configures TLS, brings up the stack, runs a self-test, and
+prints the URL + admin credentials. See
+**[docs/V0_6_INSTALLER_PLAN.md](docs/V0_6_INSTALLER_PLAN.md)** for the
+full phased design.
 
 The dashboard matches the Convex Cloud aesthetic (top app bar, team picker,
 redesigned home, team-settings shell), and the control plane is multi-node-safe
