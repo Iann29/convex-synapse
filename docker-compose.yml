@@ -139,10 +139,44 @@ services:
     networks:
       - synapse-network
 
+  # ----------------------------------------------------------------
+  # Caddy reverse-proxy profile (v0.6+). Activated by the auto-
+  # installer when the host has no existing reverse proxy
+  # (`./setup.sh` writes a Caddyfile from installer/templates/
+  # caddy.standalone and brings this service up). Operators with
+  # their own Caddy/nginx don't get a port-80 conflict because the
+  # service is idle when the `caddy` profile isn't selected.
+  # ----------------------------------------------------------------
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: synapse-caddy
+    profiles: ["caddy"]
+    restart: unless-stopped
+    depends_on:
+      - synapse
+      - dashboard
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    volumes:
+      # Operator's rendered Caddyfile (written by
+      # installer/install/caddy.sh::write_standalone). Default path
+      # matches setup.sh's /opt/synapse/Caddyfile convention; the
+      # repo-root fallback keeps `docker compose --profile caddy up`
+      # usable from a fresh clone without invoking setup.sh first.
+      - ${SYNAPSE_CADDYFILE_PATH:-./Caddyfile}:/etc/caddy/Caddyfile:ro
+      - synapse-caddy-data:/data
+      - synapse-caddy-config:/config
+    networks:
+      - synapse-network
+
 volumes:
   synapse-pgdata:
   synapse-backend-pgdata:
   synapse-minio-data:
+  synapse-caddy-data:
+  synapse-caddy-config:
 
 networks:
   synapse-network:
