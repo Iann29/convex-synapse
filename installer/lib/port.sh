@@ -14,14 +14,20 @@
 # `lsof` — fewer paths to test, clearer error if the host is missing
 # the toolchain.
 
-# port::in_use <port> — Exits 0 when something is listening on that TCP
-# port (IPv4 or IPv6), 1 when the port is free, 2 on usage error.
+# port::in_use <port> — Exits 0 when the port is unavailable to bind,
+# 1 when it's free, 2 on usage error. "Unavailable" is broader than
+# "currently listening": we also catch TIME_WAIT and CLOSE_WAIT, since
+# operators commonly run setup.sh right after stopping a previous
+# attempt's containers, and those sockets linger ~60-120s before the
+# kernel releases them. Without the broader filter, find_free returns
+# a port that docker run would then fail to bind with "address in
+# use", and the operator gets a confusing error.
 #
 # Notes on the ss invocation:
-#   -H  no header row, so wc counts only matches
-#   -l  listening sockets only — we don't care about ESTABLISHED
-#   -t  TCP only (Synapse + Convex backends + Postgres are all TCP)
+#   -H  no header row, so the line count reflects matches only
+#   -t  TCP (Synapse + Convex backends + Postgres are all TCP)
 #   -n  numeric, no DNS lookups (faster, deterministic for tests)
+#   state listening|time-wait|close-wait — see above
 #   ( sport = :PORT )  ss filter syntax — exact source-port match
 port::in_use() {
     local port="${1:-}"
@@ -37,8 +43,11 @@ port::in_use() {
         echo "port::in_use: 'ss' not found (install iproute2)" >&2
         return 2
     fi
+    # `grep -c '^'` counts non-empty lines, robust against versions of
+    # `ss` that don't emit a trailing newline (older iproute2).
     local count
-    count="$(ss -ltnH "( sport = :$port )" 2>/dev/null | wc -l)"
+    count="$(ss -tnH state listening state time-wait state close-wait \
+                "( sport = :$port )" 2>/dev/null | grep -c '^')"
     (( count > 0 ))
 }
 

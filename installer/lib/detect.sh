@@ -24,6 +24,11 @@
 # detect::os_id — Echoes the `ID=` value from /etc/os-release ("debian",
 # "ubuntu", "fedora", "pop", …) or "unknown". Always exits 0 — callers
 # branch on the string, not on the exit code.
+#
+# Trailing CR is stripped because some images (Windows-edited configs,
+# certain embedded distros) ship /etc/os-release with CRLF line
+# endings; without the strip, downstream `case "$id" in debian)`
+# matches fail because "debian" != "debian\r".
 detect::os_id() {
     local file="${DETECT_OS_RELEASE:-/etc/os-release}"
     if [[ ! -r "$file" ]]; then
@@ -33,7 +38,8 @@ detect::os_id() {
     (
         # shellcheck source=/dev/null
         . "$file" 2>/dev/null || true
-        echo "${ID:-unknown}"
+        local id="${ID:-unknown}"
+        echo "${id%$'\r'}"
     )
 }
 
@@ -51,6 +57,9 @@ detect::os_family() {
         # shellcheck source=/dev/null
         . "$file" 2>/dev/null || true
         local id="${ID:-}" id_like="${ID_LIKE:-}"
+        # Strip trailing CR (CRLF tolerance — see detect::os_id).
+        id="${id%$'\r'}"
+        id_like="${id_like%$'\r'}"
         case "$id" in
             debian|ubuntu) echo debian; return 0 ;;
             fedora|rhel|centos|rocky|almalinux|amzn) echo redhat; return 0 ;;
@@ -80,13 +89,21 @@ detect::os_version() {
     (
         # shellcheck source=/dev/null
         . "$file" 2>/dev/null || true
-        echo "${VERSION_ID:-unknown}"
+        local v="${VERSION_ID:-unknown}"
+        echo "${v%$'\r'}"
     )
 }
 
-# detect::os_codename — Echoes VERSION_CODENAME (Debian) or
-# UBUNTU_CODENAME (Ubuntu derivatives like Mint that override
-# VERSION_CODENAME). Empty string when neither is set.
+# detect::os_codename — Echoes the codename a Debian/Ubuntu apt repo
+# would expect (e.g. "bookworm", "noble", "jammy"). Empty when nothing
+# is set.
+#
+# Linux Mint and similar Ubuntu-derived distros set VERSION_CODENAME to
+# their *brand* name ("virginia", "victoria") and UBUNTU_CODENAME to
+# the underlying Ubuntu name ("jammy"). The Docker apt repo only
+# publishes Ubuntu codenames, so we prefer UBUNTU_CODENAME whenever
+# ID_LIKE indicates an Ubuntu derivative — otherwise the install fails
+# with "no Release file for victoria".
 detect::os_codename() {
     local file="${DETECT_OS_RELEASE:-/etc/os-release}"
     if [[ ! -r "$file" ]]; then
@@ -96,7 +113,15 @@ detect::os_codename() {
     (
         # shellcheck source=/dev/null
         . "$file" 2>/dev/null || true
-        echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-${DEBIAN_CODENAME:-}}}"
+        local id_like="${ID_LIKE:-}"
+        id_like="${id_like%$'\r'}"
+        if [[ " $id_like " == *" ubuntu "* && -n "${UBUNTU_CODENAME:-}" ]]; then
+            local u="${UBUNTU_CODENAME}"
+            echo "${u%$'\r'}"
+            return 0
+        fi
+        local c="${VERSION_CODENAME:-${UBUNTU_CODENAME:-${DEBIAN_CODENAME:-}}}"
+        echo "${c%$'\r'}"
     )
 }
 
@@ -142,8 +167,16 @@ detect::pkg_manager() {
 # speed but falls back to `id -u` so the helper works in shells where
 # EUID isn't exported. Tests inject DETECT_UID to bypass bash's
 # readonly EUID.
+#
+# The numeric-validation guard matters because bash's `[[ x -eq 0 ]]`
+# treats the LHS as an arithmetic expression; an undefined-name string
+# silently evaluates to 0, so `DETECT_UID=foo` would otherwise pass as
+# root. With the regex check we fail-closed when the override isn't a
+# proper integer.
 detect::is_root() {
-    [[ "${DETECT_UID:-${EUID:-$(id -u)}}" -eq 0 ]]
+    local uid="${DETECT_UID:-${EUID:-$(id -u)}}"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    (( uid == 0 ))
 }
 
 # detect::sudo_cmd — Echoes the prefix the caller should put in front
@@ -191,12 +224,16 @@ detect::has_systemd() {
 # ---- Capacity -------------------------------------------------------
 
 # detect::disk_free_gb [path] — Free GB on the filesystem holding
-# `path` (default /). Uses POSIX `df -k` + awk so we don't depend on
-# GNU --output. Echoes 0 + exit 1 if df fails (e.g. path doesn't exist).
+# `path` (default /). Uses POSIX `df -kP` so we don't depend on GNU
+# --output. The `-P` flag forces single-line output; without it `df`
+# wraps to two lines when the device path is long (e.g. iSCSI LUNs,
+# UUID-style mappings, LVM-on-LUKS) and the awk NR==2 ends up on the
+# device name instead of the size column. Echoes 0 + exit 1 if df
+# fails (e.g. path doesn't exist).
 detect::disk_free_gb() {
     local path="${1:-/}"
     local kb
-    kb="$(df -k "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+    kb="$(df -kP "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
     if [[ -z "$kb" || ! "$kb" =~ ^[0-9]+$ ]]; then
         echo 0
         return 1

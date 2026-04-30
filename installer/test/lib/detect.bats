@@ -49,6 +49,17 @@ setup() {
     assert_output "unknown"
 }
 
+@test "os_id: CRLF-encoded file -> debian (no trailing CR)" {
+    # Catches the silent-mismatch bug where /etc/os-release shipped
+    # with CRLF (Windows-edited config, some embedded images) yielded
+    # "debian\r" which then fails downstream `case "$id" in debian)`
+    # matches.
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-crlf" run detect::os_id
+    assert_success
+    assert_output "debian"
+    [[ "${output: -1}" != $'\r' ]]
+}
+
 # ---- os_family ------------------------------------------------------
 
 @test "os_family: debian -> debian" {
@@ -132,6 +143,23 @@ setup() {
     assert_output ""
 }
 
+@test "os_codename: Linux Mint -> jammy (Ubuntu base, NOT virginia)" {
+    # Mint sets VERSION_CODENAME=virginia (Mint's brand name) and
+    # UBUNTU_CODENAME=jammy. Apt repos (Docker's CDN) only know Ubuntu
+    # codenames, so we must prefer UBUNTU_CODENAME for Ubuntu-derived
+    # distros. Without this fix, the install fails on Mint with
+    # "no Release file for virginia".
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-mint" run detect::os_codename
+    assert_success
+    assert_output "jammy"
+}
+
+@test "os_codename: CRLF file -> bookworm (no trailing CR)" {
+    DETECT_OS_RELEASE="$INSTALLER_FIXTURES/os-release-crlf" run detect::os_codename
+    assert_success
+    assert_output "bookworm"
+}
+
 # ---- arch -----------------------------------------------------------
 
 @test "arch: x86_64 -> amd64" {
@@ -170,27 +198,46 @@ setup() {
 }
 
 # ---- pkg_manager ----------------------------------------------------
+#
+# Important: these tests pin PATH to JUST the mock dir so a real
+# `apt-get` on a Debian/Ubuntu dev box doesn't beat the mock. The
+# previous version assumed the bats/bats:latest Alpine CI image (no
+# apt-get on PATH); developers running bats locally on a Debian host
+# saw failures. `command -v` is a builtin so no real /bin needed.
 
 @test "pkg_manager: apt wins when apt-get is on PATH" {
     mock_cmd apt-get 0
     mock_cmd dnf 0
-    run detect::pkg_manager
+    PATH="$SYN_MOCK_BIN" run detect::pkg_manager
     assert_success
     assert_output "apt"
 }
 
-@test "pkg_manager: dnf when only dnf" {
+@test "pkg_manager: dnf when only dnf is available" {
     mock_cmd dnf 0
-    run detect::pkg_manager
+    PATH="$SYN_MOCK_BIN" run detect::pkg_manager
     assert_success
     assert_output "dnf"
 }
 
-@test "pkg_manager: pacman when only pacman" {
+@test "pkg_manager: pacman when only pacman is available" {
     mock_cmd pacman 0
-    run detect::pkg_manager
+    PATH="$SYN_MOCK_BIN" run detect::pkg_manager
     assert_success
     assert_output "pacman"
+}
+
+@test "pkg_manager: zypper when nothing else is available" {
+    mock_cmd zypper 0
+    PATH="$SYN_MOCK_BIN" run detect::pkg_manager
+    assert_success
+    assert_output "zypper"
+}
+
+@test "pkg_manager: unknown when no package manager on PATH" {
+    PATH="$SYN_MOCK_BIN" run detect::pkg_manager
+    assert_success
+    assert_output "unknown"
 }
 
 # NOTE: zypper isn't tested in isolation because the bats/bats:latest
@@ -214,6 +261,14 @@ setup() {
 
 @test "is_root: DETECT_UID=1000 -> failure" {
     DETECT_UID=1000 run detect::is_root
+    assert_failure
+}
+
+@test "is_root: DETECT_UID=foo (non-numeric) -> failure (not silently 'root')" {
+    # Bash arithmetic evaluates undefined-name strings to 0, which
+    # would silently mark a non-numeric override as root. The regex
+    # guard fails closed.
+    DETECT_UID=foo run detect::is_root
     assert_failure
 }
 
@@ -299,6 +354,17 @@ setup() {
     run detect::disk_free_gb /
     assert_success
     assert_output "0"
+}
+
+@test "disk_free_gb: long device path stays on one line via -P" {
+    # GNU df without -P wraps to two lines when the device path is
+    # long (iSCSI LUN, UUID-style mapping, LVM-on-LUKS). With -P, the
+    # row stays single-line and our awk NR==2 lands on the size column.
+    mock_cmd df 0 "Filesystem            1K-blocks  Used Available Use% Mounted on
+/dev/disk/by-uuid/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee 100000000 50000 52428800  1% /"
+    run detect::disk_free_gb /
+    assert_success
+    assert_output "50"
 }
 
 @test "disk_free_gb: df returns empty -> 0 + failure" {
