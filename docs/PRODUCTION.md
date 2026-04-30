@@ -1,8 +1,8 @@
 # Running Synapse on a VPS
 
-End-to-end guide for taking the local `docker compose up -d` stack and
-turning it into something that survives a real domain, real users, and a
-firewall. Geared at a single-VPS setup; multi-host / k8s is in
+End-to-end guide for taking a fresh Linux VPS to a running Synapse with
+TLS, Caddy, a registered admin user, and a self-tested Convex
+deployment. Geared at a single-VPS setup; multi-host / k8s is in
 [ROADMAP.md](ROADMAP.md) (v1.0).
 
 This doc covers **single-replica** deployments end-to-end (the
@@ -13,11 +13,63 @@ boring-but-works case). HA-per-deployment has a separate setup
 
 | Thing | Why |
 |---|---|
-| A VPS with **2+ GB RAM, 2+ vCPU, 20+ GB disk** | Each Convex backend container is light, but image + Postgres + dashboard + a couple of deployments adds up |
-| Docker + Docker Compose v2 | The whole stack runs in containers |
+| A VPS with **2+ GB RAM, 2+ vCPU, 20+ GB disk** | Each Convex backend container is light, but image + Postgres + dashboard + a couple of deployments adds up. The `setup.sh` preflight refuses to proceed below this. |
+| Linux (Debian/Ubuntu, Fedora/RHEL family, or Alpine) | Anything else falls outside the auto-installer's scope today |
 | A **domain** pointing at the VPS (`A` or `AAAA` record) | TLS termination + a stable URL for `npx convex`. Subdomain works fine, e.g. `synapse.yourdomain.com` |
-| Outbound internet from the VPS | First-time pull of `ghcr.io/get-convex/convex-backend` |
-| Caddy / Cloudflare / nginx (pick one) | TLS in front of port 8080. Caddy is the simplest — config below |
+| Outbound internet from the VPS | Pulls Docker, the Convex backend image, and Caddy/Let's Encrypt |
+| Root or `sudo` access | Installer mutates `/opt/synapse`, optionally `/etc/caddy/Caddyfile`, and Docker daemon state |
+
+Nothing else. The installer figures out Docker, generates secrets, and
+configures Caddy.
+
+## The one-command path
+
+SSH into the VPS, then:
+
+```bash
+git clone https://github.com/Iann29/convex-synapse.git
+cd convex-synapse
+./setup.sh --domain=synapse.yourdomain.com
+```
+
+Hosted curl-pipe-shell (`curl -sf https://get.synapse.dev | sh`) is
+reserved for **v0.6.2** — it just needs a static script host pinned to
+a git tag.
+
+What `setup.sh` does, in order:
+
+1. **Preflight** — checks OS, arch, sudo, Docker, Compose v2, disk, RAM, outbound, DNS (`dig <domain>` matches `curl ifconfig.me`)
+2. **Install deps** — `apt-get install` / `dnf install` for `jq`, `curl`, `dig` (anything missing). Idempotent; skipped if all present
+3. **Install dir** — creates `/opt/synapse` (or `--install-dir=`), rsyncs the repo into it
+4. **Secrets** — renders `.env` from `installer/templates/env.tmpl` with `openssl rand`-generated `SYNAPSE_JWT_SECRET` + `POSTGRES_PASSWORD` (+ `SYNAPSE_STORAGE_KEY` if `--enable-ha`). On re-runs, existing values are **preserved** (Coolify-style `update_env_var`); never regenerates.
+5. **Caddy** — three-mode auto-detection:
+   - Caddy already on host → append managed `BEGIN/END synapse` block to `/etc/caddy/Caddyfile`, `systemctl reload caddy`
+   - nginx on host → print a `location { }` snippet for the operator to paste
+   - Nothing → render the standalone `Caddyfile` and activate the compose `caddy` profile (Caddy runs as a container alongside Synapse)
+6. **Compose up** — `docker compose up -d --build` (builds `synapse` + `dashboard` locally; pulls `postgres:16-alpine`, `caddy:2-alpine`, etc), then waits up to 60 s for `/health` to return 200
+7. **Pre-pull Convex backend image** — `docker pull ghcr.io/get-convex/convex-backend:latest` so the very first deployment doesn't hit "No such image"
+8. **Self-test** — register a one-shot admin → create team → create project → create deployment → wait for `status=running` → fetch `cli_credentials` → assert URL is publicly reachable (skipped with `--no-tls` since loopback URL is expected then)
+9. **Success screen** — prints public URL, install dir, log path, next steps
+
+Total time on a 2 vCPU / 4 GB Hetzner box: **~3 min** cold, **~30 s** on
+re-runs (everything's cached).
+
+## Useful flags
+
+| Flag | When |
+|---|---|
+| `--domain=<host>` | Required for TLS / `npx convex` from the outside |
+| `--non-interactive` | `curl-pipe-shell` mode; no prompts; defaults everything else |
+| `--no-tls` | Skip Caddy entirely. Use when fronting Synapse with your own ingress (Cloudflare Tunnel, AWS ALB, etc) or for local-only installs |
+| `--skip-dns-check` | Proceed before the A-record propagates. Caddy will still fail to issue the cert until DNS lands; useful when you're only testing the install logic |
+| `--enable-ha` | Opt the install into HA-per-deployment mode. Requires `SYNAPSE_BACKEND_POSTGRES_URL` + `SYNAPSE_BACKEND_S3_*` preset in env. See [HA_TESTING.md](HA_TESTING.md). |
+| `--doctor` | Run preflight against an existing install. No mutations. Useful for "is my VPS still healthy?" or post-upgrade smoke-test |
+| `--upgrade` | Reserved for v0.6.1. Will run `git pull && docker compose pull && up -d --build` with rollback on health failure |
+| `--uninstall` | Reserved for v0.6.1. Will tear down compose + remove the Caddyfile block + optional `--volumes` |
+| `--install-dir=<path>` | Override `/opt/synapse` (rare; useful for side-by-side test installs) |
+| `--acme-email=<addr>` | Email for Let's Encrypt; defaults to `admin@<domain>` |
+
+`SYNAPSE_NON_INTERACTIVE=1` env var is equivalent to `--non-interactive`.
 
 ## Architecture, abridged
 
@@ -32,150 +84,30 @@ boring-but-works case). HA-per-deployment has a separate setup
                                        (NOT exposed to the internet)
 ```
 
-Synapse's reverse proxy mounts `/d/{name}/*` on the same `:8080` listener
-as the API, so a single TLS-terminating front-end protects everything.
-Per-deployment ports stay internal — your firewall only opens 80/443.
+Synapse's reverse proxy mounts `/d/{name}/*` on the same `:8080`
+listener as the API, so a single TLS-terminating front-end protects
+everything. Per-deployment ports stay internal — your firewall only
+opens 80/443.
 
-## 1. Provision the VPS
+## Smoke test from your laptop
 
-DigitalOcean / Hetzner / Linode / OVH — anything with Docker support
-works. After SSH'ing in:
-
-```bash
-# Debian / Ubuntu
-sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2 git
-
-# (Optional) run docker without sudo
-sudo usermod -aG docker $USER && newgrp docker
-```
-
-## 2. Clone Synapse
+After `setup.sh` exits green, the installer's self-test already
+exercised the API. To poke around manually:
 
 ```bash
-git clone https://github.com/Iann29/convex-synapse.git
-cd convex-synapse
-cp .env.example .env
-```
-
-## 3. Edit `.env` for production
-
-The `.env` file shipped with the repo is dev-friendly — change these
-**before** running `docker compose up`:
-
-```bash
-# Auth — generate a real secret (NEVER commit this)
-SYNAPSE_JWT_SECRET=<output of `openssl rand -hex 64`>
-
-# Your VPS's public origin. Without this, `npx convex` from your laptop
-# gets a "http://127.0.0.1:3210" URL that points at the VPS's loopback,
-# which obviously won't work.
-SYNAPSE_PUBLIC_URL=https://synapse.yourdomain.com
-
-# Reverse-proxy mode: route /d/{name}/* to the right backend container.
-# With PUBLIC_URL set, this gives you ONE public port (8080) for
-# everything — no need to expose the per-deployment 3210-3500 range.
-SYNAPSE_PROXY_ENABLED=true
-
-# Postgres password — at minimum, change from the default `synapse:synapse`
-POSTGRES_USER=synapse
-POSTGRES_PASSWORD=<strong random>
-
-# CORS — restrict to your dashboard origin once you go behind TLS
-SYNAPSE_ALLOWED_ORIGINS=https://synapse.yourdomain.com
-
-# Healthcheck-via-network: required when synapse runs in a container
-# (which it does, in compose). Don't change unless you know why.
-SYNAPSE_HEALTHCHECK_VIA_NETWORK=true
-```
-
-The `SYNAPSE_DB_URL` line in `.env` already references the compose
-network's `postgres` service — leave it.
-
-## 4. Bring up the stack
-
-```bash
-docker compose up -d
-docker compose logs -f synapse  # confirm "synapse starting"
-```
-
-The first run pulls the dashboard + synapse images and the first
-deployment-create pulls `ghcr.io/get-convex/convex-backend:latest` —
-budget a couple of minutes the first time.
-
-## 5. TLS termination with Caddy
-
-Caddy is the quickest path to HTTPS — auto-renews Let's Encrypt certs,
-no fiddling. Install on the host:
-
-```bash
-sudo apt-get install -y caddy
-```
-
-Edit `/etc/caddy/Caddyfile`:
-
-```caddy
-synapse.yourdomain.com {
-    # /api → the dashboard (port 6790)
-    @dashboard {
-        not path /v1/* /d/* /health
-    }
-    handle @dashboard {
-        reverse_proxy localhost:6790
-    }
-
-    # /v1/* (API), /d/{name}/* (proxy), /health → Synapse
-    handle {
-        reverse_proxy localhost:8080
-    }
-}
-```
-
-Reload Caddy:
-
-```bash
-sudo systemctl reload caddy
-```
-
-DNS `A` record (`synapse.yourdomain.com` → VPS IP) needs to be in place
-before this — Caddy negotiates the cert on the first request.
-
-## 6. Firewall
-
-Only open the public TLS ports:
-
-```bash
-sudo ufw allow 22       # SSH (already open, just in case)
-sudo ufw allow 80/tcp   # Caddy redirects HTTP → HTTPS
-sudo ufw allow 443/tcp  # the actual API
-sudo ufw enable
-```
-
-Postgres (5432), Synapse (8080), dashboard (6790), and the Convex
-backend host-port range (3210-3500) all stay private — Caddy is the
-only thing that talks to them.
-
-## 7. Smoke test
-
-From your laptop:
-
-```bash
-# 1. Register the first user
+# 1. Register your real admin (if the demo created one with a
+#    fixture email, you'll want a "real" admin too)
 curl -sf -X POST https://synapse.yourdomain.com/v1/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"email":"you@yourdomain.com","password":"strong-random-here","name":"You"}'
+  -d '{"email":"you@yourdomain.com","password":"strong-random","name":"You"}'
 
-# 2. Visit the dashboard
-open https://synapse.yourdomain.com    # browser
+# 2. Open the dashboard
+open https://synapse.yourdomain.com
 ```
 
-Then in the dashboard: create a team → project → deployment. Wait for
-the row to flip to `running` (~1 second).
-
-Click **CLI credentials** on the deployment row — the export snippet
-should now reference `https://synapse.yourdomain.com/d/<name>`, NOT
-`http://127.0.0.1:<port>`. Paste the snippet into a local shell and
-`npx convex dev --once` should connect from anywhere.
+Click **CLI credentials** on a deployment row — the export snippet
+should reference `https://synapse.yourdomain.com/d/<name>`. Paste into a
+local shell and `npx convex dev --once` connects from anywhere.
 
 ## What about HA?
 
@@ -199,7 +131,7 @@ applies:
 
 ```bash
 # Daily backup via a cron job
-docker compose exec -T postgres \
+docker compose -f /opt/synapse/docker-compose.yml exec -T postgres \
   pg_dump -U synapse synapse | gzip > /backups/synapse-$(date +%F).sql.gz
 ```
 
@@ -208,10 +140,15 @@ For the Convex backend data itself: the SQLite file lives in
 or use `npx convex export` against each deployment if you need
 portable dumps.
 
-## Upgrading Synapse
+`./setup.sh backup` and `./setup.sh restore` are reserved for v0.6.1
+and will package both into a single tarball.
+
+## Upgrading
+
+For v0.6.0 (this milestone), the manual upgrade dance:
 
 ```bash
-cd convex-synapse
+cd /opt/synapse
 git pull
 docker compose build synapse dashboard
 docker compose up -d synapse dashboard
@@ -221,31 +158,125 @@ Embedded migrations apply on startup — operator never runs them
 manually. The provisioner queue + advisory locks keep an in-flight
 deploy from being lost during the restart.
 
+`./setup.sh --upgrade` (reserved for **v0.6.1**) will wrap this with a
+health-check-based rollback if the new version fails to come up healthy
+within 60 s.
+
 ## Common gotchas
 
-- **`npx convex` says "could not connect"** — `SYNAPSE_PUBLIC_URL` is
-  unset or wrong. The CLI got a `http://127.0.0.1:<port>` URL that
-  only resolves on the VPS itself.
-- **502 Bad Gateway from Caddy** — Synapse-API container is down.
-  `docker compose logs synapse` will tell you why (usually a missing
-  env var on first boot).
-- **CORS error in browser DevTools** — `SYNAPSE_ALLOWED_ORIGINS` is
-  set to `*` by default. If you locked it down, make sure your
-  dashboard origin (the one in the URL bar) is in the allowed list.
-- **Disk filling up** — old Convex backend images and volumes
-  accumulate. `docker system prune` cleans dangling stuff;
-  `docker volume ls -q --filter name=synapse-data-` shows
-  per-deployment volumes (don't blanket-delete — these have user data).
-- **Postgres volume can't be backed up while running** —
-  `pg_dump` is the right tool, not a raw volume copy. The compose
-  Postgres exposes `:5432` only on the docker network; use `docker
-  compose exec` to reach it.
+- **`npx convex` says "could not connect"** — `SYNAPSE_PUBLIC_URL` is unset or wrong. The CLI got a `http://127.0.0.1:<port>` URL that only resolves on the VPS itself. The installer sets this from `--domain`; if you ran with `--no-tls`, that's expected and `npx convex` only works from the VPS itself.
+- **502 Bad Gateway from Caddy** — Synapse-API container is down. `docker compose -f /opt/synapse/docker-compose.yml logs synapse` will tell you why (usually a missing env var on first boot).
+- **CORS error in browser DevTools** — `SYNAPSE_ALLOWED_ORIGINS` doesn't include the dashboard origin. `setup.sh` sets it to `https://<domain>` by default; if you front Synapse with multiple hostnames, expand the list.
+- **Disk filling up** — old Convex backend images and volumes accumulate. `docker system prune` cleans dangling stuff; `docker volume ls -q --filter name=synapse-data-` shows per-deployment volumes (don't blanket-delete — these have user data).
+- **Postgres volume can't be backed up while running** — `pg_dump` is the right tool, not a raw volume copy. The compose Postgres exposes `:5432` only on the docker network; use `docker compose exec` to reach it.
+- **Re-running `setup.sh` doesn't refresh secrets** — by design. Existing values in `.env` are preserved (Coolify `update_env_var` pattern). To rotate the JWT secret, edit `/opt/synapse/.env` directly, then `docker compose restart synapse`.
+- **Caddy fails with "no Release file for victoria"** (Linux Mint hosts) — fixed in chunk 1: the OS detection prefers `UBUNTU_CODENAME` over Mint's brand-name `VERSION_CODENAME` for Ubuntu-derived distros. If you hit this on an older repo checkout, `git pull`.
 
 ## What's NOT included today
 
-- Auto-renewing TLS for **per-deployment** custom domains (v1.0 — Caddy
-  only terminates Synapse's own domain right now)
-- Multi-region replication (out of scope; lease design forbids it
-  upstream — see V0_5_PLAN.md)
-- Automatic Postgres backups (manual `pg_dump` + cron is the v0.5 story)
+- Auto-renewing TLS for **per-deployment** custom domains (v1.0 — Caddy only terminates Synapse's own domain right now)
+- Multi-region replication (out of scope; lease design forbids it upstream — see V0_5_PLAN.md)
+- `./setup.sh --upgrade` / `--uninstall` / `--backup` (reserved for v0.6.1)
+- Hosted `curl -sf https://get.synapse.dev | sh` one-liner (reserved for v0.6.2)
+- Browser-driven first-run wizard (reserved for v0.6.3)
 - A K8s / Helm install path (v1.0)
+
+---
+
+## Appendix: manual install (advanced)
+
+The `setup.sh` flow above is what the docs recommend for everyone.
+This appendix is preserved for operators who need to inspect / modify
+specific steps (debugging the installer itself, integrating with an
+unusual ingress, reproducing what the installer would have done).
+
+### 1. Provision the VPS
+
+DigitalOcean / Hetzner / Linode / OVH / etc — anything with Docker
+support works. After SSH'ing in:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-v2 git jq dnsutils curl
+
+# Fedora / RHEL
+sudo dnf install -y docker docker-compose-plugin git jq bind-utils curl
+
+# (Optional) run docker without sudo
+sudo usermod -aG docker $USER && newgrp docker
+```
+
+### 2. Clone Synapse + render `.env`
+
+```bash
+sudo mkdir -p /opt/synapse && sudo chown $USER /opt/synapse
+git clone https://github.com/Iann29/convex-synapse.git /opt/synapse
+cd /opt/synapse
+cp .env.example .env
+```
+
+Edit `.env` for production:
+
+```bash
+SYNAPSE_JWT_SECRET=<output of `openssl rand -hex 64`>
+SYNAPSE_PUBLIC_URL=https://synapse.yourdomain.com
+SYNAPSE_PROXY_ENABLED=true
+POSTGRES_USER=synapse
+POSTGRES_PASSWORD=<output of `openssl rand -hex 16`>
+SYNAPSE_ALLOWED_ORIGINS=https://synapse.yourdomain.com
+SYNAPSE_HEALTHCHECK_VIA_NETWORK=true
+```
+
+### 3. Bring up the stack
+
+```bash
+docker compose up -d --build
+docker compose logs -f synapse  # confirm "synapse starting"
+```
+
+### 4. TLS via Caddy
+
+Install Caddy on the host (`sudo apt-get install -y caddy`), then add
+to `/etc/caddy/Caddyfile`:
+
+```caddy
+synapse.yourdomain.com {
+    @dashboard {
+        not path /v1/* /d/* /health
+    }
+    handle @dashboard {
+        reverse_proxy localhost:6790
+    }
+    handle {
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+`sudo systemctl reload caddy`. DNS A-record must already point at the
+VPS — Caddy negotiates the cert on the first request.
+
+### 5. Pre-pull the Convex backend image
+
+```bash
+docker pull ghcr.io/get-convex/convex-backend:latest
+```
+
+Otherwise the very first `create_deployment` hits "No such image" and
+returns 500.
+
+### 6. Firewall
+
+```bash
+sudo ufw allow 22 80/tcp 443/tcp
+sudo ufw enable
+```
+
+Synapse (8080), dashboard (6790), Postgres (5432), and the per-
+deployment 3210-3500 range stay private — Caddy is the only thing that
+talks to them.
+
+That's the manual flow. `./setup.sh` does all of the above plus the
+post-install self-test. Use the manual path only when you have a
+reason — the installer is faster and validates more.
