@@ -46,6 +46,11 @@ const (
 	// Adopted = registered an existing external Convex backend rather than
 	// provisioning a new one. Synapse-original; no Cloud equivalent.
 	ActionAdoptDeployment = "adoptDeployment"
+	// Upgrade = converted an existing single-replica deployment to HA.
+	// Synapse-original; emitted at endpoint-enqueue time. The worker
+	// emits no separate audit event today — operators trace progress via
+	// provisioning_jobs.status.
+	ActionUpgradeToHA = "upgradeToHA"
 
 	// Personal access tokens. Cloud has no equivalent (it uses OAuth flows),
 	// so these names are Synapse-original; verbs follow the existing

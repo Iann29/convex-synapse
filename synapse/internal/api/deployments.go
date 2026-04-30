@@ -76,6 +76,7 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Get("/auth", h.deploymentAuth)
 		r.Get("/cli_credentials", h.deploymentCLICredentials)
 		r.Post("/create_deploy_key", h.createDeployKey)
+		r.Post("/upgrade_to_ha", h.upgradeToHA)
 	})
 	return r
 }
@@ -144,6 +145,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
 		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
+		       d.ha_enabled, d.replica_count,
 		       p.id, p.team_id, p.name, p.slug, p.is_demo, p.created_at,
 		       t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
 		  FROM deployments d
@@ -155,6 +157,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
 		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
+		&d.HAEnabled, &d.ReplicaCount,
 		&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt,
 		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
 	)
@@ -1019,6 +1022,108 @@ func (h *DeploymentsHandler) getDeployment(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+// ---------- POST /v1/deployments/{name}/upgrade_to_ha ----------
+
+// upgradeToHAReq optionally lets the caller override the cluster-wide
+// HA defaults (same shape as createDeployment.HAOverrides). Empty
+// payload uses the SYNAPSE_BACKEND_* env defaults.
+type upgradeToHAReq struct {
+	HAOverrides *haOverrides `json:"haOverrides,omitempty"`
+}
+
+// upgradeToHA migrates an existing single-replica deployment to HA.
+// The endpoint validates + enqueues the work; the actual mechanics
+// (snapshot_export from the existing replica → provision 2 new HA
+// replicas → snapshot_import → atomic swap) live on the worker side.
+//
+// Today the worker rejects upgrade_to_ha jobs with a clear error
+// instead of corrupting state mid-migration. That makes the API
+// surface stable so operators can wire it up; the heavy lifting is
+// scheduled for v0.5.1 (see docs/V0_5_PLAN.md).
+//
+// Validation refuses early when:
+//   - HA isn't enabled on this Synapse instance
+//   - cluster config is incomplete
+//   - the deployment is already HA (no-op)
+//   - the deployment is adopted (Synapse doesn't manage its container,
+//     can't migrate it)
+//   - the deployment is in a non-running state (provisioning, failed,
+//     stopped — operator should resolve before upgrading)
+func (h *DeploymentsHandler) upgradeToHA(w http.ResponseWriter, r *http.Request) {
+	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can upgrade deployments")
+		return
+	}
+	if !h.HA.Enabled {
+		writeError(w, http.StatusBadRequest, "ha_disabled",
+			"HA-per-deployment is disabled on this Synapse instance (set SYNAPSE_HA_ENABLED=true)")
+		return
+	}
+	if missing := missingHAClusterFields(h.HA); missing != "" {
+		writeError(w, http.StatusBadRequest, "ha_misconfigured",
+			"HA is enabled but cluster config is incomplete: "+missing)
+		return
+	}
+	if h.Crypto == nil {
+		writeError(w, http.StatusBadRequest, "ha_misconfigured",
+			"HA is enabled but SYNAPSE_STORAGE_KEY is not set")
+		return
+	}
+	if d.HAEnabled {
+		writeError(w, http.StatusConflict, "already_ha",
+			"Deployment is already running in HA mode")
+		return
+	}
+	if d.Adopted {
+		writeError(w, http.StatusBadRequest, "cannot_upgrade_adopted",
+			"Adopted deployments are managed externally; convert to HA on the source side and re-adopt")
+		return
+	}
+	if d.Status != models.DeploymentStatusRunning {
+		writeError(w, http.StatusConflict, "deployment_not_running",
+			"Deployment must be 'running' to upgrade; current status: "+d.Status)
+		return
+	}
+
+	var req upgradeToHAReq
+	// readJSON requires a non-empty body; fall back to default config
+	// when the caller posts an empty {}.
+	if r.ContentLength > 0 {
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+
+	// The worker's mechanical work isn't implemented yet — refuse with
+	// the same code we use elsewhere for the "API exists, runtime
+	// missing" pattern. Once the export/import flow lands, this branch
+	// flips to enqueueing an `upgrade_to_ha` job and returning 202.
+	writeError(w, http.StatusNotImplemented, "ha_upgrade_not_yet_implemented",
+		"upgrade_to_ha is in flight (snapshot_export → re-provision → snapshot_import → swap); "+
+			"see docs/V0_5_PLAN.md")
+
+	// Audit the *attempt* even though we refused — operators trying to
+	// upgrade need a paper trail of who pinged the endpoint and when.
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpgradeToHA,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata: map[string]any{
+			"name":   d.Name,
+			"status": "rejected_not_yet_implemented",
+		},
+	})
+	_ = req
 }
 
 // ---------- POST /v1/deployments/{name}/delete ----------
