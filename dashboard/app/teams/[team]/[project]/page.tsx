@@ -61,6 +61,11 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
 
   const [open, setOpen] = useState(false);
   const [type, setType] = useState<"dev" | "prod">("dev");
+  // HA mode. Off by default — single-replica deployments are the common
+  // path. When the backend has SYNAPSE_HA_ENABLED=false (most clusters),
+  // submitting with this on returns 400 ha_disabled which we surface
+  // inline instead of crashing the dialog.
+  const [haMode, setHAMode] = useState(false);
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [openingName, setOpeningName] = useState<string | null>(null);
@@ -82,8 +87,12 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
     setFormError(null);
     setPending(true);
     try {
-      await api.projects.createDeployment(projectId, { type });
+      await api.projects.createDeployment(projectId, {
+        type,
+        ha: haMode || undefined,
+      });
       setOpen(false);
+      setHAMode(false);
       await mutate();
     } catch (err) {
       setFormError(
@@ -339,6 +348,11 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                       )}
                       {d.isDefault && <Badge tone="neutral">default</Badge>}
                       {d.adopted && <Badge tone="neutral">adopted</Badge>}
+                      {d.haEnabled && (
+                        <Badge tone="green">
+                          HA{d.replicaCount ? ` ×${d.replicaCount}` : ""}
+                        </Badge>
+                      )}
                     </div>
                     {(d.deploymentUrl || d.url) && (
                       <div className="mt-1 flex items-center gap-2">
@@ -415,6 +429,25 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             <p className="text-xs text-neutral-500">
               Provisions a Convex backend container.
             </p>
+          </div>
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-xs text-neutral-400">
+              <input
+                id="create-ha-toggle"
+                type="checkbox"
+                checked={haMode}
+                onChange={(e) => setHAMode(e.target.checked)}
+                className="h-4 w-4 rounded border-neutral-700 bg-neutral-900 text-violet-500 focus:ring-violet-500"
+              />
+              <span>High availability (2 replicas + Postgres + S3)</span>
+            </label>
+            {haMode && (
+              <p className="text-xs text-neutral-500">
+                Requires <code className="text-neutral-300">SYNAPSE_HA_ENABLED=true</code> on
+                the cluster plus <code className="text-neutral-300">SYNAPSE_BACKEND_*</code>
+                {" "}credentials. See <code className="text-neutral-300">docs/V0_5_PLAN.md</code>.
+              </p>
+            )}
           </div>
           {formError && <p className="text-xs text-red-400">{formError}</p>}
           <div className="flex justify-end gap-2">
