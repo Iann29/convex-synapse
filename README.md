@@ -42,11 +42,17 @@ Synapse fills that gap.
 
 ## Status
 
-**v0.4 — UI redesigned, v0.2 leftovers cleared.** The dashboard now matches
-the Convex Cloud aesthetic (top app bar, team picker, redesigned home,
-team-settings shell). The control plane is multi-node-safe (v0.3) and the
-two long-standing v0.2 stragglers landed: paginated team/project listings
-and a migration helper that imports existing self-hosted backends.
+**v0.4 done; v0.5 (HA-per-deployment) in flight — 8 of 10 chunks landed.**
+Operators can now opt a deployment into HA at create time: the backend
+provisions two replicas backed by Postgres + S3, the proxy fails over
+between them on connection errors, and the health worker tracks replica
+state independently. Single-replica behavior is unchanged — HA is a
+per-deployment switch behind `SYNAPSE_HA_ENABLED`.
+
+The dashboard matches the Convex Cloud aesthetic (top app bar, team
+picker, redesigned home, team-settings shell), and the control plane is
+multi-node-safe (v0.3). Paginated team/project listings and a migration
+helper for existing self-hosted backends are also live.
 
 A `docker compose up -d` plus a register call gets you a control-plane API,
 a dashboard, and the ability to provision real Convex backend containers in
@@ -77,11 +83,18 @@ What works today:
 - Redesigned dashboard: top app bar with team picker, home with
   Projects/Deployments tabs, team-settings shell with sidebar, deterministic
   avatar gradients
-- ~110 Go integration tests + 18 Playwright e2e green in CI
+- **HA-per-deployment** (opt-in via `SYNAPSE_HA_ENABLED=true` +
+  `SYNAPSE_STORAGE_KEY`): `ha:true` on `create_deployment` provisions 2
+  replicas backed by Postgres + S3 with AES-GCM-encrypted creds at rest,
+  proxy fails over between replicas on connection error, health worker
+  rolls up replica statuses into the deployment-level status, dashboard
+  toggle + `HA ×N` badge. Real-backend e2e + `upgrade_to_ha` endpoint
+  still in flight — see [docs/ROADMAP.md](docs/ROADMAP.md).
+- ~125 Go integration tests + 20 Playwright e2e green in CI
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next (v0.5 HA-per-deployment
-plan in [docs/V0_5_PLAN.md](docs/V0_5_PLAN.md)) and what's deliberately out of
-scope.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next (chunks 9-10 of
+v0.5 still in flight; full plan in [docs/V0_5_PLAN.md](docs/V0_5_PLAN.md))
+and what's deliberately out of scope.
 
 ## Repo layout
 
