@@ -127,10 +127,54 @@ Chunks landed:
   the happy path returns `501 ha_upgrade_not_yet_implemented` with a
   pointer to V0_5_PLAN.md. (PR #7, merged)
 
-## v0.5.1 — "HA polish" 📋 NEXT
+## v0.6 — "Auto-installer" 🚀 PRIORITY
 
-The mechanical pieces that didn't fit in v0.5's main slice. Both are
-behind already-shipped APIs, so adding them is a runtime-only change.
+> **The installer is now the single most important thing on the
+> roadmap.** Synapse's reason to exist is to make self-hosting Convex
+> painless. The current "clone the repo, edit .env, edit Caddyfile,
+> sudo reload, docker compose up, manually verify" flow is the exact
+> pain we're supposed to be solving. Operators should run **one
+> command** and get a fully-configured production-ready install.
+
+Full design + phased plan: **[docs/V0_6_INSTALLER_PLAN.md](V0_6_INSTALLER_PLAN.md)**.
+
+North star:
+
+```
+$ curl -sf https://get.synapse.dev | sh
+```
+
+Two minutes later, the operator's VPS has Synapse running on
+`https://<their-domain>` with TLS, a registered admin user, and the
+Convex backend image pre-pulled.
+
+Phased delivery (~8 dev-days, 3-4 calendar weeks part-time):
+
+- [ ] **v0.6.0 — Foundation.** `./setup.sh` script + supporting
+  compose changes. 90% of single-VPS installs work end-to-end without
+  manual file edits. Pre-flight checks (Docker, ports, DNS, disk),
+  Caddy auto-detection (use existing OR install fresh OR run in
+  compose), generated secrets, idempotent re-runs, post-install
+  self-test, pretty success screen.
+- [ ] **v0.6.1 — Lifecycle commands.** `synapse status` / `upgrade` /
+  `backup` / `restore` / `uninstall` / `logs` / `doctor`. The same
+  binary the installer drops, exposing maintenance subcommands.
+- [ ] **v0.6.2 — Hosted install script.** `curl -sf https://get.synapse.dev | sh`
+  one-liner pinned to git tags.
+- [ ] **v0.6.3 — Browser-driven first-run wizard.** Dashboard's
+  `/login` redirects to `/setup` when no users exist; walks the
+  operator through admin-create → optional HA → demo deployment +
+  CLI snippet. Operator never sees a config file.
+- [ ] **v0.6.4 — Cloud images (stretch).** Pre-built DigitalOcean /
+  Hetzner / Linode snapshots, Packer-built on each tag, listed in
+  each provider's marketplace. Out of scope for the initial v0.6
+  milestone; bookmarked for v0.7.
+
+## v0.5.1 — "HA polish" 📋 DEFERRED
+
+Bookmarked but lower priority than v0.6. Both pieces are behind
+already-shipped APIs (the wire surface exists — only the runtime
+behind it needs to land), so adding them is a runtime-only change.
 
 - [ ] Worker handler for `upgrade_to_ha` jobs: stream `snapshot_export`
   from the existing replica, provision 2 new HA replicas, run
