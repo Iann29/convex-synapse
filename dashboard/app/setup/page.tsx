@@ -29,8 +29,8 @@ type Phase =
   | { kind: "loading" }
   | { kind: "admin" }
   | { kind: "demo" }
-  | { kind: "provisioning"; teamSlug: string; projectSlug: string }
-  | { kind: "done"; teamSlug: string; projectSlug: string }
+  | { kind: "provisioning"; teamSlug: string; projectId: string }
+  | { kind: "done"; teamSlug: string; projectId: string }
   | { kind: "redirect" };
 
 export default function SetupPage() {
@@ -103,7 +103,7 @@ export default function SetupPage() {
       setPhase({
         kind: "provisioning",
         teamSlug: team.slug,
-        projectSlug: created.projectSlug,
+        projectId: created.projectId,
       });
       // Provision a dev deployment. The operator lands on the project
       // page with this row already showing — no "click to create" step.
@@ -111,7 +111,7 @@ export default function SetupPage() {
       setPhase({
         kind: "done",
         teamSlug: team.slug,
-        projectSlug: created.projectSlug,
+        projectId: created.projectId,
       });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not bootstrap demo");
@@ -127,7 +127,11 @@ export default function SetupPage() {
 
   const finish = () => {
     if (phase.kind === "done") {
-      router.push(`/teams/${phase.teamSlug}/${phase.projectSlug}`);
+      // The project route uses projectId, not slug — see app/teams/[team]/page.tsx
+      // where every project link is built with `project.id`.
+      router.push(
+        `/teams/${encodeURIComponent(phase.teamSlug)}/${encodeURIComponent(phase.projectId)}`,
+      );
     }
   };
 
