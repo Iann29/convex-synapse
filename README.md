@@ -14,8 +14,8 @@ that gap: teams, projects, multi-deployment, audit log, `npx convex`
 auth, and an embedded Convex Dashboard with one-click "Open dashboard".
 
 ```bash
-git clone https://github.com/Iann29/convex-synapse.git
-cd convex-synapse && ./setup.sh --domain=synapse.yourdomain.com
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --domain=synapse.yourdomain.com
 ```
 
 Three minutes later: stack up on your VPS, TLS via Caddy + Let's
@@ -78,29 +78,43 @@ see [`docs/SCREENSHOTS.md`](docs/SCREENSHOTS.md).
 
 ## Quickstart
 
-### Production VPS — with TLS
+### Production VPS — with TLS (one-liner)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --domain=synapse.yourdomain.com
+```
+
+DNS A-record must already point at the VPS. Caddy handles TLS via
+Let's Encrypt automatically. The script clones the repo into
+`/tmp/convex-synapse-bootstrap-<pid>` and re-execs itself from there
+— operators see "Bootstrapping Synapse installer from ..." on stderr
+before the real install starts.
+
+### Local dev — no TLS, no domain
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --no-tls --skip-dns-check --non-interactive
+```
+
+Open `http://localhost:6790`, register, click around. Useful flags
+worth knowing: `--enable-ha`, `--doctor`, `--install-dir=`,
+`--upgrade` (v0.6.1), `--no-bootstrap` (run from a local checkout).
+
+### Manual install (inspect first)
+
+If you'd rather review the script before running it (good practice
+for serious deploys), `git clone` and run it locally — same script,
+same flags:
 
 ```bash
 git clone https://github.com/Iann29/convex-synapse.git
 cd convex-synapse && ./setup.sh --domain=synapse.yourdomain.com
 ```
 
-DNS A-record must already point at the VPS. Caddy handles TLS via
-Let's Encrypt automatically.
-
-### Local dev — no TLS, no domain
-
-```bash
-git clone https://github.com/Iann29/convex-synapse.git
-cd convex-synapse && ./setup.sh --no-tls --skip-dns-check --non-interactive
-```
-
-Open `http://localhost:6790`, register, click around. Useful flags
-worth knowing: `--enable-ha`, `--doctor`, `--install-dir=`,
-`--upgrade` (v0.6.1).
-
-For everything else (manual install, custom Caddy/nginx, HA cluster
-setup, the `npx convex` flow), see
+For everything else (custom Caddy/nginx, HA cluster setup, the
+`npx convex` flow), see
 [`docs/PRODUCTION.md`](docs/PRODUCTION.md) /
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) /
 [`docs/HA_TESTING.md`](docs/HA_TESTING.md).

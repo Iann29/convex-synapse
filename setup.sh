@@ -2,8 +2,9 @@
 #
 # Synapse — auto-installer entry point.
 #
-# Run on a fresh VPS:
-#     curl -sf https://get.synapse.dev | sh
+# Run on a fresh VPS via the hosted one-liner:
+#     curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+#         | bash -s -- --domain=synapse.example.com
 #
 # Or, after `git clone`:
 #     ./setup.sh --domain=synapse.example.com
@@ -16,20 +17,40 @@
 # Everything lives inside `main()` and is invoked at EOF. This is the
 # Tailscale curl-pipe-shell idiom: a download truncated mid-file
 # can't execute partial logic because the function is never called.
+#
+# When invoked via `curl | bash`, the installer/ directory holding
+# the dot-included libraries doesn't ship alongside this single file.
+# `setup::needs_bootstrap` detects that case and `setup::bootstrap`
+# git-clones the repo into a temp dir + re-execs setup.sh from there
+# with the same args. Operators who ran `git clone` see no behaviour
+# change — `installer/` is already next to setup.sh.
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="0.6.1"
+readonly INSTALLER_VERSION="0.6.2"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"
+readonly BOOTSTRAP_REPO_URL="${SYNAPSE_BOOTSTRAP_REPO_URL:-https://github.com/Iann29/convex-synapse.git}"
+readonly BOOTSTRAP_REF="${SYNAPSE_BOOTSTRAP_REF:-main}"
 
 # Resolve the directory holding this script so we can dot-include the
 # installer libraries regardless of how the operator invoked us
 # (./setup.sh, /opt/synapse/setup.sh, bash -c "$(curl …)", etc).
-# `${BASH_SOURCE[0]}` is the path of the file currently executing.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly INSTALLER_TEMPLATES="$HERE/installer/templates"
+# `${BASH_SOURCE[0]}` is the path of the file currently executing —
+# but under `curl | bash`, bash reads from stdin and BASH_SOURCE[0]
+# is unset/empty. Default to "" first (set -u guard), then resolve
+# to an absolute path only when the source file actually exists.
+# An empty HERE is the bootstrap signal — we'll re-exec from a
+# real clone before sourcing any libs.
+_setup_src="${BASH_SOURCE[0]:-}"
+if [[ -n "$_setup_src" && -f "$_setup_src" ]]; then
+    HERE="$(cd "$(dirname "$_setup_src")" && pwd)"
+else
+    HERE=""
+fi
+unset _setup_src
+readonly INSTALLER_TEMPLATES="${HERE:+$HERE/installer/templates}"
 export INSTALLER_TEMPLATES
 
 # CURRENT_STEP is set at the top of each phase so the trap message
@@ -134,12 +155,20 @@ Options:
                              URL, DNS, TLS expiry, disk. Exit 0 healthy,
                              1 degraded, 2 broken.
     --install-dir=<path>     Override $INSTALL_DIR_DEFAULT.
+    --no-bootstrap           Skip the curl|sh bootstrap re-exec even
+                             when installer/ is missing. Useful for
+                             tests and for running setup.sh from a
+                             custom checkout.
     --version                Print installer version and exit.
     --help                   This message.
 
 Environment:
     SYNAPSE_NON_INTERACTIVE  Same as --non-interactive (any non-empty)
     SYNAPSE_INSTALL_LOG      Override log path (default $LOG_FILE)
+    SYNAPSE_BOOTSTRAP_REPO_URL  Git URL to clone for the bootstrap
+                             re-exec (default $BOOTSTRAP_REPO_URL)
+    SYNAPSE_BOOTSTRAP_REF    Git ref to check out during bootstrap
+                             (default $BOOTSTRAP_REF)
 EOF
 }
 
@@ -167,6 +196,7 @@ parse_flags() {
     LOGS_FOLLOW=0
     LOGS_TAIL=""
     STATUS=0
+    NO_BOOTSTRAP=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
         case "$1" in
@@ -195,6 +225,7 @@ parse_flags() {
             --tail)            LOGS_TAIL="${2:-}"; shift ;;
             --status)          STATUS=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
+            --no-bootstrap)    NO_BOOTSTRAP=1 ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
             *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
@@ -219,6 +250,103 @@ acquire_lock() {
         echo "another setup.sh is already running (lock: $LOCK_FILE.fd)" >&2
         exit 2
     fi
+}
+
+# Bootstrap (curl | bash) ---------------------------------------------
+#
+# When the script is fetched via `curl | bash`, only setup.sh exists
+# in the bash process — the installer/ tree of dot-includable libs
+# is missing. setup::needs_bootstrap detects that state; setup::bootstrap
+# clones the repo into a temp dir and re-execs setup.sh from the clone,
+# passing through every original argument.
+#
+# Both functions are pure and side-effect-free except for the obvious
+# (clone, exec, stdout chatter), which keeps them testable in isolation
+# under __SETUP_NO_MAIN.
+
+# setup::needs_bootstrap [<dir>]
+# Returns 0 (true) when no installer/ tree is reachable from <dir>
+# (default: $HERE). Empty <dir> always counts as needing bootstrap —
+# that's the curl|bash case, where BASH_SOURCE[0] resolved to nothing.
+setup::needs_bootstrap() {
+    local dir="${1-$HERE}"
+    if [[ -z "$dir" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$dir/installer" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# setup::bootstrap_target_dir
+# Echoes the path we'll clone into. /tmp first; falls back to
+# $HOME/.synapse-bootstrap-<pid> when /tmp isn't writable (some
+# hardened distros mount /tmp read-only or noexec). $$ is the pid of
+# the running bash, so two parallel curl|bash invocations don't
+# clobber each other.
+setup::bootstrap_target_dir() {
+    local pid=$$
+    if [[ -d /tmp && -w /tmp ]]; then
+        printf '/tmp/convex-synapse-bootstrap-%s' "$pid"
+        return 0
+    fi
+    local home="${HOME:-/root}"
+    if [[ -d "$home" && -w "$home" ]]; then
+        printf '%s/.synapse-bootstrap-%s' "$home" "$pid"
+        return 0
+    fi
+    return 1
+}
+
+# setup::bootstrap "$@"
+# Clone the repo into a temp dir and exec setup.sh from there with the
+# original args. This function MUST run before source_libs() — that's
+# the whole point. On success it execs (never returns); on failure it
+# prints a manual recovery hint and exits non-zero.
+setup::bootstrap() {
+    if ! command -v git >/dev/null 2>&1; then
+        printf 'error: git is required for the curl|bash bootstrap.\n' >&2
+        printf '  install it first: sudo apt-get install -y git  (Debian/Ubuntu)\n' >&2
+        printf '                    sudo dnf install -y git      (Fedora/RHEL)\n' >&2
+        printf '  then re-run the one-liner.\n' >&2
+        printf '  alternatively, git clone %s and run ./setup.sh directly.\n' \
+            "$BOOTSTRAP_REPO_URL" >&2
+        exit 2
+    fi
+    local target
+    if ! target="$(setup::bootstrap_target_dir)"; then
+        # shellcheck disable=SC2016  # literal $HOME in operator-facing message
+        printf 'error: no writable temp dir for bootstrap (/tmp + $HOME both unusable).\n' >&2
+        printf '  manually: git clone %s /opt/synapse-src && /opt/synapse-src/setup.sh ...\n' \
+            "$BOOTSTRAP_REPO_URL" >&2
+        exit 2
+    fi
+    # Clean up a stale dir from a previous aborted bootstrap with the
+    # same pid (rare — pid reuse — but cheap to handle).
+    if [[ -e "$target" ]]; then
+        rm -rf "$target"
+    fi
+    printf 'Bootstrapping Synapse installer from %s (ref: %s)...\n' \
+        "$BOOTSTRAP_REPO_URL" "$BOOTSTRAP_REF" >&2
+    printf '  target: %s\n' "$target" >&2
+    if ! git clone --depth=1 --branch "$BOOTSTRAP_REF" \
+            "$BOOTSTRAP_REPO_URL" "$target" >&2; then
+        printf 'error: git clone failed. Check network + that the ref %s exists.\n' \
+            "$BOOTSTRAP_REF" >&2
+        exit 2
+    fi
+    if [[ ! -x "$target/setup.sh" ]]; then
+        printf 'error: cloned repo has no setup.sh at %s/setup.sh\n' "$target" >&2
+        exit 2
+    fi
+    printf 'Re-executing setup.sh from %s\n' "$target" >&2
+    # Tell the child it's the bootstrapped clone so it doesn't loop.
+    # The exec replaces this process; cleanup of $target is left to
+    # the OS / next reboot. Operators that want it gone immediately
+    # can rm -rf /tmp/convex-synapse-bootstrap-* themselves.
+    export SYNAPSE_BOOTSTRAPPED=1
+    exec "$target/setup.sh" "$@"
 }
 
 # Source library files. We source ALL of them up-front so undefined
@@ -601,6 +729,19 @@ EOF
 
 main() {
     parse_flags "$@"
+
+    # Bootstrap re-exec: when the script was fetched via curl|bash
+    # the installer/ libs aren't on disk next to us. Clone the repo
+    # into a temp dir and exec from there. --no-bootstrap escapes
+    # the loop for tests; SYNAPSE_BOOTSTRAPPED=1 is set by the
+    # parent setup.sh on the re-exec so we don't clone twice if the
+    # cloned copy somehow still looks bootstrap-y.
+    if (( ! NO_BOOTSTRAP )) && [[ -z "${SYNAPSE_BOOTSTRAPPED:-}" ]] \
+            && setup::needs_bootstrap; then
+        setup::bootstrap "$@"
+        # setup::bootstrap execs; if we reach this line it failed.
+        exit 2
+    fi
 
     # Doctor mode — run preflight against the existing install and
     # exit. No mutations.
