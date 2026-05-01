@@ -712,11 +712,26 @@ lifecycle::_restore_inner() {
     fi
 
     if [[ -f "$stage/synapse.sql.gz" ]]; then
-        if ! ui::spin "Replaying metadata dump" \
-                bash -c "gunzip -c '$stage/synapse.sql.gz' | '$docker_cmd' exec -i synapse-postgres psql -U '$pg_user' -d '$pg_db' -q -v ON_ERROR_STOP=1 >/dev/null 2>&1"; then
-            ui::fail "psql replay failed — DB is in a partial state, inspect manually"
+        # Decompress to a sibling .sql file so psql can read via a
+        # plain `< file` redirect — avoids the bash -c + pipe combo
+        # that swallowed psql's exit code on the synapse-test VPS
+        # (the wrapper-rc was non-zero even when the dump itself
+        # replayed cleanly when re-run by hand).
+        local sql_file="$stage/synapse.sql"
+        if ! gunzip -c "$stage/synapse.sql.gz" > "$sql_file"; then
+            ui::fail "could not decompress synapse.sql.gz from archive"
             return 2
         fi
+        ui::info "Replaying metadata dump"
+        local replay_log="$stage/psql-replay.log"
+        if ! "$docker_cmd" exec -i synapse-postgres psql \
+                -U "$pg_user" -d "$pg_db" \
+                -q -v ON_ERROR_STOP=1 < "$sql_file" >"$replay_log" 2>&1; then
+            ui::fail "psql replay failed — see $replay_log"
+            tail -n 20 "$replay_log" >&2 || true
+            return 2
+        fi
+        ui::success "Replaying metadata dump"
     else
         ui::warn "no synapse.sql.gz in archive — skipping DB restore"
     fi
