@@ -16,10 +16,6 @@ import { ApiError, api, type Deployment, type Project } from "@/lib/api";
 
 type Params = { team: string; project: string };
 
-const CONVEX_DASHBOARD_URL =
-  process.env.NEXT_PUBLIC_CONVEX_DASHBOARD_URL?.replace(/\/$/, "") ||
-  "http://localhost:6791";
-
 function statusTone(status?: string): "green" | "yellow" | "red" | "neutral" {
   if (!status) return "neutral";
   const s = status.toLowerCase();
@@ -129,24 +125,19 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
     }
   };
 
-  const openDashboard = async (name: string) => {
-    setActionError(null);
-    setOpeningName(name);
-    try {
-      const auth = await api.deployments.auth(name);
-      const url = `${CONVEX_DASHBOARD_URL}/#deploymentName=${encodeURIComponent(
-        auth.deploymentName
-      )}&adminKey=${encodeURIComponent(auth.adminKey)}&deploymentUrl=${encodeURIComponent(
-        auth.deploymentUrl
-      )}`;
-      window.open(url, "_blank", "noopener,noreferrer");
-    } catch (err) {
-      setActionError(
-        err instanceof ApiError ? err.message : "Could not load deployment credentials"
-      );
-    } finally {
-      setOpeningName(null);
-    }
+  const openDashboard = (name: string) => {
+    // Open a Synapse-hosted embed shell that iframes the open-source
+    // Convex Dashboard and answers its postMessage handshake with
+    // adminKey + deploymentUrl. The handshake protocol is the only
+    // way to auto-login the dashboard without a rebuild — the URL
+    // hash format we tried before (`#deploymentName=...`) is silently
+    // ignored by the self-hosted build (verified against the source
+    // in get-convex/convex-backend's `npm-packages/dashboard-self-hosted/`).
+    window.open(
+      `/embed/${encodeURIComponent(name)}`,
+      "_blank",
+      "noopener,noreferrer",
+    );
   };
 
   const [deletingName, setDeletingName] = useState<string | null>(null);

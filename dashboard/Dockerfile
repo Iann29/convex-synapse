@@ -15,6 +15,15 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ARG NEXT_PUBLIC_SYNAPSE_URL=http://localhost:8080
 ENV NEXT_PUBLIC_SYNAPSE_URL=$NEXT_PUBLIC_SYNAPSE_URL
+# NEXT_PUBLIC_CONVEX_DASHBOARD_URL is the URL where the OPEN-SOURCE
+# Convex Dashboard (the "data/functions/logs" UI for a single
+# deployment) is reachable. Synapse hosts it as a sibling service
+# in docker-compose; setup.sh wires this to http://<vps>:6791 (or
+# https://<domain>:6791 with TLS) so the "Open dashboard" button
+# generates a link operators can actually open from a remote browser.
+# Default targets a local-dev `docker run convex-dashboard` on 6791.
+ARG NEXT_PUBLIC_CONVEX_DASHBOARD_URL=http://localhost:6791
+ENV NEXT_PUBLIC_CONVEX_DASHBOARD_URL=$NEXT_PUBLIC_CONVEX_DASHBOARD_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
