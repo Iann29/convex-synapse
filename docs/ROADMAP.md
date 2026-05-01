@@ -148,10 +148,13 @@ behind it needs to land), so adding them is a runtime-only change.
   `replica_index ASC`. A 2s probe loop hitting `/api/check_admin_key`
   populates the column so the picker stabilises on the lease holder.
 
-## v1.0 — "Safe to depend on"
+## v1.0 — "Safe to depend on" 🚀 IN PROGRESS
 
 - [x] Audit log writer + reader (subset of cloud's vocabulary)
-- [ ] Custom domains with auto-TLS
+- [x] **Custom domains with auto-TLS** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Backend (PR #35) + installer (PR #36) both shipped; real-VPS smoke pending wildcard DNS setup. Subchunks:
+  - [x] Chunk 1 — `SYNAPSE_BASE_DOMAIN` config, `publicDeploymentURL` rewrite, proxy Host-header routing, `/v1/internal/tls_ask` endpoint. 14 new Go tests (139 → 146) (PR #35)
+  - [x] Chunk 2 — `setup.sh --base-domain=<host>`, env.tmpl, DNS preflight (`check_base_domain` synthetic-subdomain probe), Caddy global `on_demand_tls { ask }`, new `caddy.wildcard` template appended to standalone + host fragments. 7 new bats (266 → 273) (PR #36)
+  - [ ] Chunk 3 — dashboard polish: explain new URL form on the deployment row, success screen mentions custom-domain mode
 - [ ] Volume snapshot backups → S3
 - [ ] RBAC: project-level roles
 - [ ] OAuth/SSO via OIDC (works with Authentik, Zitadel, Keycloak)

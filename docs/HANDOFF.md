@@ -39,7 +39,7 @@ CLI auth) on infrastructure the operator controls.
 | ~~v0.6.4 (Cloud images marketplace)~~ | ❌ deprioritized 2026-05-01 |
 | **v1.0 (custom domains, S3 backup, RBAC, OIDC, K8s, Helm, API stability)** | 🚀 NEXT — your mission |
 
-Test counts: 266 bats + 139 Go integration + 24 Playwright e2e, all
+Test counts: 273 bats + 146 Go integration + 24 Playwright e2e, all
 green in CI on every push. shellcheck `-x` clean across 11 `.sh` files.
 
 A real Hetzner CPX22 has been running this code end-to-end through
@@ -108,7 +108,7 @@ Recommended order (operator can override):
 
 ## Real-VPS validation discipline
 
-CI (266 bats + 139 Go + 24 Playwright + compose build + shellcheck)
+CI (273 bats + 146 Go + 24 Playwright + compose build + shellcheck)
 runs on every push and is the **floor**, not the ceiling. The 13
 bugs caught during v0.6 all had green CI before real-VPS smoke
 surfaced them. Bug classes that bats and Go simply cannot see:
