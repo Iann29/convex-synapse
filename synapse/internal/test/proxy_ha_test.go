@@ -58,7 +58,7 @@ func TestProxy_HA_Failover(t *testing.T) {
 	}
 
 	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil))
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
 	t.Cleanup(srv.Close)
 
 	// Sanity: with both replicas alive the proxy lands on replica 0
@@ -110,7 +110,7 @@ func TestProxy_HA_NoReplicas(t *testing.T) {
 	}
 
 	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil))
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/d/no-rep-3300/api/anything")

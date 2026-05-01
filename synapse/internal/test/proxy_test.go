@@ -46,7 +46,7 @@ func TestProxy_ForwardsToResolvedAddress(t *testing.T) {
 	h.SeedDeployment(project.ID, "px-cat-1234", "dev", "running", false, owner.ID, port, "k")
 
 	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil))
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
 	t.Cleanup(srv.Close)
 
 	// GET /d/px-cat-1234/api/check_admin_key → upstream sees /api/check_admin_key
@@ -71,7 +71,7 @@ func TestProxy_ForwardsToResolvedAddress(t *testing.T) {
 func TestProxy_404OnMissingDeployment(t *testing.T) {
 	h := Setup(t)
 	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil))
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/d/does-not-exist/anything")
@@ -93,7 +93,7 @@ func TestProxy_404ForNonRunningDeployment(t *testing.T) {
 	h.SeedDeployment(project.ID, "down-fox-1234", "dev", "failed", false, owner.ID, 9999, "k")
 
 	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil))
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp, err := http.Get(srv.URL + "/d/down-fox-1234/api/check_admin_key")
@@ -145,5 +145,106 @@ func TestProxy_ResolverCaches(t *testing.T) {
 	got3, _ := resolver.Resolve(context.Background(), "cached-owl-1234")
 	if got3 != "127.0.0.1:5252" {
 		t.Errorf("post-invalidate: got %q; want 127.0.0.1:5252", got3)
+	}
+}
+
+// TestProxy_HostBasedRouting (v1.0+): when proxy.Handler is wired with
+// a baseDomain, requests where Host == "<name>.<base>" route to the
+// matching deployment using the request path verbatim — no /d/ prefix
+// required. This is the path Caddy takes after on-demand TLS for a
+// per-deployment subdomain.
+func TestProxy_HostBasedRouting(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Host Co")
+	project := createProject(t, h, owner.AccessToken, team.Slug, "Host Proj")
+
+	var hitPath, hitHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPath = r.URL.Path
+		hitHost = r.Host
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "http://"))
+	port, _ := strconv.Atoi(portStr)
+	h.SeedDeployment(project.ID, "host-fox-1234", "dev", "running", false, owner.ID, port, "k")
+
+	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, "synapse.example.com"))
+	t.Cleanup(srv.Close)
+
+	// Send a request with Host = "host-fox-1234.synapse.example.com" and
+	// path /api/check_admin_key (no /d/ prefix). Because httptest's URL
+	// is 127.0.0.1:<port>, we have to set Host on the *Request* directly.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/check_admin_key", nil)
+	req.Host = "host-fox-1234.synapse.example.com"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+	if hitPath != "/api/check_admin_key" {
+		t.Errorf("upstream path: got %q want /api/check_admin_key", hitPath)
+	}
+	_ = hitHost
+}
+
+// TestProxy_HostBased_NotFoundOutsideBase: when baseDomain is set but
+// Host doesn't match, fall through to path-based routing — and 404
+// when the path isn't /d/ either. Verifies the dispatch tree doesn't
+// accidentally swallow non-proxy requests.
+func TestProxy_HostBased_NotFoundOutsideBase(t *testing.T) {
+	h := Setup(t)
+	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, "synapse.example.com"))
+	t.Cleanup(srv.Close)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/random", nil)
+	req.Host = "evil.example.com"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestProxy_HostBased_PathStillWorks: with baseDomain configured,
+// internal /d/ path requests must STILL work — that's how compose-
+// network calls reach a deployment from the synapse-api process.
+func TestProxy_HostBased_PathStillWorks(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Both Co")
+	project := createProject(t, h, owner.AccessToken, team.Slug, "Both Proj")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok:" + r.URL.Path))
+	}))
+	t.Cleanup(upstream.Close)
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "http://"))
+	port, _ := strconv.Atoi(portStr)
+	h.SeedDeployment(project.ID, "both-fox-9999", "dev", "running", false, owner.ID, port, "k")
+
+	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
+	srv := httptest.NewServer(proxy.Handler(resolver, nil, "synapse.example.com"))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/d/both-fox-9999/version")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "ok:/version" {
+		t.Errorf("path-based with baseDomain set: status=%d body=%q", resp.StatusCode, body)
 	}
 }

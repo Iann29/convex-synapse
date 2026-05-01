@@ -141,3 +141,53 @@ func TestURLRewrite_HostPortMode(t *testing.T) {
 		t.Errorf("host-port mode URL: got %q want %q", got.DeploymentURL, want)
 	}
 }
+
+// TestURLRewrite_BaseDomain: BaseDomain set wins over PublicURL +
+// ProxyEnabled — deployment URLs become "https://<name>.<BaseDomain>".
+// This is the v1.0 custom-domains shape; with wildcard DNS + Caddy
+// on-demand TLS configured, Convex clients see a per-deployment
+// hostname instead of "<host>/d/<name>".
+func TestURLRewrite_BaseDomain(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "https://synapse.example.com",
+		ProxyEnabled: true,
+		BaseDomain:   "synapse.example.com",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Subdomain Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Subdomain Proj")
+	h.SeedDeployment(proj.ID, "bold-fox-1234", "dev", "running", true, owner.ID, 3242, "")
+
+	var got deploymentResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/bold-fox-1234", owner.AccessToken,
+		nil, http.StatusOK, &got)
+
+	want := "https://bold-fox-1234.synapse.example.com"
+	if got.DeploymentURL != want {
+		t.Errorf("BaseDomain URL: got %q want %q", got.DeploymentURL, want)
+	}
+}
+
+// TestURLRewrite_BaseDomain_NoOpForEmptyBase: BaseDomain unset keeps
+// the v0.6 path-based shape — pins the decision tree against future
+// refactors of publicDeploymentURL accidentally swapping branches.
+func TestURLRewrite_BaseDomain_NoOpForEmptyBase(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "https://synapse.example.com",
+		ProxyEnabled: true,
+		// BaseDomain intentionally empty
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Path Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Path Proj")
+	h.SeedDeployment(proj.ID, "calm-fox-2222", "dev", "running", true, owner.ID, 3299, "")
+
+	var got deploymentResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/calm-fox-2222", owner.AccessToken,
+		nil, http.StatusOK, &got)
+
+	want := "https://synapse.example.com/d/calm-fox-2222"
+	if got.DeploymentURL != want {
+		t.Errorf("BaseDomain empty falls back to path: got %q want %q", got.DeploymentURL, want)
+	}
+}

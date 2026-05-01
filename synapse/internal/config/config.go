@@ -74,6 +74,17 @@ type Config struct {
 	// shape, suitable for local dev.
 	PublicURL string
 
+	// BaseDomain (v1.0+) is the wildcard subdomain Synapse provisions
+	// per-deployment URLs under. When set, every emitted deployment
+	// URL becomes "https://<name>.<BaseDomain>" — the operator points
+	// "*.<BaseDomain>" DNS at the VPS and Caddy on-demand TLS issues
+	// per-host certs. Wins over PublicURL+ProxyEnabled (i.e. operators
+	// who configured both get the subdomain shape).
+	//
+	// Empty (default) → custom domains disabled; the path-based
+	// "<PublicURL>/d/<name>" form continues to work.
+	BaseDomain string
+
 	// HealthAutoRestart, when true, has the health worker call docker
 	// `start` on a deployment whose status just flipped to "stopped". A
 	// missing container is promoted to "failed" instead — restart loops
@@ -157,6 +168,7 @@ func Load() (*Config, error) {
 		AllowedOrigins:        getEnvDefault("SYNAPSE_ALLOWED_ORIGINS", "*"),
 		ProxyEnabled:          getEnvDefault("SYNAPSE_PROXY_ENABLED", "") == "true",
 		PublicURL:             strings.TrimRight(os.Getenv("SYNAPSE_PUBLIC_URL"), "/"),
+		BaseDomain:            strings.Trim(os.Getenv("SYNAPSE_BASE_DOMAIN"), ". "),
 		HealthAutoRestart:     getEnvDefault("SYNAPSE_HEALTH_AUTO_RESTART", "") == "true",
 
 		HAEnabled:             getEnvDefault("SYNAPSE_HA_ENABLED", "") == "true",

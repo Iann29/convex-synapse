@@ -57,6 +57,15 @@ type DeploymentsHandler struct {
 	PublicURL    string
 	ProxyEnabled bool
 
+	// BaseDomain (v1.0+) is the wildcard subdomain Synapse provisions
+	// per-deployment URLs under: when set, deployment URLs become
+	// "https://<name>.<BaseDomain>" instead of "<PublicURL>/d/<name>".
+	// Operator points DNS at "*.<BaseDomain>" → VPS IP and Caddy on-
+	// demand TLS issues per-host certs as Convex clients connect.
+	// Empty disables custom domains; the legacy /d/<name>/* path keeps
+	// working either way (the proxy handler accepts both).
+	BaseDomain string
+
 	// HA carries cluster-wide HA defaults. Empty when HA isn't enabled
 	// — the handler refuses requests that ask for ha:true in that case.
 	HA HAConfig
@@ -76,14 +85,27 @@ type DeploymentsHandler struct {
 // but useless from outside the host.
 //
 // Decision matrix:
+//   - BaseDomain set (any other flag)      → "https://<name>.<BaseDomain>"
 //   - PublicURL empty                      → return d.DeploymentURL (legacy)
 //   - PublicURL set, ProxyEnabled true     → "<PublicURL>/d/<name>"
 //   - PublicURL set, ProxyEnabled false    → "<PublicURL>:<host_port>"
 //
 // Adopted deployments keep d.DeploymentURL — the operator already
 // supplied a public URL when they registered it.
+//
+// BaseDomain wins over the path-based shape because if the operator
+// took the trouble to wire wildcard DNS + on-demand TLS, they want
+// Convex clients to see "<name>.<host>" — not "<host>/d/<name>"
+// which the dashboard's Convex Cloud-style UX assumes is the URL
+// scheme.
 func (h *DeploymentsHandler) publicDeploymentURL(d *models.Deployment) string {
-	if h.PublicURL == "" || d.Adopted {
+	if d.Adopted {
+		return d.DeploymentURL
+	}
+	if h.BaseDomain != "" {
+		return "https://" + d.Name + "." + h.BaseDomain
+	}
+	if h.PublicURL == "" {
 		return d.DeploymentURL
 	}
 	if h.ProxyEnabled {
