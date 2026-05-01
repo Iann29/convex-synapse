@@ -666,7 +666,9 @@ POSTGRES_USER=synapse
 POSTGRES_DB=synapse
 EOF
     : >"$stage/docker-compose.yml"
-    : >"$stage/synapse.sql.gz"
+    # A real (if empty-content) gzip blob — `: > file` produces 0
+    # bytes, which gunzip rejects with "invalid magic".
+    printf 'SELECT 1;\n' | gzip >"$stage/synapse.sql.gz"
     tar czf "$archive" -C "$stage" .
 
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
@@ -719,7 +721,9 @@ POSTGRES_USER=synapse
 POSTGRES_DB=synapse
 EOF
     : >"$stage/docker-compose.yml"
-    : >"$stage/synapse.sql.gz"
+    # A real (if empty-content) gzip blob — `: > file` produces 0
+    # bytes, which gunzip rejects with "invalid magic".
+    printf 'SELECT 1;\n' | gzip >"$stage/synapse.sql.gz"
     tar czf "$archive" -C "$stage" .
 
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
