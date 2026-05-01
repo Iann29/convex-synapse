@@ -377,3 +377,360 @@ lifecycle::_rollback() {
     ui::warn "Rollback applied — inspect with:"
     ui::warn "  docker compose -f $install_dir/docker-compose.yml logs --tail=200"
 }
+
+# ====================================================================
+# Backup / Restore (v0.6.1 chunk 2)
+# ====================================================================
+#
+# A backup captures everything an operator needs to rebuild a Synapse
+# install from scratch:
+#
+#   synapse-backup-YYYYMMDD-HHMMSS.tar.gz
+#   ├── manifest.json        timestamp, version, volume names, env_included
+#   ├── .env                 secrets (operator can pass --exclude-env)
+#   ├── docker-compose.yml   the compose file used at backup time
+#   ├── synapse.sql.gz       pg_dump --clean --if-exists of metadata DB
+#   └── volumes/
+#       └── synapse-data-*.tar.gz   one tarball per per-deployment volume
+#
+# Restore is the reverse: down → wipe + restore volumes → wipe pgdata
+# → up postgres → psql in dump → up rest → wait /health.
+
+LIFECYCLE_BACKUP_BUSYBOX_IMAGE="${LIFECYCLE_BACKUP_BUSYBOX_IMAGE:-busybox:stable}"
+
+# lifecycle::backup <install_dir> [--out=<path>] [--exclude-env]
+# Returns 0 + prints the archive path on success, 2 on failure.
+lifecycle::backup() {
+    local _stage_path=""
+    local rc=0
+    lifecycle::_backup_inner "$@" stage_var=_stage_path || rc=$?
+    if [[ -n "$_stage_path" && -d "$_stage_path" ]]; then
+        rm -rf "$_stage_path"
+    fi
+    return $rc
+}
+
+lifecycle::_backup_inner() {
+    local install_dir="$1"
+    shift
+    local out_path="" exclude_env=0 stage_var=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --out=*)        out_path="${1#*=}" ;;
+            --out)          out_path="${2:-}"; shift ;;
+            --exclude-env)  exclude_env=1 ;;
+            stage_var=*)    stage_var="${1#*=}" ;;
+        esac
+        shift
+    done
+
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+    local backup_log="$install_dir/backup.log"
+
+    if [[ ! -f "$env_file" || ! -f "$compose_file" ]]; then
+        ui::fail "no Synapse install at $install_dir (.env or docker-compose.yml missing)"
+        return 2
+    fi
+
+    # Default output path: $INSTALL_DIR/backups/synapse-backup-<ts>.tar.gz
+    local ts
+    ts="$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%s)"
+    if [[ -z "$out_path" ]]; then
+        local prefix=""
+        prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+        $prefix mkdir -p "$install_dir/backups"
+        out_path="$install_dir/backups/synapse-backup-${ts}.tar.gz"
+    fi
+
+    ui::step "Synapse backup"
+    ui::info "Install dir: $install_dir"
+    ui::info "Output: $out_path"
+
+    local stage
+    stage="$(mktemp -d 2>/dev/null || mktemp -d -t synapse-backup)"
+    if [[ -n "$stage_var" ]]; then
+        printf -v "$stage_var" '%s' "$stage"
+    fi
+    mkdir -p "$stage/volumes"
+
+    # 1. Copy .env (unless --exclude-env) and docker-compose.yml.
+    if (( ! exclude_env )); then
+        cp "$env_file" "$stage/.env"
+    fi
+    cp "$compose_file" "$stage/docker-compose.yml"
+
+    # 2. pg_dump the metadata DB. Read POSTGRES_USER/DB from .env so we
+    #    don't hardcode "synapse"; operators may have customized.
+    local pg_user pg_db
+    pg_user="$(secrets::env_get "$env_file" POSTGRES_USER)"
+    pg_db="$(secrets::env_get "$env_file" POSTGRES_DB)"
+    pg_user="${pg_user:-synapse}"
+    pg_db="${pg_db:-synapse}"
+
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+    # `set -o pipefail` so the pipeline returns pg_dump's exit code,
+    # not gzip's (gzip succeeds on an empty pipe and would mask a
+    # postgres-down failure as a green backup).
+    if ! ui::spin "Dumping metadata database ($pg_db)" \
+            bash -c "set -o pipefail; '$docker_cmd' exec synapse-postgres pg_dump -U '$pg_user' -d '$pg_db' --clean --if-exists | gzip > '$stage/synapse.sql.gz'"; then
+        ui::fail "pg_dump failed — is synapse-postgres running?"
+        return 2
+    fi
+
+    # 3. Tar each per-deployment volume via a busybox sidecar. We use
+    #    busybox so the host doesn't need tar; the volume is mounted
+    #    read-only so live deployments can't corrupt the snapshot
+    #    mid-stream.
+    local volumes=()
+    while IFS= read -r vol; do
+        if [[ -n "$vol" ]]; then
+            volumes+=("$vol")
+        fi
+    done < <("$docker_cmd" volume ls -q 2>/dev/null | grep -E '^synapse-data-' || true)
+
+    local vol
+    for vol in "${volumes[@]}"; do
+        if ! ui::spin "Archiving volume $vol" \
+                "$docker_cmd" run --rm \
+                    -v "$vol:/source:ro" \
+                    -v "$stage/volumes:/dest" \
+                    "$LIFECYCLE_BACKUP_BUSYBOX_IMAGE" \
+                    tar czf "/dest/$vol.tar.gz" -C /source .; then
+            ui::warn "skipped $vol (tar failed)"
+        fi
+    done
+
+    # 4. Manifest. Plain text key=value to keep it grep-able from the
+    #    operator's terminal without needing jq. JSON would be nice
+    #    but the dependencies aren't worth it for this footprint.
+    {
+        printf 'format=synapse-backup-v1\n'
+        printf 'timestamp=%s\n' "$ts"
+        printf 'version=%s\n' "$(secrets::env_get "$env_file" SYNAPSE_VERSION)"
+        printf 'env_included=%s\n' "$(( exclude_env == 0 ))"
+        printf 'volume_count=%s\n' "${#volumes[@]}"
+        local v
+        for v in "${volumes[@]}"; do
+            printf 'volume=%s\n' "$v"
+        done
+    } > "$stage/manifest.txt"
+
+    # 5. tar everything into the final archive.
+    local prefix=""
+    prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+    $prefix mkdir -p "$(dirname "$out_path")"
+    if ! ui::spin "Bundling archive" \
+            tar czf "$out_path" -C "$stage" .; then
+        ui::fail "tar of staging dir failed"
+        return 2
+    fi
+
+    local size
+    size="$(du -h "$out_path" 2>/dev/null | awk '{print $1}')"
+    lifecycle::log "$backup_log" "backup created: $out_path ($size)"
+
+    ui::success "Backup ready: $out_path ($size, ${#volumes[@]} volume(s))"
+    return 0
+}
+
+# lifecycle::restore <install_dir> <archive_path> [--keep-env] [--non-interactive]
+# Wipe per-deployment volumes + pgdata, restore from archive, bring
+# stack back up. Requires the archive's manifest to validate. Returns
+# 0 on success, 2 on failure.
+lifecycle::restore() {
+    local _stage_path=""
+    local rc=0
+    lifecycle::_restore_inner "$@" stage_var=_stage_path || rc=$?
+    if [[ -n "$_stage_path" && -d "$_stage_path" ]]; then
+        rm -rf "$_stage_path"
+    fi
+    return $rc
+}
+
+lifecycle::_restore_inner() {
+    local install_dir="$1"
+    local archive_path="$2"
+    shift 2
+    local keep_env=0 non_interactive=0 stage_var=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --keep-env)        keep_env=1 ;;
+            --non-interactive) non_interactive=1 ;;
+            stage_var=*)       stage_var="${1#*=}" ;;
+        esac
+        shift
+    done
+
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+    local restore_log="$install_dir/restore.log"
+
+    if [[ ! -f "$env_file" || ! -f "$compose_file" ]]; then
+        ui::fail "no Synapse install at $install_dir"
+        return 2
+    fi
+    if [[ ! -f "$archive_path" ]]; then
+        ui::fail "archive not found: $archive_path"
+        return 2
+    fi
+
+    ui::step "Synapse restore"
+    ui::info "Install dir: $install_dir"
+    ui::info "Archive: $archive_path"
+
+    # 1. Stage the archive contents.
+    local stage
+    stage="$(mktemp -d 2>/dev/null || mktemp -d -t synapse-restore)"
+    if [[ -n "$stage_var" ]]; then
+        printf -v "$stage_var" '%s' "$stage"
+    fi
+
+    if ! tar xzf "$archive_path" -C "$stage" 2>/dev/null; then
+        ui::fail "archive could not be extracted (corrupt or wrong format?)"
+        return 2
+    fi
+    if [[ ! -f "$stage/manifest.txt" ]]; then
+        ui::fail "archive missing manifest.txt — not a Synapse backup"
+        return 2
+    fi
+
+    # Validate format token.
+    local format
+    format="$(grep '^format=' "$stage/manifest.txt" | head -n1 | cut -d= -f2-)"
+    if [[ "$format" != "synapse-backup-v1" ]]; then
+        ui::fail "unsupported backup format: '$format' (expected synapse-backup-v1)"
+        return 2
+    fi
+
+    local ts version vol_count
+    ts="$(grep '^timestamp=' "$stage/manifest.txt" | head -n1 | cut -d= -f2-)"
+    version="$(grep '^version=' "$stage/manifest.txt" | head -n1 | cut -d= -f2-)"
+    vol_count="$(grep -c '^volume=' "$stage/manifest.txt" || true)"
+    ui::info "Backup timestamp: ${ts:-unknown}"
+    ui::info "Backup version: ${version:-unknown}"
+    ui::info "Backup volumes: $vol_count"
+
+    if (( ! non_interactive )); then
+        printf 'This will WIPE current synapse-data-* volumes and pgdata. Continue? [y/N] ' >&2
+        local reply=""
+        read -r reply || true
+        if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
+            ui::warn "aborted by operator"
+            return 1
+        fi
+    fi
+
+    lifecycle::log "$restore_log" "restore start: archive=$archive_path"
+
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+    local pg_user pg_db
+    pg_user="$(secrets::env_get "$env_file" POSTGRES_USER)"
+    pg_db="$(secrets::env_get "$env_file" POSTGRES_DB)"
+    pg_user="${pg_user:-synapse}"
+    pg_db="${pg_db:-synapse}"
+
+    # 2. Stop everything: compose stack AND synapse-managed deployment
+    #    containers (which mount the synapse-data-* volumes — they'd
+    #    block the volume rm otherwise).
+    ui::spin "Stopping synapse-managed deployment containers" \
+        bash -c "ids=\$('$docker_cmd' ps -aq --filter label=synapse.managed=true 2>/dev/null); if [[ -n \"\$ids\" ]]; then '$docker_cmd' rm -f \$ids >/dev/null 2>&1; fi; true"
+
+    if ! ui::spin "Stopping compose stack" \
+            "$docker_cmd" compose -f "$compose_file" down; then
+        ui::fail "compose down failed"
+        return 2
+    fi
+
+    # 3. Restore .env (unless --keep-env). The current .env stays put
+    #    if the operator opted out — useful when the archive holds
+    #    secrets they've since rotated.
+    if (( ! keep_env )) && [[ -f "$stage/.env" ]]; then
+        local prefix=""
+        prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+        $prefix cp "$stage/.env" "$env_file"
+        $prefix chmod 0600 "$env_file"
+        ui::success ".env restored from archive"
+    fi
+
+    # 4. For each volume tarball in the archive, wipe + recreate the
+    #    Docker volume + extract via busybox sidecar.
+    if [[ -d "$stage/volumes" ]]; then
+        local vol_archive vol
+        for vol_archive in "$stage/volumes"/*.tar.gz; do
+            [[ -e "$vol_archive" ]] || continue
+            vol="$(basename "$vol_archive" .tar.gz)"
+            "$docker_cmd" volume rm "$vol" >/dev/null 2>&1 || true
+            "$docker_cmd" volume create "$vol" >/dev/null 2>&1 || true
+            if ! ui::spin "Restoring volume $vol" \
+                    "$docker_cmd" run --rm \
+                        -v "$vol:/dest" \
+                        -v "$stage/volumes:/src:ro" \
+                        "$LIFECYCLE_BACKUP_BUSYBOX_IMAGE" \
+                        tar xzf "/src/$(basename "$vol_archive")" -C /dest; then
+                ui::warn "could not restore $vol"
+            fi
+        done
+    fi
+
+    # 5. Wipe pgdata so postgres comes up empty, ready to accept the
+    #    pg_dump replay. The volume name follows compose's
+    #    `<project>_<volume>` rule; the project name is the dir
+    #    basename of $compose_file's parent.
+    local project_name
+    project_name="$(basename "$install_dir")"
+    local pgdata_vol="${project_name}_synapse-pgdata"
+    "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+
+    # 6. Bring postgres up alone, wait for it, then pipe the dump in.
+    if ! ui::spin "Starting postgres" \
+            "$docker_cmd" compose -f "$compose_file" up -d postgres; then
+        ui::fail "compose up postgres failed"
+        return 2
+    fi
+    # pg_isready loop with a 60s budget. The `docker exec` returns
+    # non-zero when not ready, which we soak via the until.
+    local pg_ready=0
+    local elapsed=0
+    while (( elapsed < 60 )); do
+        if "$docker_cmd" exec synapse-postgres pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+            pg_ready=1
+            break
+        fi
+        sleep 1
+        elapsed=$(( elapsed + 1 ))
+    done
+    if (( ! pg_ready )); then
+        ui::fail "postgres didn't become ready in 60s"
+        return 2
+    fi
+
+    if [[ -f "$stage/synapse.sql.gz" ]]; then
+        if ! ui::spin "Replaying metadata dump" \
+                bash -c "gunzip -c '$stage/synapse.sql.gz' | '$docker_cmd' exec -i synapse-postgres psql -U '$pg_user' -d '$pg_db' -q -v ON_ERROR_STOP=1 >/dev/null 2>&1"; then
+            ui::fail "psql replay failed — DB is in a partial state, inspect manually"
+            return 2
+        fi
+    else
+        ui::warn "no synapse.sql.gz in archive — skipping DB restore"
+    fi
+
+    # 7. Bring the rest of the stack up.
+    if ! ui::spin "Starting full stack" \
+            "$docker_cmd" compose -f "$compose_file" up -d; then
+        ui::fail "compose up failed"
+        return 2
+    fi
+
+    local synapse_port
+    synapse_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
+    synapse_port="${synapse_port:-8080}"
+    if ! compose::wait_healthy "http://localhost:$synapse_port/health" 120; then
+        ui::fail "Synapse didn't become healthy in 120s after restore"
+        return 2
+    fi
+
+    ui::success "Restore complete from $archive_path"
+    lifecycle::log "$restore_log" "restore success: archive=$archive_path"
+    return 0
+}

@@ -99,6 +99,15 @@ Options:
                              if no releases exist yet).
     --force                  Skip the "already on latest" short-circuit
                              during --upgrade.
+    --backup                 Snapshot the install (.env + compose +
+                             pg_dump + per-deployment volumes) into a
+                             timestamped tarball.
+    --out=<path>             Output path for --backup. Default:
+                             \$INSTALL_DIR/backups/synapse-backup-<ts>.tar.gz
+    --exclude-env            Skip .env in --backup (no secrets in tarball).
+    --restore=<archive>      Wipe + restore from a backup tarball.
+    --keep-env               During --restore, keep the current .env
+                             instead of replacing it from the archive.
     --doctor                 Run preflight + status checks against an
                              existing install; no mutations.
     --uninstall              Remove the install + containers; preserves
@@ -125,6 +134,11 @@ parse_flags() {
     UPGRADE=0
     UPGRADE_REF=""
     FORCE=0
+    BACKUP=0
+    BACKUP_OUT=""
+    EXCLUDE_ENV=0
+    RESTORE_ARCHIVE=""
+    KEEP_ENV=0
     UNINSTALL=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
@@ -138,6 +152,11 @@ parse_flags() {
             --upgrade)         UPGRADE=1 ;;
             --ref=*)           UPGRADE_REF="${1#*=}" ;;
             --force)           FORCE=1 ;;
+            --backup)          BACKUP=1 ;;
+            --out=*)           BACKUP_OUT="${1#*=}" ;;
+            --exclude-env)     EXCLUDE_ENV=1 ;;
+            --restore=*)       RESTORE_ARCHIVE="${1#*=}" ;;
+            --keep-env)        KEEP_ENV=1 ;;
             --doctor)          DOCTOR=1 ;;
             --uninstall)       UNINSTALL=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
@@ -572,6 +591,36 @@ main() {
             up_args+=(--force)
         fi
         lifecycle::upgrade "$INSTALL_DIR" "${up_args[@]}"
+        exit $?
+    fi
+    if (( BACKUP )); then
+        if [[ -w "$(dirname "$LOG_FILE")" ]]; then
+            exec > >(tee -a "$LOG_FILE") 2>&1
+        fi
+        source_libs
+        local bk_args=()
+        if [[ -n "$BACKUP_OUT" ]]; then
+            bk_args+=(--out="$BACKUP_OUT")
+        fi
+        if (( EXCLUDE_ENV )); then
+            bk_args+=(--exclude-env)
+        fi
+        lifecycle::backup "$INSTALL_DIR" "${bk_args[@]}"
+        exit $?
+    fi
+    if [[ -n "$RESTORE_ARCHIVE" ]]; then
+        if [[ -w "$(dirname "$LOG_FILE")" ]]; then
+            exec > >(tee -a "$LOG_FILE") 2>&1
+        fi
+        source_libs
+        local rs_args=()
+        if (( KEEP_ENV )); then
+            rs_args+=(--keep-env)
+        fi
+        if [[ -n "${SYNAPSE_NON_INTERACTIVE:-}" ]]; then
+            rs_args+=(--non-interactive)
+        fi
+        lifecycle::restore "$INSTALL_DIR" "$RESTORE_ARCHIVE" "${rs_args[@]}"
         exit $?
     fi
     if (( UNINSTALL )); then
