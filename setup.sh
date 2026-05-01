@@ -754,9 +754,30 @@ Next steps:
 Useful commands:
   $INSTALL_DIR/setup.sh --doctor       — re-run health checks
   $INSTALL_DIR/setup.sh --upgrade      — pull the latest release + restart
+  $INSTALL_DIR/setup.sh --status       — diagnostic snapshot
   docker compose -f $INSTALL_DIR/docker-compose.yml logs -f synapse
 
 EOF
+    # When custom domains are enabled, the operator MUST have wildcard
+    # DNS pointed at this VPS for Caddy on-demand TLS to issue certs.
+    # The DNS preflight already warned them if the wildcard isn't
+    # resolving, but a reminder at the end of the install (when the
+    # success state is fresh) is the cheapest insurance against
+    # "I created a deployment, the URL doesn't load" support tickets.
+    if [[ -n "${BASE_DOMAIN:-}" ]]; then
+        local stripped="${BASE_DOMAIN#.}"
+        cat <<EOF
+Custom domains enabled (v1.0):
+  Each provisioned deployment becomes a dedicated subdomain:
+    https://<deployment-name>.${stripped}
+
+  ⚠ DNS:  *.${stripped} A record must point at this VPS
+          (Caddy can't issue Let's Encrypt certs until it resolves)
+  Probe:  dig +short probe-test.${stripped}
+          # should return this VPS's public IP
+
+EOF
+    fi
 }
 
 # main ----------------------------------------------------------------

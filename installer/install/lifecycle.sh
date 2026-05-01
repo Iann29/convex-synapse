@@ -1041,13 +1041,17 @@ lifecycle::status() {
     local openssl_cmd="${LIFECYCLE_OPENSSL:-openssl}"
     local df_cmd="${LIFECYCLE_DF:-df}"
 
-    # ---- Version + Public URL (.env values) -----------------------
-    local version public_url
+    # ---- Version + Public URL + Custom domains (.env values) ------
+    local version public_url base_domain
     version="$(secrets::env_get "$env_file" SYNAPSE_VERSION)"
     public_url="$(secrets::env_get "$env_file" SYNAPSE_PUBLIC_URL)"
+    base_domain="$(secrets::env_get "$env_file" SYNAPSE_BASE_DOMAIN)"
     ui::info ""
     ui::info "$(printf '%-22s %s' "Version" "${version:-unknown}")"
     ui::info "$(printf '%-22s %s' "Public URL" "${public_url:-(unset — local-only)}")"
+    if [[ -n "$base_domain" ]]; then
+        ui::info "$(printf '%-22s %s' "Custom domains" "*.${base_domain} (v1.0)")"
+    fi
 
     # ---- Compose stack containers ---------------------------------
     ui::info ""
