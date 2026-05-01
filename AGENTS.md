@@ -209,6 +209,24 @@ probe the dashboard uses pre-login to decide between `/login` and
   uses `POST /<resource>/delete` (not HTTP `DELETE`) — verify::_curl
   with `-X DELETE` 4xx's silently because `curl -f` is on.
 
+## v1.0 ground rules (custom domains)
+
+`SYNAPSE_BASE_DOMAIN=<host>` enables per-deployment subdomains
+(`<name>.<host>` instead of the path-based `<host>/d/<name>/`).
+Caddy on-demand TLS issues per-host certs lazily; the
+`/v1/internal/tls_ask` endpoint gates issuance on real, non-deleted
+deployments so attackers can't burn Let's Encrypt quota.
+
+- **Every new `SYNAPSE_*` env var needs THREE wire-up points** (see PR #25 + #38):
+  1. `installer/templates/env.tmpl` — operator-facing, what they see in `.env`
+  2. `docker-compose.yml` synapse service `environment:` block — container-facing, what reaches the binary
+  3. `synapse/internal/config/config.go` — Go-facing, what `cfg.X` reads
+  Skipping (2) is the bug both PR #25 and PR #38 fixed: the var lives in `.env` (compose variable expansion works fine) but never reaches the running container, so `cfg.X == ""` despite the value being right there in the file. Integration tests can mask this because they wire the field directly via `SetupOpts`. **Real-VPS smoke is the only guard.**
+- **Multi-segment chi routes** want `r.Route("/parent", func(r) { r.Method(GET, "/child", h) })` instead of `r.Method(GET, "/parent/child", h)` — the latter probably works (route registers and the handler runs) but the nested form is the chi idiom and matches the rest of `router.go`.
+- **`tls_ask` returns 200 only when**: BaseDomain is set AND the asked-about host is `<sub>.<BaseDomain>` (case-insensitive) AND `<sub>` is a single label AND `<sub>` is a real, non-deleted deployment. Anything else is a non-200 so Caddy refuses cert issuance.
+- **Proxy.Handler dispatches by Host first, path fallback second.** When `baseDomain` is non-empty AND `r.Host` matches `<sub>.<base>`, route by leftmost label using `r.URL.Path` verbatim. Otherwise fall through to `/d/<name>/...` — internal compose-network calls keep working with the path form even when custom domains are enabled cluster-wide.
+- **`adopted` deployments keep their operator-supplied URL** even when BaseDomain is set. They live outside Synapse's DNS scope; rewriting would break the operator's existing setup.
+
 ## URL rewrite contract (PR #10 + #24)
 
 Every endpoint that returns a `models.Deployment` (raw or wrapped)
