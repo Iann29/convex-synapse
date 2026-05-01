@@ -31,7 +31,9 @@ setup() {
     run "$SETUP" --version
     assert_success
     assert_output --partial "synapse-installer"
-    assert_output --partial "0.6.0"
+    # Match X.Y.Z without pinning to a specific value — tracking
+    # INSTALLER_VERSION here just creates churn on every release.
+    assert_output --regexp '[0-9]+\.[0-9]+\.[0-9]+'
 }
 
 @test "setup.sh --help: lists every flag" {
@@ -52,16 +54,24 @@ setup() {
 
 # ---- not-yet-implemented flags fail explicitly ---------------------
 
-@test "setup.sh --upgrade: exit 2 with 'not yet implemented'" {
-    run --separate-stderr "$SETUP" --upgrade
-    assert_failure 2
-    [[ "$stderr" == *"not yet implemented"* ]]
-}
-
 @test "setup.sh --uninstall: exit 2 with 'not yet implemented'" {
     run --separate-stderr "$SETUP" --uninstall
     assert_failure 2
     [[ "$stderr" == *"not yet implemented"* ]]
+}
+
+# ---- --upgrade flag wiring -----------------------------------------
+#
+# The full --upgrade flow is exercised in lifecycle.bats with mocked
+# git/docker. Here we only confirm the flag is parsed and the
+# missing-install error message reaches the operator.
+
+@test "setup.sh --upgrade: complains when install dir has no .env" {
+    local fake_dir="$BATS_TEST_TMPDIR/empty-install"
+    mkdir -p "$fake_dir"
+    run "$SETUP" --upgrade --install-dir="$fake_dir"
+    assert_failure 2
+    assert_output --partial "no .env"
 }
 
 # ---- source-mode probing -------------------------------------------

@@ -134,6 +134,40 @@ EOF
     assert_output "keep-me"
 }
 
+@test "set_env_var: existing non-empty value FORCE-OVERWRITTEN (the whole point)" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.0
+KEEPME=intact
+EOF
+    secrets::set_env_var "$ENV_FILE" SYNAPSE_VERSION 0.6.1
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "0.6.1"
+    run secrets::env_get "$ENV_FILE" KEEPME
+    assert_output "intact"
+}
+
+@test "set_env_var: missing key -> appended" {
+    cat >"$ENV_FILE" <<EOF
+FOO=bar
+EOF
+    secrets::set_env_var "$ENV_FILE" SYNAPSE_VERSION 0.6.1
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "0.6.1"
+    run secrets::env_get "$ENV_FILE" FOO
+    assert_output "bar"
+}
+
+@test "set_env_var: missing file -> created with mode 0600" {
+    local f="$BATS_TEST_TMPDIR/fresh.env"
+    secrets::set_env_var "$f" SYNAPSE_VERSION 0.6.1
+    [ -f "$f" ]
+    run secrets::env_get "$f" SYNAPSE_VERSION
+    assert_output "0.6.1"
+    local mode
+    mode="$(stat -c %a "$f")"
+    [[ "$mode" == "600" ]]
+}
+
 @test "ensure_env_var: existing non-empty value PRESERVED (never overwrite)" {
     cat >"$ENV_FILE" <<EOF
 SYNAPSE_JWT_SECRET=keep-this-existing-secret

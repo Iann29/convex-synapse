@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="0.6.0"
+readonly INSTALLER_VERSION="0.6.1"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"
@@ -91,8 +91,14 @@ Options:
                              preflight (useful when DNS hasn't
                              propagated yet).
     --non-interactive        Disable all prompts. Implies sane defaults.
-    --upgrade                Run the upgrade flow (git pull + compose
-                             pull + restart). NOT YET IMPLEMENTED.
+    --upgrade                Upgrade an existing install: clone the
+                             target ref, rebuild, restart, on failure
+                             roll back to the previous images.
+    --ref=<git-ref>          Target branch or tag for --upgrade.
+                             Default: latest GitHub release (or 'main'
+                             if no releases exist yet).
+    --force                  Skip the "already on latest" short-circuit
+                             during --upgrade.
     --doctor                 Run preflight + status checks against an
                              existing install; no mutations.
     --uninstall              Remove the install + containers; preserves
@@ -117,6 +123,8 @@ parse_flags() {
     SKIP_DNS=0
     DOCTOR=0
     UPGRADE=0
+    UPGRADE_REF=""
+    FORCE=0
     UNINSTALL=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
@@ -128,6 +136,8 @@ parse_flags() {
             --skip-dns-check)  SKIP_DNS=1 ;;
             --non-interactive) export SYNAPSE_NON_INTERACTIVE=1 ;;
             --upgrade)         UPGRADE=1 ;;
+            --ref=*)           UPGRADE_REF="${1#*=}" ;;
+            --force)           FORCE=1 ;;
             --doctor)          DOCTOR=1 ;;
             --uninstall)       UNINSTALL=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
@@ -177,6 +187,8 @@ source_libs() {
     . "$HERE/installer/install/compose.sh"
     # shellcheck source=installer/install/verify.sh
     . "$HERE/installer/install/verify.sh"
+    # shellcheck source=installer/install/lifecycle.sh
+    . "$HERE/installer/install/lifecycle.sh"
 }
 
 # Phases -------------------------------------------------------------
@@ -525,7 +537,7 @@ Next steps:
 
 Useful commands:
   $INSTALL_DIR/setup.sh --doctor       — re-run health checks
-  $INSTALL_DIR/setup.sh --upgrade      — pull the latest version (TODO)
+  $INSTALL_DIR/setup.sh --upgrade      — pull the latest release + restart
   docker compose -f $INSTALL_DIR/docker-compose.yml logs -f synapse
 
 EOF
@@ -546,8 +558,21 @@ main() {
     fi
 
     if (( UPGRADE )); then
-        echo "--upgrade is not yet implemented (v0.6.1)" >&2
-        exit 2
+        # Mirror tee-to-log only AFTER we know we're upgrading — a
+        # bare --version / --help call shouldn't create a dangling log.
+        if [[ -w "$(dirname "$LOG_FILE")" ]]; then
+            exec > >(tee -a "$LOG_FILE") 2>&1
+        fi
+        source_libs
+        local up_args=()
+        if [[ -n "$UPGRADE_REF" ]]; then
+            up_args+=(--ref="$UPGRADE_REF")
+        fi
+        if (( FORCE )); then
+            up_args+=(--force)
+        fi
+        lifecycle::upgrade "$INSTALL_DIR" "${up_args[@]}"
+        exit $?
     fi
     if (( UNINSTALL )); then
         echo "--uninstall is not yet implemented (v0.6.1)" >&2
