@@ -34,13 +34,14 @@ talks to Synapse with the same shape Cloud uses.
 | `synapse/internal/test/` | Integration test suite (`Setup(t)` / `SetupHA(t)` harness + per-resource `_test.go`). Package: `synapsetest` |
 | `synapse/internal/db/migrations/` | `go:embed`'d SQL migrations applied at startup. Currently 6 migrations (init, jobs, adopted, replicas, replica_id on jobs, upgrade_to_ha kind) |
 | `dashboard/` | Next.js 16 + Tailwind 4 dashboard. Real pages, not a placeholder. HA toggle + `HA ×N` badge on deployments since v0.5 |
-| `dashboard/tests/` | Playwright e2e (20 specs) — runs against live compose stack |
-| `setup.sh` | v0.6 auto-installer entry point. `main()` wrapper for curl-pipe-shell safety, ERR/EXIT traps, flock single-instance, full CLI flag surface |
+| `dashboard/tests/` | Playwright e2e (24 specs) — runs against live compose stack |
+| `dashboard/app/setup/` | v0.6.3 first-run wizard. `/login` redirects here when `/v1/install_status` reports `firstRun=true` |
+| `setup.sh` | v0.6 auto-installer entry point. `main()` wrapper for curl-pipe-shell safety, bootstrap re-exec under `curl \| bash`, ERR/EXIT traps, flock single-instance, full CLI flag surface (install + lifecycle) |
 | `installer/lib/` | Pure-bash detection helpers (detect:: namespace) — OS, arch, pkg manager, sudo, has_*, disk/RAM, public_ip |
-| `installer/install/` | Phase scripts the orchestrator composes (preflight, secrets, caddy, compose, verify, ui) |
+| `installer/install/` | Phase scripts the orchestrator composes (preflight, secrets, caddy, compose, verify, ui) + `lifecycle.sh` (upgrade / backup / restore / uninstall / logs / status) |
 | `installer/templates/` | env.tmpl + caddy.fragment + caddy.standalone — rendered with `{{KEY}}` substitution from exported env vars |
-| `installer/test/` | bats unit tests (~211 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
-| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION |
+| `installer/test/` | bats unit tests (266 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
+| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION, HANDOFF |
 | `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile (backend-postgres + minio) and `caddy` profile (TLS reverse proxy) |
 | `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |
 | `.vps/` | **gitignored** — synapse-test VPS credentials + private SSH key. NEVER commit |
@@ -65,9 +66,9 @@ docker rm -f $(docker ps -aq --filter label=synapse.managed=true)
 docker volume ls -q --filter name=synapse-data- | xargs -r docker volume rm
 
 # Tests
-cd synapse && go test ./... -count=1            # ~18s, integration (136 tests)
-cd dashboard && npx playwright test             # ~1.5min, against live stack
-docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/   # bats (211)
+cd synapse && go test ./... -count=1            # ~18s, integration (139 tests)
+cd dashboard && npx playwright test             # ~2.5min, against live stack (24 specs)
+docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/   # bats (266)
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x setup.sh installer/lib/*.sh installer/install/*.sh
 
 # Real-VPS smoke test (when changes affect setup.sh / compose / Go API surface)
@@ -202,6 +203,8 @@ If you're tempted to add one, move it to the roadmap and discuss first.
 | **Public URL rewrite (PR #10 + #23/#24/#25)**: `/auth`, `/cli_credentials`, `getDeployment`, `getProjectDeployment`, both `listDeployments`, `createDeployment`, `adoptDeployment` all return rewritten URLs (`<PublicURL>/d/<name>` or `<PublicURL>:<port>`) so remote browsers/CLIs reach a working address | `internal/api/deployments.go::publicDeploymentURL` |
 | **Convex Dashboard hosted + auto-login (PR #26)**: clicking "Open dashboard" on a deployment row opens an iframe shell at `/embed/<name>` that loads the upstream `ghcr.io/get-convex/convex-dashboard` image and answers its `postMessage` handshake with adminKey + URL — operator lands on the data/functions/logs UI auto-logged. A Caddy sidecar (`convex-dashboard-proxy`) strips `X-Frame-Options` + `frame-ancestors` so the iframe renders | `dashboard/app/embed/[name]/page.tsx`, `installer/templates/convex-dashboard.caddyfile` |
 | **Lifecycle commands (v0.6.1)**: `setup.sh` exposes `--upgrade` (auto-detect via GitHub Releases /latest, snapshot-rollback on failure, slashes sanitized in stamps), `--backup` (manifest.txt + .env + compose + pg_dump + per-deployment volumes → tarball; `--exclude-env` opt-out), `--restore=<archive>` (wipes pgdata + per-deployment volumes by suffix-match; replays dump after a `SELECT 1` readiness gate; `--keep-env` opt-out), `--uninstall` (mandatory pre-uninstall backup unless `--skip-backup`; wipes volumes by default unless `--keep-volumes`; strips host-Caddy managed block), `--logs=<component> [--follow] [--tail=<n>]` (thin pass-through with strict component validation), `--status` (read-only diagnostic table). All real-VPS validated on `synapse-vps`. Audit trail per command in `$INSTALL_DIR/{upgrade,backup,restore}.log` | `installer/install/lifecycle.sh`, `setup.sh::main` early-return branches |
+| **Hosted `curl \| sh` install (v0.6.2)**: `curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \| bash -s -- --domain=...` boots the script straight from GitHub. `setup::needs_bootstrap` detects the `installer/`-not-on-disk case (BASH_SOURCE[0] is empty under `curl \| bash`); `setup::bootstrap` clones the repo into `/tmp/convex-synapse-bootstrap-<pid>` (or `~/.synapse-bootstrap-<pid>`) and `exec`s the cloned `setup.sh` with the original args. `--no-bootstrap` opts out for tests. `SYNAPSE_BOOTSTRAP_REF` env pins the ref (default: `main`) | `setup.sh::setup::needs_bootstrap`, `setup.sh::setup::bootstrap` |
+| **First-run wizard (v0.6.3)**: dashboard `/login` probes `GET /v1/install_status` (public, no auth, `EXISTS` check on `users` table) and replaces to `/setup` when `firstRun=true`. The 4-phase wizard (loading → admin → demo → provisioning → done) creates the admin via `/v1/auth/register`, bootstraps `Default` team + `demo` project + dev deployment, then drops on the project page with the deployment row visible. `setup.sh::phase_verify` now `TRUNCATE users CASCADE` after the self-test passes (ON DELETE RESTRICT on `teams.creator_user_id` blocks row-level deletes; CASCADE follows the FK tree) so a fresh install lands at zero-user state and the wizard fires | `synapse/internal/api/install_status.go`, `dashboard/app/setup/page.tsx`, `dashboard/app/login/page.tsx::useEffect`, `installer/install/verify.sh` cleanup |
 | Dashboard (20 e2e tests, real pages, HA toggle + badge) | `dashboard/` |
 
 ## Real-VPS validation

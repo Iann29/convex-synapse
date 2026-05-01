@@ -303,9 +303,10 @@ both before adding a new chunk.
 
 ## Real-world bugs caught on the synapse-test VPS
 
-Eight runs of `setup.sh` on a fresh Hetzner CPX22 (Ubuntu 24.04)
-during chunk 7 + fix-ups #23/#24/#25 surfaced bugs that the bats
-suite did not. Each one is now a regression test; read this list
+Across v0.6.0 chunk 7, fix-ups #23/#24/#25, and the v0.6.1/v0.6.2/v0.6.3
+sessions, real-VPS smokes on a fresh Hetzner CPX22 (Ubuntu 24.04)
+surfaced 13 distinct bug classes that the bats suite alone could
+not catch. Each one is now a regression test; read this list
 before adding a chunk so the lessons don't have to be relearned:
 
 1. **`[[ -n "$X" ]] && cmd` at the end of a function** — when the
@@ -351,10 +352,54 @@ before adding a chunk so the lessons don't have to be relearned:
    expansion only. The synapse service's `environment:` block didn't
    reference it. Container env was empty; `config.PublicURL` parsed
    to ""; rewrite was a no-op. Fixed in `docker-compose.yml`.
+10. **`trap RETURN` fires on every nested function return**, not just
+    the trap-setting function. `lifecycle::upgrade` set up a trap to
+    `rm -rf $tmp_clone` — which fired the moment `ui::spin` returned
+    from the snapshot phase, deleting the clone target before
+    rsync ran. Fix: wrap the inner logic, cleanup once on the outer
+    wrapper's return, hand the path back via `printf -v` + a
+    non-shadowing var name. See `lifecycle::upgrade` /
+    `lifecycle::_upgrade_inner`.
+11. **`${SYNAPSE_VERSION}` as a docker tag rejects `/`.** The
+    upgrade flow stamped `feat/installer-upgrade` into `.env` after
+    a successful upgrade; the next compose build tagged
+    `synapse-dashboard:feat/installer-upgrade` — Docker rejected with
+    "invalid reference format". Two-pronged fix: pin
+    `synapse:local` / `synapse-dashboard:local` in docker-compose
+    (decouple tag from version) AND sanitize `/` → `-` in the
+    stamp belt-and-suspenders.
+12. **Compose volume names defy prediction.** The pgdata volume on
+    one VPS was `synapse_synapse-pgdata` even though the install dir
+    was `/opt/synapse-test` (compose project name doesn't always
+    track basename — `COMPOSE_PROJECT_NAME` env, parent dir of
+    compose-file, operator overrides all interact). Don't try to
+    predict; iterate `docker volume ls -q | grep 'synapse-pgdata$'`
+    and rm everything that matches.
+13. **`pg_isready` returns 0 during postgres's first-init shutdown
+    cycle.** A fresh pgdata triggers init → user-create → SHUTDOWN →
+    real-restart. `pg_isready` passes during the first boot, then
+    psql connections fail during the shutdown window with "the
+    database system is shutting down". Wait for `psql -tAc 'SELECT 1'`
+    to succeed, not pg_isready. (Also: `bash -c "pg_dump | gzip >
+    out"` doesn't auto-inherit `set -o pipefail`; either set it
+    inside the bash -c or decompress to a sibling .sql file and use
+    a `< file` redirect — no pipe.)
+
+Plus three follow-ups specific to v0.6.3 (first-run wizard cleanup):
+- **Convex API uses `POST /<resource>/delete`, NOT HTTP `DELETE`.**
+  `verify::_curl DELETE` 4xx'd silently because of `curl -f`.
+- **`teams.creator_user_id ON DELETE RESTRICT` blocks any row-level
+  user delete.** TRUNCATE … CASCADE is the surgical idiom for
+  "reset metadata to factory state" after the self-test.
+- **The `/setup` route uses `projectId` as the URL segment, not
+  `projectSlug`.** The wizard tried to redirect with the slug;
+  the project page fetched it as a UUID and 404'd. Match the
+  existing `app/teams/[team]/page.tsx` link convention.
 
 These are the bug classes a bats suite alone CANNOT catch. Real-VPS
 validation is part of "done" for any change that touches setup.sh,
-docker-compose.yml, or a backend handler that emits a URL.
+installer/, docker-compose.yml, lifecycle.sh, the auth/wizard
+dashboard surface, or a backend handler that emits a URL.
 
 ## Don't add (anti-features from the plan)
 

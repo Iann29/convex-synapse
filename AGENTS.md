@@ -94,7 +94,7 @@ The auto-installer (`setup.sh` + `installer/`) is pure bash. The
 Cross-reference rules:
 
 - **Real-VPS validation** is part of "done" for installer/compose
-  changes. The bats suite runs ~211 unit tests but doesn't see real
+  changes. The bats suite runs 266 unit tests but doesn't see real
   Docker, real Caddy, real DNS, or a real Next.js build. Chunk 7 of
   v0.6.0 (PR #19) caught 6 bugs in a single real-VPS run that ALL
   had green bats CI. Subsequent fix-ups (PR #23/#24/#25) added
@@ -144,6 +144,70 @@ wired via the early-return branches in `setup.sh::main()`.
   `${SYNAPSE_VERSION}` as a tag.
 - **`docker compose images --format json` uses `.ContainerName`,
   NOT `.Service`.** Older docs/examples have it wrong.
+- **Match volumes by suffix, not predicted project name.** Compose's
+  project-name resolution depends on `COMPOSE_PROJECT_NAME`, the
+  parent dir of the compose file, and operator overrides — no helper
+  in shell can predict the volume name reliably. Iterate
+  `docker volume ls -q | grep 'synapse-pgdata$'` (or `synapse-data-`)
+  instead. Real-VPS smoke caught a `synapse_synapse-pgdata` even
+  though the install dir was `/opt/synapse-test`.
+- **`bash -c "... | psql >/dev/null 2>&1"` swallows psql's exit code.**
+  Without `set -o pipefail` (which doesn't auto-inherit into
+  `bash -c`) the rc is whichever finished last. For pg_dump pipelines,
+  set pipefail explicitly inside the bash -c. For psql replay, decompress
+  to a sibling `.sql` file and use `< file` redirect — no pipe needed.
+- **`pg_isready` returns 0 during postgres's first-init reboot cycle.**
+  The container boots, creates the user, SHUTS DOWN, then restarts.
+  `pg_isready` passes during the FIRST boot but connections during
+  the shutdown window fail with "the database system is shutting down".
+  Use a `psql -tAc 'SELECT 1'` retry loop (90s budget) instead.
+
+## v0.6.2 ground rules (curl | sh bootstrap)
+
+`setup.sh` is meant to work both as a local `./setup.sh` and as a
+hosted `curl -sSf https://raw.githubusercontent.com/.../main/setup.sh
+| bash -s -- ...` one-liner. Under the latter, only `setup.sh` is
+in the bash process — `installer/` lives nowhere on disk.
+
+- **`HERE` defaults to empty string** when `BASH_SOURCE[0]` is
+  unset/empty (the `curl | bash` case). `set -u` would NPE if we
+  unconditionally `cd $(dirname "$BASH_SOURCE")` — guard with the
+  `_setup_src` resolver before `readonly INSTALLER_TEMPLATES`.
+- **Bootstrap re-exec runs BEFORE source_libs.** `setup::needs_bootstrap`
+  returns true when `$HERE` is empty OR `$HERE/installer` is missing.
+  `setup::bootstrap` clones to `/tmp/convex-synapse-bootstrap-$$`
+  (or `$HOME/.synapse-bootstrap-$$` fallback), exports
+  `SYNAPSE_BOOTSTRAPPED=1`, and `exec`s the cloned setup.sh with `"$@"`.
+- **`--no-bootstrap` flag** disables the re-exec for tests and for
+  operators running setup.sh from a custom checkout that's missing
+  `installer/` for some reason.
+- **`SYNAPSE_BOOTSTRAP_REF` env** pins the git ref the bootstrap
+  clones (default `main`). Future tagged releases can be reached via
+  raw URL: `.../v0.7.0/setup.sh` (not yet — no tags cut).
+
+## v0.6.3 ground rules (first-run wizard + install_status)
+
+The `/v1/install_status` endpoint is the public, unauthenticated
+probe the dashboard uses pre-login to decide between `/login` and
+`/setup`. Treat it as a stable contract:
+
+- **Public, no auth.** Mounted in the public group of `router.go`,
+  next to `/auth`. The dashboard hits it before any JWT/PAT exists —
+  there's no other surface that could carry the signal.
+- **`firstRun = NOT EXISTS(SELECT 1 FROM users)`.** Cheap (postgres
+  short-circuits at the first row). Don't add OR-clauses for
+  "no teams" or "no projects" — the wizard's contract is "no humans
+  have logged in yet", not "no infrastructure has been touched".
+- **Fail closed.** A DB-unreachable probe returns 503, not
+  `firstRun=false`. Misleading "everything's installed" sends the
+  operator to `/login` of nothing — the 503 falls through to the
+  normal login form (which itself fails clearly).
+- **`setup.sh::phase_verify` MUST leave the DB at zero-user state**
+  on success without `--keep-demo`. `TRUNCATE users CASCADE` is the
+  surgical fix because `teams.creator_user_id ON DELETE RESTRICT`
+  blocks any row-level user delete (FK constraint). The Convex API
+  uses `POST /<resource>/delete` (not HTTP `DELETE`) — verify::_curl
+  with `-X DELETE` 4xx's silently because `curl -f` is on.
 
 ## URL rewrite contract (PR #10 + #24)
 

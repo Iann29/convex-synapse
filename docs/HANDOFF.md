@@ -1,11 +1,14 @@
 # You are taking over the convex-synapse project
 
 You're stepping into a session where the previous agent + operator just
-finished v0.6.0 (the auto-installer milestone), four fix-ups closing the
-public-URL rewrite chain (PRs #23/#24/#25/#26), and an unplanned
-brought-forward fix that hosts the open-source Convex Dashboard
-alongside Synapse with auto-login. Read this end-to-end before you
-write a line of code.
+finished v0.6.x in full — auto-installer, lifecycle commands,
+`curl | sh` one-liner, browser first-run wizard. The v0.6 milestone
+("first 30 seconds of using Synapse is the installer") is **done**.
+What's left is the v1.0 surface area: the hard stuff that turns
+"works for one operator on a Hetzner box" into "ships to thousands of
+self-hosters across providers".
+
+Read this end-to-end before you write a line of code.
 
 ---
 
@@ -30,69 +33,103 @@ CLI auth) on infrastructure the operator controls.
 | Milestone | Status |
 |---|---|
 | v0.1 → v0.5 | ✅ shipped |
-| **v0.6.0 (auto-installer)** | **✅ shipped — 10/10 chunks merged** |
-| **v0.6.0 fix-ups (#17, #23, #24, #25, #26)** | ✅ all merged |
-| **v0.6.1 (lifecycle commands)** | 🚀 NEXT — your mission |
-| v0.6.2 (hosted `curl \| sh`) | 📋 trivial once a static host exists |
-| v0.6.3 (browser first-run wizard) | 📋 lighter than it sounds now that Convex Dashboard auto-login works |
-| v0.7 (cloud images) | 📋 |
-| v1.0 | distant |
+| **v0.6 (auto-installer + lifecycle + curl\|sh + first-run wizard)** | **✅ shipped — every chunk merged + real-VPS validated** |
+| v0.5.1 (HA polish — upgrade_to_ha worker, real-backend failover, active health probe) | 📋 deferred |
+| v0.7 (ghcr.io pre-built images — install ~30s instead of ~3min) | 📋 not started; needs CI workflow + multi-arch buildx |
+| ~~v0.6.4 (Cloud images marketplace)~~ | ❌ deprioritized 2026-05-01 |
+| **v1.0 (custom domains, S3 backup, RBAC, OIDC, K8s, Helm, API stability)** | 🚀 NEXT — your mission |
 
-Test counts: ~136 Go integration + 20 Playwright e2e + 211 bats unit, all
-green in CI on every push. shellcheck `-x` clean across 9 `.sh` files.
+Test counts: 266 bats + 139 Go integration + 24 Playwright e2e, all
+green in CI on every push. shellcheck `-x` clean across 11 `.sh` files.
 
-A real Hetzner CPX22 has been running this code end-to-end through every
-chunk and fix-up. **That validation surfaced 9 distinct bugs the bats +
-Go suites didn't catch** — the whole list lives in `.claude/skills/synapse-installer/SKILL.md`
-under "Real-world bugs caught on the synapse-test VPS". Read it; the
-lessons generalize.
+A real Hetzner CPX22 has been running this code end-to-end through
+every chunk. **That validation surfaced 13 distinct bugs the bats +
+Go suites didn't catch** — see
+`.claude/skills/synapse-installer/SKILL.md` under "Real-world bugs
+caught on the synapse-test VPS". Read it; the lessons generalize.
 
-## Your mission: v0.6.1 lifecycle commands
+## Your mission: v1.0 — pick a piece, scope it, ship it
 
-`setup.sh` already has the flag surface reserved for these commands —
-each one currently exits 2 with "not yet implemented". Implement the
-runtime behind each flag, in this priority order. Each one should be
-its own PR (sized small enough to review in one sitting):
+The ROADMAP lists v1.0 items in `docs/ROADMAP.md`. Each one is
+substantial enough that the operator has explicitly asked us to
+**surface it as a fork-in-the-road instead of just diving in**.
+Confirm priority before scoping.
 
-1. **`--doctor`** — already implemented. Runs preflight against an existing
-   install with no mutations. Skip — keep as a smoke test for new code.
+The list:
 
-2. **`--upgrade`** (highest priority). `git pull` (or `tar` extract from
-   the upgrade payload) → `docker compose pull` → `up -d --build` →
-   wait `/health` 2xx. On failure, roll back to the previous image
-   tag + restart. Audit trail in the install log. Real-VPS validation
-   is a hard requirement — this is the command operators run on
-   production, with state.
+1. **Custom domains with auto-TLS** — each deployment with its own
+   subdomain (e.g. `<deployment>.synapse.example.com`) instead of
+   `/d/<name>/*` proxy paths. Caddy on-demand TLS or Let's Encrypt
+   per-host. Touches: provisioner (host header allocation), proxy
+   (route resolution), caddy.sh (cert reload).
+2. **Volume snapshot backups → S3** — extension of v0.6.1 chunk 2.
+   Same archive format, but write to a configured S3 bucket on a
+   schedule (cron-style) instead of a local tarball. Retention
+   policy. Operator opts in via env vars. Touches: lifecycle.sh
+   (s3-aware path), new env vars, audit log entries.
+3. **RBAC: project-level roles** — admin / member / viewer per
+   project (currently roles are team-scoped only). Touches: db
+   migration adding `project_members`, every project handler's
+   authz check, dashboard role-toggle UI.
+4. **OAuth/SSO via OIDC** — works with Authentik, Zitadel,
+   Keycloak. Auth handler grows an OIDC discovery flow alongside
+   email+password. JWT issuer accepts the OIDC sub claim. Dashboard
+   /login adds "Sign in with Provider" button when configured.
+   Touches: `internal/auth/`, `internal/api/auth.go`, dashboard auth.
+5. **Kubernetes provisioner** — alternative to Docker. Provisioner
+   interface already factored (Provision/Destroy/Restart). Add a
+   `internal/k8sprov/` that creates Deployment + Service + PVC per
+   Synapse deployment. Configured via `SYNAPSE_PROVISIONER=k8s` +
+   kubeconfig. Touches: `internal/api/router.go` wiring,
+   `internal/health/` (k8s-aware status), Helm chart.
+6. **Helm chart** — installs Synapse on an existing K8s cluster.
+   Helm umbrella over postgres (CloudNative-PG operator? bitnami?),
+   synapse, dashboard, optional cluster-issuer for cert-manager.
+   Depends on (5). Touches: new `helm/` dir, GitHub Actions to
+   publish to a chart repo on each tag.
+7. **Public API stability guarantees + versioned releases** — start
+   cutting `v0.7.0`, `v1.0.0` git tags, GitHub releases with notes,
+   semver discipline on the OpenAPI shape. The `--upgrade` flow
+   already queries `releases/latest` — once tags exist it
+   short-circuits to "you're on v1.0.0, latest is v1.0.0" instead
+   of always pulling main.
 
-3. **`--backup` / `--restore`** (do these together — they share format).
-   `pg_dump synapse-postgres` + `tar` of every `synapse-data-*` volume
-   into a single timestamped archive (suggested:
-   `synapse-backup-YYYYMMDD-HHMMSS.tar.gz`). `--restore <path>`
-   reverses: `docker compose down`, replaces volumes from the tarball,
-   `up -d`, smoke-test. Operator gets a known-good rollback point
-   before any risky upgrade.
+Recommended order (operator can override):
+- **A. Cut `v0.6.3` tag + GitHub release first** (5 minutes — `git
+  tag v0.6.3 && gh release create`). Closes the loop on `--upgrade`
+  having a real target. Cheap, high-leverage. Do this regardless.
+- **B. Then v0.7** (ghcr.io images — biggest UX win for next 100
+  operators). Install drops from 3min to 30s. CI workflow + multi-
+  arch buildx + ghcr publish on tag.
+- **C. Then v1.0 items** by operator priority. The list above is in
+  rough effort order ascending. RBAC and OIDC are the typical "I
+  can't ship to my team without this" items; K8s/Helm is the typical
+  "I can't deploy at this scale without this".
 
-4. **`--uninstall`** — mandatory `--backup` prompt first (set
-   `--skip-backup` to override). Then `docker compose down --volumes`
-   (only if operator confirms), `caddy::remove_block` from
-   `/etc/caddy/Caddyfile` if it was a host-Caddy install, remove the
-   install dir.
+## Real-VPS validation discipline
 
-5. **`--logs <component>`** — thin wrapper over
-   `docker compose logs -f <service>`. Components:
-   `synapse / dashboard / postgres / caddy / convex-dashboard`.
+CI (266 bats + 139 Go + 24 Playwright + compose build + shellcheck)
+runs on every push and is the **floor**, not the ceiling. The 13
+bugs caught during v0.6 all had green CI before real-VPS smoke
+surfaced them. Bug classes that bats and Go simply cannot see:
 
-6. **`--status`** — diagnostic snapshot: container states, port bindings,
-   DNS resolution result, TLS cert expiry (when caddy_host), disk usage
-   under `/var/lib/docker`. Read-only, prints a structured table. Same
-   output shape as the success screen at the end of a fresh install.
+- bash `set -e` footguns (`[[ -n "$X" ]] && cmd` aborting at function tail)
+- `trap RETURN` firing on every nested function return (not just the trap-setting function)
+- `bash -c "... | psql >/dev/null 2>&1"` swallowing the pipeline's exit code
+- `pg_isready` returning 0 during postgres's first-init shutdown cycle
+- camelCase vs snake_case API shapes (Convex API uses `accessToken`, `firstRun`, etc.)
+- `${SYNAPSE_VERSION}` as docker tag rejecting `/` (branch refs)
+- `docker compose images` JSON using `.ContainerName` (not `.Service`)
+- compose project-name resolution defying prediction (volume-suffix-match needed)
+- `NEXT_PUBLIC_*` build-arg vs runtime env (Next.js inlines at build time)
+- iframe / X-Frame-Options / CSP behavior
+- the upstream Convex Dashboard's postMessage handshake protocol
+- Convex API uses `POST /<resource>/delete` (not HTTP DELETE)
+- FK `ON DELETE RESTRICT` on `teams.creator_user_id` blocks user delete
 
-For each: write the function in `installer/install/lifecycle.sh` (new
-file), wire into `setup.sh` (replacing the 501-style stubs), add bats
-unit tests in `installer/test/install/lifecycle.bats`, and **smoke on
-the synapse-test VPS** before declaring done.
-
-The `synapse-installer` skill has the conventions; follow them.
+Treat real-VPS smoke as a checkbox in "done" for any change touching
+`setup.sh`, `installer/`, `docker-compose.yml`, the Go API surface,
+or the dashboard auth/wizard surface.
 
 ## The synapse-test VPS — your sandbox
 
@@ -109,22 +146,24 @@ ssh -i ~/.ssh/synapse-test-vps root@<ip>
 ```
 
 IP, password, key paths all live in `/.vps/credentials.md` (gitignored
-under `/.vps/`; the directory + file already exist on the operator's
-machine — read them, don't ask). Standard real-VPS workflow:
+under `/.vps/`). Standard real-VPS workflow:
 
 ```bash
-# Tear down the previous test
-ssh synapse-vps 'docker compose -f /opt/synapse-test/docker-compose.yml down -v 2>/dev/null
-                 docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
-                 rm -rf /tmp/convex-synapse /opt/synapse-test'
+# Tear down the previous test (or use --uninstall now that it exists)
+ssh synapse-vps 'docker rm -f $(docker ps -aq --filter name=synapse-) 2>/dev/null
+                 docker volume ls -q | grep -E "(synapse-data-|synapse-pgdata)" \
+                   | xargs -r docker volume rm
+                 rm -rf /opt/synapse-test'
 
-# Clone the branch under test and run setup.sh end-to-end
-ssh synapse-vps 'cd /tmp && git clone -b <your-branch> https://github.com/Iann29/convex-synapse.git
-                 cd convex-synapse && bash setup.sh --no-tls --skip-dns-check --non-interactive --install-dir=/opt/synapse-test'
+# Fresh install via curl|sh (the canonical install path now)
+ssh synapse-vps 'curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+                 | bash -s -- --no-tls --skip-dns-check --non-interactive \
+                              --install-dir=/opt/synapse-test'
 
 # Validate from outside the VPS (your dev machine, NOT inside the VPS)
 curl -sf http://<vps-ip>:8080/health
-curl -sf -o /dev/null -w "%{http_code}\n" http://<vps-ip>:6790/register
+curl -sf http://<vps-ip>:8080/v1/install_status   # firstRun should be true
+curl -sf -o /dev/null -w "%{http_code}\n" http://<vps-ip>:6790/setup
 ```
 
 **Hard rules:**
@@ -134,26 +173,6 @@ curl -sf -o /dev/null -w "%{http_code}\n" http://<vps-ip>:6790/register
 - Never SSH there for unrelated work — the box is single-purpose.
 - If you bork it, ask for a reset; don't try to recover with `rm -rf /`.
 
-## Real-VPS validation discipline
-
-CI (~131 Go + 20 Playwright + 211 bats) runs on every push and is the
-floor, not the ceiling. The 9 bugs caught during v0.6.0 + fix-ups all
-had green CI before real-VPS smoke surfaced them. Bug classes that bats
-and Go simply cannot see:
-
-- bash `set -e` footguns (`[[ -n "$X" ]] && cmd` aborting at function tail)
-- `docker compose pull` on services with `build:`
-- camelCase vs snake_case API shapes (Convex's API is camelCase: `accessToken`, `projectId`, `convexUrl`)
-- `NEXT_PUBLIC_*` build-arg vs runtime env (Next.js inlines at build time)
-- missing host tooling (`jq`, `dig`)
-- public-IP / DNS / TLS / Let's Encrypt flows
-- iframe / X-Frame-Options / CSP behavior
-- the upstream Convex Dashboard's postMessage handshake protocol
-
-Treat real-VPS smoke as a checkbox in "done" for any change touching
-`setup.sh`, `installer/`, `docker-compose.yml`, or any backend handler
-that emits a URL.
-
 ## Operator profile
 
 - **Language:** Brazilian Portuguese, informal-technical. Respond in
@@ -162,7 +181,8 @@ that emits a URL.
   in the day-to-day sense. Runs the Amage agency (e-commerce; Next.js
   + Convex self-hosted + BetterAuth). Understands product and concept,
   not implementation details. **Avoid jargon without translating.**
-  Use analogies (he liked "recepção open-source que substitui Big Brain").
+  Use analogies (he liked "shopping center pra Convex", "recepção
+  open-source que substitui Big Brain").
 - **Legal name:** **Ian Bee** (Iann29 on GitHub), NOT "Ian Saraiva".
   This is in copyright headers / LICENSE files / author lines.
 - **Working style:** he likes parallel agents, autonomous slices, and
@@ -173,31 +193,31 @@ that emits a URL.
   per-PR confirmation when CI is green. He still wants the big
   architectural calls (e.g. "should this be its own service or live
   inside synapse-api?") presented as a fork-in-the-road, not as a
-  decided plan.
-- **He'll push back on overengineering.** Anti-features in
-  `docs/V0_6_INSTALLER_PLAN.md` are anti-features for a reason; don't
-  invent new ones.
+  decided plan. **Especially v1.0 items — those each justify a
+  scope-then-build conversation, not a dive.**
+- **He'll push back on overengineering.** If a feature feels bigger
+  than it should, scope it down explicitly. The "less is more"
+  framing of v0.6 (we cut v0.6.4 deliberately) is the model.
+- **VPS reset is fine but ALWAYS confirm first.** He explicitly said
+  "vou auto-aprovar" for merges, but real-VPS destructive ops should
+  still get a "vou rodar X, ok?" before fire.
 - **When asked "como tá?" / "oq foi feito?":** give a concrete summary
   with numbers (commit count, test count, what's deployed). Brief and
   structured — he's checking, not interrogating.
 
 ## Repo conventions (skim once)
 
-Full versions live in `CLAUDE.md` and `AGENTS.md` — both <250 lines,
-both worth reading end-to-end before non-trivial changes. Highlights:
+Full versions live in `CLAUDE.md` and `AGENTS.md` — both kept under
+~250 lines. Highlights:
 
 - **Build green before commit.** `cd synapse && go build ./... && go vet ./... && go test ./... -count=1`
   must pass. Bats + shellcheck for `installer/` changes. Playwright for
   dashboard + handler changes.
 - **One feature per commit.** Refactor lives in its own commit.
-- **End-to-end test each slice.** New endpoint → integration test in
-  `synapse/internal/test/<resource>_test.go`. New UI flow → Playwright
-  spec. New installer phase → bats. **No "tested manually with curl"
-  for anything user-visible.**
 - **Conventional commits.** `feat(scope):`, `fix(scope):`, `chore:`,
   `docs:`. Bodies are verbose — list the curl flow you actually ran.
-- **Push directly to `main`** for small docs / fixes / refactors. Large
-  features go through PR (squash merge; keep history clean).
+- **Push directly to `main`** for small docs / fixes / refactors.
+  Large features go through PR (squash merge; keep history clean).
 - **Errors to clients** always go through `writeError(w, status, code, msg)`
   in `httpx.go`. Stable codes, human messages, never leak internals.
 - **Audit hook** every mutating handler success path. Best-effort,
@@ -212,46 +232,50 @@ both worth reading end-to-end before non-trivial changes. Highlights:
   the `*DeploymentsHandler` field.
 - **bash gotcha**: never use `[[ -n "$X" ]] && cmd` as the last line of
   a function — under `set -e` the test's exit code aborts the caller.
-  Use explicit `if`/`fi`.
+  Use explicit `if`/`fi`. Never `trap RETURN` for cleanup — bash
+  fires it on every nested function return. Wrap the inner logic and
+  cleanup once on the outer wrapper's return.
+- **Lifecycle conventions** (v0.6.1+): see AGENTS.md "v0.6.1 ground
+  rules" through "v0.6.3 ground rules" — validate-first, audit-trail,
+  no-trap-RETURN, image-tags-vs-version-stamps, suffix-match for
+  volumes, set-pipefail in `bash -c`, `SELECT 1` retry for postgres
+  readiness, `TRUNCATE … CASCADE` for FK-RESTRICT cleanup.
 
 ## Required reading inside the repo
 
 In this order:
 
 1. **`CLAUDE.md`** — repo layout, common commands, conventions, "What HAS
-   landed" table. Updated after every milestone.
+   landed" table. Updated after every milestone. Reflects v0.6 ✅ DONE.
 2. **`AGENTS.md`** — cross-tool conventions, "done" checklist, URL
-   rewrite contract, Convex Dashboard embedding contract.
-3. **`docs/ROADMAP.md`** — every milestone status. v0.6.1 is your
-   target.
-4. **`docs/V0_6_INSTALLER_PLAN.md`** — design + chunk-by-chunk landing
-   log for v0.6. Anti-features explicitly called out.
-5. **`.claude/skills/synapse-installer/SKILL.md`** — bash conventions,
-   the 9 real-world bugs caught during v0.6.0, the canonical real-VPS
-   smoke recipe.
-6. **`docs/PRODUCTION.md`** — the operator-facing install guide. Keep
-   it current as v0.6.1 commands ship.
-7. **`docs/ARCHITECTURE.md`** — design decisions and what's deliberately
+   rewrite contract, v0.6.1/v0.6.2/v0.6.3 ground rules.
+3. **`docs/ROADMAP.md`** — every milestone status. v0.6 ✅; v1.0 is
+   your target.
+4. **`docs/ARCHITECTURE.md`** — design decisions and what's deliberately
    out of scope.
-8. **`docs/SCREENSHOTS.md`** — UI tour. Refresh captures when you
-   change dashboard pages.
+5. **`.claude/skills/synapse-installer/SKILL.md`** — bash conventions,
+   the 13 real-world bugs caught during v0.6, the canonical real-VPS
+   smoke recipe.
+6. **`docs/PRODUCTION.md`** — the operator-facing install guide.
+   Already leads with `curl | sh`.
+7. **`docs/SCREENSHOTS.md`** — UI tour. Add a `/setup` wizard
+   screenshot when you do anything UX-side.
+8. **`docs/V0_6_INSTALLER_PLAN.md`** — the full v0.6 design + chunk
+   landing log. Anti-features still apply going forward.
 
 When in doubt, `git log --oneline | head -50` shows the journey. Commit
 bodies are intentionally verbose — they explain trade-offs not restated
 in the code.
 
-## What's deliberately out of scope
+## What's deliberately out of scope (forever)
 
 - Stripe/Orb billing parity
-- WorkOS/SAML (we have email+password JWT; OIDC is v1.0+)
+- WorkOS-specific SAML paths (we use OIDC, see v1.0 list)
 - Multi-region / deployment classes
 - Discord/Vercel integrations
 - LaunchDarkly equivalent
-- Rebuilding the Convex backend itself (the `defy-works/convex-backend`
-  fork lives in a different layer; we orchestrate the upstream image
-  unmodified)
 
-If you're tempted to add one, move it to the roadmap and discuss.
+If you're tempted to add one, move it to "maybe never" in ROADMAP.
 
 ## Pointers
 
@@ -268,23 +292,22 @@ If you're tempted to add one, move it to the roadmap and discuss.
 
 ## Final notes
 
+- Cut `v0.6.3` git tag + GitHub release as your warm-up — closes the
+  loop on `--upgrade` having a real target. Should be your first
+  commit on a new session.
 - The operator gave the synapse-test VPS as your sandbox. Use it.
-  Don't optimize for skipping smoke tests.
-- v0.6.1 commands look small in isolation but compose into the
-  operator-experience surface. Treat each as a product, not a script.
-  The success screen / log format / failure-mode messaging matters as
-  much as the happy path.
-- Subagents are valuable for research-heavy work (the v0.6.0 chunks
-  used Coolify/k3s/Tailscale comparative reads; the Convex Dashboard
-  fix used two parallel agents to cross-verify the postMessage
-  protocol). Lean on them when the question spans more than a single
-  file or branches into "what does the upstream do?".
-- The operator wants 5k stars eventually. The path there is "first
-  30 seconds of using Synapse is the installer" + "every operator
-  pain point in self-hosting Convex is something we already solved".
-  Don't lose that frame.
+- v1.0 items each justify a scope-then-build conversation. Don't
+  dive into K8s or OIDC without the operator confirming priority —
+  each is a multi-session feature.
+- Subagents are valuable for research-heavy work and parallel
+  independent slices. Lean on them when the question spans more than
+  a single file or branches into "what does the upstream do?".
+- The operator wants 5k stars eventually. The path there is
+  "first 30 seconds of using Synapse is the installer" (✅ done in
+  v0.6) + "every operator pain point in self-hosting Convex is
+  something we already solved" (your job in v1.0).
 
 Start by reading `CLAUDE.md`, `AGENTS.md`, `docs/ROADMAP.md`, and the
 `synapse-installer` skill end-to-end. Then say hi to the operator in
-pt-BR and confirm where to begin (`--upgrade` is the obvious first
-v0.6.1 ticket, but check). BORAAAA MESTREEEEE!! vamos lá.
+pt-BR and confirm where to begin (cut the tag, then ask which v1.0
+item to scope first). BORAAAA MESTREEEEE!! vamos lá.

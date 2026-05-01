@@ -65,10 +65,12 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 | HA-per-deployment | opt-in: 2 replicas + external Postgres + S3, AES-GCM encrypted creds |
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
-| Auto-installer | `./setup.sh` brings up the whole stack on a fresh VPS in ~3 min |
+| Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
+| Lifecycle commands | `--upgrade` (auto-detect via GitHub Releases, snapshot rollback), `--backup` / `--restore`, `--uninstall`, `--logs`, `--status` |
+| First-run wizard | dashboard `/login` → `/setup` on a fresh install: admin → demo team/project/deployment in three clicks |
 | Pagination | `?limit&?cursor` + `X-Next-Cursor` on every list endpoint |
 
-**Tests:** ~136 Go integration tests + 20 Playwright e2e + 211 bats unit
+**Tests:** ~139 Go integration tests + 24 Playwright e2e + 266 bats unit
 tests, all green in CI on every push.
 
 For roadmap, design notes, and what's deliberately out of scope, see
