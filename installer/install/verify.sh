@@ -182,36 +182,33 @@ verify::run() {
     fi
 
     if (( keep == 0 )); then
-        # Full teardown: deployment first (Docker container + volume),
-        # then the team (CASCADEs project + invites + members). The
-        # self-test admin user is left dangling but harmless on its
-        # own. Critically, we wipe the team so the user is no longer
-        # a team-creator (FK ON DELETE RESTRICT on teams.creator),
-        # then wipe the user via direct postgres-delete so the dashboard
-        # at /v1/install_status reports firstRun=true on next paint —
-        # the v0.6.3 wizard depends on that.
+        # Tear down the demo deployment via the API so the docker
+        # container + volume go away cleanly (synapse handles the
+        # Docker lifecycle internally; a raw SQL delete would orphan
+        # them). Convex Cloud uses POST /delete, not the HTTP DELETE
+        # method.
         ui::info "Self-test: tearing down demo deployment"
-        verify::_curl DELETE "$url/v1/deployments/$dep" >/dev/null || \
+        verify::_curl POST "$url/v1/deployments/$dep/delete" "{}" >/dev/null || \
             ui::warn "Self-test: demo cleanup returned non-zero (operator can delete via dashboard)"
 
-        ui::info "Self-test: tearing down demo team"
-        verify::_curl DELETE "$url/v1/teams/$team" >/dev/null || \
-            ui::warn "Self-test: team cleanup returned non-zero"
-
-        # The auth API has no /delete_self today (v1.0+); delete via
-        # postgres directly. Best-effort — if the docker exec fails
-        # the operator's first-run wizard simply doesn't appear (they
-        # can still log in with the printed VERIFY_EMAIL / VERIFY_PASSWORD,
-        # or wipe with `setup.sh --uninstall`).
+        # Wipe the rest via TRUNCATE … CASCADE so the v0.6.3 first-run
+        # wizard at /setup will fire on the operator's first dashboard
+        # visit. There's no /delete_team API today (v1.0+), and the
+        # FK ON DELETE RESTRICT on teams.creator_user_id prevents a
+        # row-level delete of the user. TRUNCATE … CASCADE follows the
+        # FK tree and is the surgical equivalent of "reset to factory"
+        # at the metadata layer. Best-effort — failure here just means
+        # the wizard doesn't show; operator can still log in with the
+        # one-shot admin (email/password are in the install log).
         local pg_user pg_db
         pg_user="${POSTGRES_USER:-synapse}"
         pg_db="${POSTGRES_DB:-synapse}"
         local docker_cmd="${VERIFY_DOCKER:-docker}"
-        ui::info "Self-test: removing one-shot admin user ($email)"
+        ui::info "Self-test: clearing self-test user + team + project"
         if ! "$docker_cmd" exec synapse-postgres \
-                psql -U "$pg_user" -d "$pg_db" -tAc \
-                "DELETE FROM users WHERE email = '$email';" >/dev/null 2>&1; then
-            ui::warn "Self-test: could not delete self-test user — first-run wizard may not show"
+                psql -U "$pg_user" -d "$pg_db" -q -v ON_ERROR_STOP=1 -c \
+                "TRUNCATE users CASCADE;" >/dev/null 2>&1; then
+            ui::warn "Self-test: could not TRUNCATE — first-run wizard may not show"
         fi
     fi
     return 0
