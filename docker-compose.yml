@@ -134,8 +134,35 @@ services:
     image: ghcr.io/get-convex/convex-dashboard:latest
     container_name: synapse-convex-dashboard
     restart: unless-stopped
+    # NOTE: no `ports:` here — the upstream image emits anti-iframe
+    # headers (X-Frame-Options + frame-ancestors CSP) that block
+    # Synapse's /embed/<name> shell from rendering the dashboard.
+    # The convex-dashboard-proxy sidecar below strips those headers
+    # and is what operators actually hit on port 6791.
+    expose:
+      - "6791"
+    networks:
+      - synapse-network
+
+  # ----------------------------------------------------------------
+  # Tiny Caddy reverse-proxy in front of convex-dashboard. The
+  # upstream image's X-Frame-Options + CSP frame-ancestors prevent
+  # iframe embedding; this sidecar strips both so the Synapse
+  # dashboard's `/embed/<name>` shell can iframe it and reply to
+  # the postMessage handshake that auto-logs the dashboard. Strip
+  # is safe because the /embed page itself sits behind Synapse auth.
+  # ----------------------------------------------------------------
+
+  convex-dashboard-proxy:
+    image: caddy:2-alpine
+    container_name: synapse-convex-dashboard-proxy
+    restart: unless-stopped
+    depends_on:
+      - convex-dashboard
     ports:
-      - "${CONVEX_DASHBOARD_PORT:-6791}:6791"
+      - "${CONVEX_DASHBOARD_PORT:-6791}:80"
+    volumes:
+      - ./installer/templates/convex-dashboard.caddyfile:/etc/caddy/Caddyfile:ro
     networks:
       - synapse-network
 

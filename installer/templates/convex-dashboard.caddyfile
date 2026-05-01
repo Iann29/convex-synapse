@@ -1,0 +1,24 @@
+# Caddyfile for the convex-dashboard-proxy sidecar.
+#
+# The upstream `ghcr.io/get-convex/convex-dashboard` image ships with
+# `X-Frame-Options: SAMEORIGIN` + `Content-Security-Policy:
+# frame-ancestors 'self'` — both block the dashboard from being
+# embedded inside Synapse's `/embed/<name>` shell page (different
+# origin: VPS:6790 vs VPS:6791). Synapse's /embed page handles the
+# postMessage handshake that auto-logs the dashboard, so we WANT it
+# embedded; stripping the two headers is safe because the embed page
+# is itself behind Synapse auth — only an authenticated operator can
+# load it.
+#
+# This Caddy instance sits in front of the convex-dashboard container,
+# proxies every request through unchanged, and removes the two
+# anti-iframe headers from the response. No other behaviour changes.
+
+:80 {
+    reverse_proxy convex-dashboard:6791 {
+        # `header_down -<Name>` deletes the upstream header from the
+        # response before Caddy writes it to the client.
+        header_down -X-Frame-Options
+        header_down -Content-Security-Policy
+    }
+}
