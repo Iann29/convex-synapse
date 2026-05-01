@@ -666,7 +666,9 @@ POSTGRES_USER=synapse
 POSTGRES_DB=synapse
 EOF
     : >"$stage/docker-compose.yml"
-    : >"$stage/synapse.sql.gz"
+    # A real (if empty-content) gzip blob — `: > file` produces 0
+    # bytes, which gunzip rejects with "invalid magic".
+    printf 'SELECT 1;\n' | gzip >"$stage/synapse.sql.gz"
     tar czf "$archive" -C "$stage" .
 
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
@@ -719,7 +721,9 @@ POSTGRES_USER=synapse
 POSTGRES_DB=synapse
 EOF
     : >"$stage/docker-compose.yml"
-    : >"$stage/synapse.sql.gz"
+    # A real (if empty-content) gzip blob — `: > file` produces 0
+    # bytes, which gunzip rejects with "invalid magic".
+    printf 'SELECT 1;\n' | gzip >"$stage/synapse.sql.gz"
     tar czf "$archive" -C "$stage" .
 
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
@@ -743,4 +747,135 @@ EOF
     assert_success
     run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
     assert_output "after-restore"
+}
+
+# ====================================================================
+# uninstall (v0.6.1 chunk 3)
+# ====================================================================
+
+@test "uninstall: aborts when .env is missing" {
+    : >"$COMPOSE_FILE"
+    run lifecycle::uninstall "$INSTALL_DIR" --non-interactive
+    assert_failure 2
+    assert_output --partial "no Synapse install"
+}
+
+@test "uninstall: --non-interactive + --skip-backup nukes the install dir" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    ps) echo "" ;;
+    *)  true ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" --non-interactive --skip-backup
+    assert_success
+    assert_output --partial "Synapse uninstalled"
+    [ ! -d "$INSTALL_DIR" ]
+}
+
+@test "uninstall: takes a backup at /tmp by default before removing" {
+    _setup_install_fixture
+    # Stub `docker` for compose down + rm + volume + exec (pg_dump)
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)   [[ "$3" == "pg_dump" ]] && echo "-- dump --" ;;
+    volume) [[ "$2" == "ls" ]] && true ;;
+    run)    : ;;
+    ps)     echo "" ;;
+    rm|compose|tag) true ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    local backup_out="$BATS_TEST_TMPDIR/un-backup.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" \
+            --non-interactive \
+            --backup-out="$backup_out"
+    assert_success
+    [ -f "$backup_out" ]
+    [ ! -d "$INSTALL_DIR" ]
+}
+
+@test "uninstall: wipes synapse-data-* + pgdata by default" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+case "$1" in
+    volume)
+        case "$2" in
+            ls)
+                printf 'synapse-data-foo\nsynapse-data-bar\nsomething-else\n'
+                # Two pgdata candidates a real install might have
+                # depending on compose project-name resolution.
+                printf 'install_synapse-pgdata\nsynapse_synapse-pgdata\n'
+                ;;
+        esac
+        ;;
+    ps) echo "" ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" \
+            --non-interactive --skip-backup
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "volume rm synapse-data-foo"
+    assert_output --partial "volume rm synapse-data-bar"
+    # Suffix-match wipes EVERY volume ending in synapse-pgdata —
+    # avoids the predict-the-project-name trap.
+    assert_output --partial "volume rm install_synapse-pgdata"
+    assert_output --partial "volume rm synapse_synapse-pgdata"
+    refute_output --partial "volume rm something-else"
+}
+
+@test "uninstall: --keep-volumes preserves volumes (only useful with saved .env)" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+case "$1" in
+    volume)
+        case "$2" in
+            ls) printf 'synapse-data-foo\n' ;;
+        esac
+        ;;
+    ps) echo "" ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" \
+            --non-interactive --skip-backup --keep-volumes
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    refute_output --partial "volume rm synapse-data-foo"
+    refute_output --partial "volume rm install_synapse-pgdata"
+}
+
+@test "uninstall: aborts when operator declines confirmation" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    # No --non-interactive: lifecycle::uninstall reads stdin for the
+    # confirm prompt. Feed "n" via here-string so it bails before
+    # touching anything.
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" --skip-backup <<<"n"
+    assert_failure
+    assert_output --partial "aborted by operator"
+    [ -d "$INSTALL_DIR" ]
 }

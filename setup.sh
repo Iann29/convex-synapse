@@ -110,8 +110,17 @@ Options:
                              instead of replacing it from the archive.
     --doctor                 Run preflight + status checks against an
                              existing install; no mutations.
-    --uninstall              Remove the install + containers; preserves
-                             volumes by default. NOT YET IMPLEMENTED.
+    --uninstall              Remove the install + containers. Takes a
+                             pre-uninstall backup unless --skip-backup;
+                             wipes volumes unless --keep-volumes (a
+                             volume without its matching .env can't
+                             be reused — recover via re-install +
+                             --restore=<backup>).
+    --skip-backup            Skip the pre-uninstall backup (use only
+                             when you're sure you don't need rollback).
+    --keep-volumes           Preserve synapse-data-* + pgdata. Only
+                             useful if you saved .env outside the
+                             install dir.
     --install-dir=<path>     Override $INSTALL_DIR_DEFAULT.
     --version                Print installer version and exit.
     --help                   This message.
@@ -140,6 +149,8 @@ parse_flags() {
     RESTORE_ARCHIVE=""
     KEEP_ENV=0
     UNINSTALL=0
+    SKIP_BACKUP=0
+    KEEP_VOLUMES=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
         case "$1" in
@@ -159,6 +170,8 @@ parse_flags() {
             --keep-env)        KEEP_ENV=1 ;;
             --doctor)          DOCTOR=1 ;;
             --uninstall)       UNINSTALL=1 ;;
+            --skip-backup)     SKIP_BACKUP=1 ;;
+            --keep-volumes)    KEEP_VOLUMES=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
@@ -624,8 +637,22 @@ main() {
         exit $?
     fi
     if (( UNINSTALL )); then
-        echo "--uninstall is not yet implemented (v0.6.1)" >&2
-        exit 2
+        if [[ -w "$(dirname "$LOG_FILE")" ]]; then
+            exec > >(tee -a "$LOG_FILE") 2>&1
+        fi
+        source_libs
+        local un_args=()
+        if (( SKIP_BACKUP )); then
+            un_args+=(--skip-backup)
+        fi
+        if (( KEEP_VOLUMES )); then
+            un_args+=(--keep-volumes)
+        fi
+        if [[ -n "${SYNAPSE_NON_INTERACTIVE:-}" ]]; then
+            un_args+=(--non-interactive)
+        fi
+        lifecycle::uninstall "$INSTALL_DIR" "${un_args[@]}"
+        exit $?
     fi
 
     # Capture all output (stdout + stderr) to the log from this point

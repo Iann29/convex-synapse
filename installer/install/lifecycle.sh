@@ -674,13 +674,19 @@ lifecycle::_restore_inner() {
     fi
 
     # 5. Wipe pgdata so postgres comes up empty, ready to accept the
-    #    pg_dump replay. The volume name follows compose's
-    #    `<project>_<volume>` rule; the project name is the dir
-    #    basename of $compose_file's parent.
-    local project_name
-    project_name="$(basename "$install_dir")"
-    local pgdata_vol="${project_name}_synapse-pgdata"
-    "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+    #    pg_dump replay. Compose's project-name resolution is
+    #    sensitive to COMPOSE_PROJECT_NAME, the compose file's
+    #    parent dir, and operator overrides — we can't reliably
+    #    predict the volume name. Match by suffix instead: any volume
+    #    ending in `synapse-pgdata` is ours. (Real-VPS smoke caught a
+    #    case where compose used 'synapse_synapse-pgdata' even though
+    #    install_dir was /opt/synapse-test, leaving stale pgdata
+    #    behind and breaking the password check on restore.)
+    local pgdata_vol
+    while IFS= read -r pgdata_vol; do
+        [[ -n "$pgdata_vol" ]] || continue
+        "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+    done < <("$docker_cmd" volume ls -q 2>/dev/null | grep 'synapse-pgdata$' || true)
 
     # 6. Bring postgres up alone, wait for it, then pipe the dump in.
     if ! ui::spin "Starting postgres" \
@@ -688,12 +694,17 @@ lifecycle::_restore_inner() {
         ui::fail "compose up postgres failed"
         return 2
     fi
-    # pg_isready loop with a 60s budget. The `docker exec` returns
-    # non-zero when not ready, which we soak via the until.
+    # Postgres on first-init runs an internal-then-real lifecycle:
+    # boots, creates the user, SHUTS DOWN, restarts for real. Plain
+    # `pg_isready` returns 0 during the internal boot, then connections
+    # fail during the shutdown window with "the database system is
+    # shutting down". We need a stronger gate: actually run a trivial
+    # query and retry until it succeeds. 90s budget covers slow VPSes.
     local pg_ready=0
     local elapsed=0
-    while (( elapsed < 60 )); do
-        if "$docker_cmd" exec synapse-postgres pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+    while (( elapsed < 90 )); do
+        if "$docker_cmd" exec synapse-postgres \
+                psql -U "$pg_user" -d "$pg_db" -tAc 'SELECT 1' >/dev/null 2>&1; then
             pg_ready=1
             break
         fi
@@ -701,16 +712,31 @@ lifecycle::_restore_inner() {
         elapsed=$(( elapsed + 1 ))
     done
     if (( ! pg_ready )); then
-        ui::fail "postgres didn't become ready in 60s"
+        ui::fail "postgres didn't accept queries in 90s"
         return 2
     fi
 
     if [[ -f "$stage/synapse.sql.gz" ]]; then
-        if ! ui::spin "Replaying metadata dump" \
-                bash -c "gunzip -c '$stage/synapse.sql.gz' | '$docker_cmd' exec -i synapse-postgres psql -U '$pg_user' -d '$pg_db' -q -v ON_ERROR_STOP=1 >/dev/null 2>&1"; then
-            ui::fail "psql replay failed — DB is in a partial state, inspect manually"
+        # Decompress to a sibling .sql file so psql can read via a
+        # plain `< file` redirect — avoids the bash -c + pipe combo
+        # that swallowed psql's exit code on the synapse-test VPS
+        # (the wrapper-rc was non-zero even when the dump itself
+        # replayed cleanly when re-run by hand).
+        local sql_file="$stage/synapse.sql"
+        if ! gunzip -c "$stage/synapse.sql.gz" > "$sql_file"; then
+            ui::fail "could not decompress synapse.sql.gz from archive"
             return 2
         fi
+        ui::info "Replaying metadata dump"
+        local replay_log="$stage/psql-replay.log"
+        if ! "$docker_cmd" exec -i synapse-postgres psql \
+                -U "$pg_user" -d "$pg_db" \
+                -q -v ON_ERROR_STOP=1 < "$sql_file" >"$replay_log" 2>&1; then
+            ui::fail "psql replay failed — see $replay_log"
+            tail -n 20 "$replay_log" >&2 || true
+            return 2
+        fi
+        ui::success "Replaying metadata dump"
     else
         ui::warn "no synapse.sql.gz in archive — skipping DB restore"
     fi
@@ -732,5 +758,171 @@ lifecycle::_restore_inner() {
 
     ui::success "Restore complete from $archive_path"
     lifecycle::log "$restore_log" "restore success: archive=$archive_path"
+    return 0
+}
+
+# ====================================================================
+# Uninstall (v0.6.1 chunk 3)
+# ====================================================================
+#
+# Mandatory backup-first (--skip-backup overrides for unattended use).
+# Then: stop synapse-managed deployment containers, compose down,
+# wipe pgdata + synapse-data-* (default — see note), strip the
+# host-Caddy managed block if it was a caddy_host install, rm
+# install dir.
+#
+# Why purge volumes by default: pgdata is encrypted with .env's
+# POSTGRES_PASSWORD; synapse-data-* admin keys are stored in
+# postgres rows. Without the matching .env (which lives in the
+# install dir we're about to nuke), the volumes are unusable —
+# postgres will reject the new install's auth attempts (real-VPS
+# smoke caught this on the v0.6.1 chunk 3 first run). The recovery
+# path is: backup-first (always on) → re-install → --restore.
+# `--keep-volumes` preserves them for advanced operators who saved
+# the .env outside the install dir.
+
+# lifecycle::uninstall <install_dir> [options]
+# Options:
+#   --skip-backup           Skip the mandatory pre-uninstall backup
+#   --backup-out=<path>     Where to write the backup (default:
+#                           /tmp/synapse-uninstall-backup-<ts>.tar.gz)
+#   --keep-volumes          Preserve synapse-data-* + pgdata volumes
+#                           (default is to wipe — see contract above)
+#   --non-interactive       Skip the confirmation prompt
+lifecycle::uninstall() {
+    local install_dir="$1"
+    shift
+    local skip_backup=0 keep_volumes=0 non_interactive=0
+    local backup_out=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --skip-backup)        skip_backup=1 ;;
+            --backup-out=*)       backup_out="${1#*=}" ;;
+            --backup-out)         backup_out="${2:-}"; shift ;;
+            --keep-volumes)       keep_volumes=1 ;;
+            --non-interactive)    non_interactive=1 ;;
+        esac
+        shift
+    done
+
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+
+    if [[ ! -f "$env_file" || ! -f "$compose_file" ]]; then
+        ui::fail "no Synapse install at $install_dir"
+        return 2
+    fi
+
+    ui::step "Synapse uninstall"
+    ui::info "Install dir: $install_dir"
+    if (( skip_backup )); then
+        ui::warn "Skipping pre-uninstall backup (--skip-backup)"
+    else
+        if [[ -z "$backup_out" ]]; then
+            local ts
+            ts="$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%s)"
+            backup_out="/tmp/synapse-uninstall-backup-${ts}.tar.gz"
+        fi
+        ui::info "Pre-uninstall backup: $backup_out"
+    fi
+    if (( keep_volumes )); then
+        ui::warn "Volumes preserved (--keep-volumes) — only useful if you saved .env"
+    else
+        ui::info "Volumes will be wiped (recovery via re-install + --restore=<backup>)"
+    fi
+
+    if (( ! non_interactive )); then
+        printf 'This will REMOVE the Synapse install at %s. Continue? [y/N] ' "$install_dir" >&2
+        local reply=""
+        read -r reply || true
+        if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
+            ui::warn "aborted by operator"
+            return 1
+        fi
+    fi
+
+    # 1. Pre-uninstall backup. We tolerate failure here (e.g. postgres
+    #    already gone) to let the operator complete the uninstall —
+    #    but we LOUDLY warn so they know they're nuking without a net.
+    if (( ! skip_backup )); then
+        if ! lifecycle::backup "$install_dir" --out="$backup_out"; then
+            ui::warn "pre-uninstall backup FAILED — continuing anyway, but you have no rollback"
+            ui::warn "abort and inspect with: docker compose -f $compose_file logs --tail=100"
+            ui::warn "or re-run with --skip-backup if you intentionally want no backup"
+        fi
+    fi
+
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+
+    # 2. Force-stop synapse-managed deployment containers. They mount
+    #    synapse-data-* volumes; we need those locks released before
+    #    docker volume rm (which is the default below).
+    ui::spin "Stopping synapse-managed deployment containers" \
+        bash -c "ids=\$('$docker_cmd' ps -aq --filter label=synapse.managed=true 2>/dev/null); if [[ -n \"\$ids\" ]]; then '$docker_cmd' rm -f \$ids >/dev/null 2>&1; fi; true"
+
+    # 3. compose down. We deliberately do NOT pass --volumes here —
+    #    compose only knows about the pgdata volume, not the
+    #    synapse-managed ones, so we wipe everything by hand below
+    #    (when not --keep-volumes). Same code path either way keeps
+    #    the flow predictable.
+    ui::spin "Stopping compose stack" \
+        "$docker_cmd" compose -f "$compose_file" down
+
+    # 4. Wipe synapse-data-* + pgdata (default; --keep-volumes opts out).
+    if (( ! keep_volumes )); then
+        local vol
+        while IFS= read -r vol; do
+            [[ -n "$vol" ]] || continue
+            "$docker_cmd" volume rm "$vol" >/dev/null 2>&1 || true
+        done < <("$docker_cmd" volume ls -q 2>/dev/null | grep -E '^synapse-data-' || true)
+
+        # Match pgdata by suffix — compose's project-name resolution
+        # depends on COMPOSE_PROJECT_NAME / compose-file's parent dir
+        # / operator overrides, so we can't predict the exact name.
+        # Anything ending in `synapse-pgdata` is ours.
+        local pgdata_vol
+        while IFS= read -r pgdata_vol; do
+            [[ -n "$pgdata_vol" ]] || continue
+            "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+        done < <("$docker_cmd" volume ls -q 2>/dev/null | grep 'synapse-pgdata$' || true)
+        ui::success "Volumes wiped"
+    fi
+
+    # 5. Strip the host-Caddy managed block if present. caddy_host
+    #    mode is the only one that touches a shared file outside the
+    #    install dir; the standalone Caddyfile lives in $install_dir
+    #    and goes away with the rm -rf.
+    local caddy_file="${SYNAPSE_HOST_CADDYFILE:-/etc/caddy/Caddyfile}"
+    if [[ -f "$caddy_file" ]] && grep -q '# BEGIN synapse (managed by synapse setup.sh' "$caddy_file"; then
+        local prefix=""
+        prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+        $prefix bash -c "$(declare -f caddy::remove_block); caddy::remove_block '$caddy_file' synapse"
+        ui::success "Removed managed block from $caddy_file"
+        # Best-effort caddy reload — operator may have a non-systemd
+        # caddy or it may already be down. Don't fail uninstall on
+        # reload failure.
+        if detect::has_cmd systemctl; then
+            $prefix systemctl reload caddy 2>/dev/null \
+                || $prefix systemctl restart caddy 2>/dev/null \
+                || ui::warn "couldn't reload caddy — reload manually"
+        fi
+    fi
+
+    # 6. Remove the install dir. Operator's pre-uninstall backup
+    #    lives at $backup_out (outside $install_dir), so this is safe.
+    local prefix=""
+    prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+    if ! $prefix rm -rf "$install_dir"; then
+        ui::fail "could not remove $install_dir — check permissions and inspect by hand"
+        return 2
+    fi
+    ui::success "Removed $install_dir"
+
+    if (( ! skip_backup )) && [[ -f "$backup_out" ]]; then
+        ui::info ""
+        ui::info "Backup preserved at: $backup_out"
+        ui::info "To recover: re-install via setup.sh, then setup.sh --restore=$backup_out"
+    fi
+    ui::success "Synapse uninstalled."
     return 0
 }
