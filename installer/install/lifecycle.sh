@@ -335,12 +335,21 @@ lifecycle::_upgrade_inner() {
     # `set_env_var` force-overwrites; `ensure_env_var` would no-op
     # because SYNAPSE_VERSION already has a value (it's the WHOLE
     # POINT of the stamp).
+    #
+    # Slashes are sanitized to '-' because the stamp may flow into
+    # contexts that reject them (older docker-compose.yml uses
+    # `synapse:${SYNAPSE_VERSION}` as the image tag; an upgrade to
+    # ref=feat/foo would fail with "invalid reference format" without
+    # this. Modern compose pins the tag to `:local` regardless, but
+    # we keep the sanitize as belt-and-suspenders for legacy
+    # installs that haven't picked up the new compose yet.)
     local new_stamp
     if (( is_branch )); then
         new_stamp="$target"
     else
         new_stamp="$stamp_target"
     fi
+    new_stamp="${new_stamp//\//-}"
     secrets::set_env_var "$env_file" SYNAPSE_VERSION "$new_stamp"
 
     ui::success "Upgrade complete: ${current:-unknown} → $new_stamp"

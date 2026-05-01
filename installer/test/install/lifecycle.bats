@@ -431,3 +431,44 @@ EOF
     # README.md from the fake clone made it through rsync.
     [ -f "$INSTALL_DIR/README.md" ]
 }
+
+@test "upgrade: sanitizes slashes in branch refs before stamping" {
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.0
+SYNAPSE_PORT=8080
+EOF
+    cat >"$SYN_MOCK_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+echo "fake" >"$dest/README.md"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=feat/installer-upgrade
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    # Slashes replaced with hyphens — docker image tags reject '/'.
+    assert_output "feat-installer-upgrade"
+}
