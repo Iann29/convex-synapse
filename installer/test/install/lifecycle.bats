@@ -120,8 +120,8 @@ EOF
 if [[ "$1" == "compose" && "$5" == "images" ]]; then
     cat <<JSON
 [
-  {"Service":"synapse","Repository":"convex2-synapse","Tag":"latest","ID":"sha256:aaa"},
-  {"Service":"postgres","Repository":"postgres","Tag":"16","ID":"sha256:bbb"}
+  {"ContainerName":"synapse","Repository":"convex2-synapse","Tag":"latest","ID":"sha256:aaa"},
+  {"ContainerName":"postgres","Repository":"postgres","Tag":"16","ID":"sha256:bbb"}
 ]
 JSON
 fi

@@ -85,8 +85,13 @@ lifecycle::snapshot_images() {
     local cmd="${COMPOSE_CMD:-docker}"
     local jq_cmd="${LIFECYCLE_JQ:-jq}"
     : >"$out"
+    # docker compose images --format json emits .ContainerName (not
+    # .Service); fall back to .Service for forward-compat with future
+    # compose versions that may rename it.
     local jq_filter='.[] | select(.Repository != "" and .ID != "") |
-        [.Service, (.Repository + ":" + (.Tag // "latest")), .ID] | @tsv'
+        [(.ContainerName // .Service // "unknown"),
+         (.Repository + ":" + (.Tag // "latest")),
+         .ID] | @tsv'
     "$cmd" compose -f "$dir/docker-compose.yml" images --format json 2>/dev/null \
         | "$jq_cmd" -r "$jq_filter" >"$out" 2>/dev/null || true
 }
