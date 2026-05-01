@@ -323,6 +323,7 @@ phase_secrets() {
         export POSTGRES_PORT="5432"
         export SYNAPSE_PORT="${SYNAPSE_PORT:-8080}"
         export DASHBOARD_PORT="${DASHBOARD_PORT:-6790}"
+        export CONVEX_DASHBOARD_PORT="${CONVEX_DASHBOARD_PORT:-6791}"
         # Decide the public URL the operator's *browser* and *CLI* will
         # use to reach this Synapse:
         #   --domain set       -> https://<domain> (Caddy fronts it)
@@ -339,15 +340,25 @@ phase_secrets() {
         # at http://<vps-ip>:6790 silently fails because the JS tries
         # to reach the API at localhost:8080 — the operator's own
         # machine, where nothing is listening.
-        local public_url="" allowed_origins="*"
+        #
+        # Same pattern for PUBLIC_CONVEX_DASHBOARD_URL — the URL the
+        # "Open dashboard" button targets. Points at the convex-dashboard
+        # service we run alongside Synapse on port 6791. Different host
+        # (or sub-path) options are reserved for v0.6.3 + custom Caddy
+        # routes; for now the simple "<host>:6791" form covers 100% of
+        # operators who don't already run the standalone elsewhere.
+        local public_url="" public_dash_url="" allowed_origins="*"
         if [[ -n "$DOMAIN" ]]; then
             public_url="https://$DOMAIN"
+            public_dash_url="https://$DOMAIN:${CONVEX_DASHBOARD_PORT}"
             allowed_origins="https://$DOMAIN"
         else
             local detected_ip=""
             if detected_ip="$(detect::public_ip 2>/dev/null)" && [[ -n "$detected_ip" ]]; then
                 public_url="http://${detected_ip}:${SYNAPSE_PORT}"
-                ui::info "Detected public IP $detected_ip — wiring dashboard to $public_url"
+                public_dash_url="http://${detected_ip}:${CONVEX_DASHBOARD_PORT}"
+                ui::info "Detected public IP $detected_ip — wiring Synapse to $public_url"
+                ui::info "Convex Dashboard wired to $public_dash_url"
             else
                 ui::warn "Public IP not detected — dashboard will only work from this VPS"
                 ui::info "  (set --domain=<host> for an externally-reachable install)"
@@ -355,6 +366,7 @@ phase_secrets() {
         fi
         export SYNAPSE_PUBLIC_URL="$public_url"
         export SYNAPSE_ALLOWED_ORIGINS="$allowed_origins"
+        export PUBLIC_CONVEX_DASHBOARD_URL="$public_dash_url"
         local ha_flag="false"
         (( ENABLE_HA )) && ha_flag="true"
         export SYNAPSE_HA_ENABLED="$ha_flag"

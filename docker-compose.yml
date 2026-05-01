@@ -88,24 +88,54 @@ services:
       context: ./dashboard
       # NEXT_PUBLIC_* vars are inlined into the JS bundle at *build*
       # time — Next.js doesn't read them at runtime. We MUST pass the
-      # public URL as a build arg, not just as a runtime env. The
+      # public URLs as build args, not just as runtime envs. The
       # `environment:` block below is kept as a hint for any code
       # path that still consults process.env at runtime, but the
-      # browser-shipped JS comes from this build arg.
+      # browser-shipped JS comes from these build args.
       args:
         NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
+        # URL of the open-source Convex Dashboard (the data/functions/
+        # logs UI for a single deployment). Synapse runs it as the
+        # convex-dashboard service below; setup.sh wires this to
+        # http://<vps-ip>:6791 (or https://<domain>:6791 with TLS).
+        NEXT_PUBLIC_CONVEX_DASHBOARD_URL: ${PUBLIC_CONVEX_DASHBOARD_URL:-http://localhost:6791}
     image: synapse-dashboard:${SYNAPSE_VERSION:-dev}
     container_name: synapse-dashboard
     restart: unless-stopped
     depends_on:
       - synapse
     environment:
-      # Same value as the build arg above; redundant for the
+      # Same values as the build args above; redundant for the
       # browser bundle but useful if any server-side render path
-      # reads it at runtime.
+      # reads them at runtime.
       NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
+      NEXT_PUBLIC_CONVEX_DASHBOARD_URL: ${PUBLIC_CONVEX_DASHBOARD_URL:-http://localhost:6791}
     ports:
       - "${DASHBOARD_PORT:-6790}:3000"
+    networks:
+      - synapse-network
+
+  # ----------------------------------------------------------------
+  # Open-source Convex Dashboard. The "data / functions / logs /
+  # schedules / files" UI for a single deployment — Convex publishes
+  # this as a separate image on ghcr.io. The Synapse dashboard's
+  # "Open dashboard" button targets it via NEXT_PUBLIC_CONVEX_DASHBOARD_URL
+  # (baked into the dashboard build above). The image embeds a static
+  # bundle that takes deploymentName / adminKey / deploymentUrl from
+  # the URL hash and connects to the backend over the public network,
+  # so this container needs no special networking — just a public
+  # port. Each deployment's data flows: operator's browser →
+  # convex-dashboard (static) → operator's browser → Synapse proxy
+  # /d/<name>/* → convex backend container. The dashboard itself
+  # never touches the data; it's just the UI shell.
+  # ----------------------------------------------------------------
+
+  convex-dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    container_name: synapse-convex-dashboard
+    restart: unless-stopped
+    ports:
+      - "${CONVEX_DASHBOARD_PORT:-6791}:6791"
     networks:
       - synapse-network
 
