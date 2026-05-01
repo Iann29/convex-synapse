@@ -125,6 +125,22 @@ remote callers get the loopback URL the provisioner stored.
 *DeploymentsHandler` field for this; new handlers in other files
 should too.
 
+## Convex Dashboard embedding contract (PR #26)
+
+The "data / functions / logs / schedules" UI for a single Convex
+deployment is the upstream open-source `convex-dashboard`, served
+by Synapse as the `convex-dashboard` compose service behind a
+Caddy sidecar that strips `X-Frame-Options` + `frame-ancestors`.
+
+The dashboard fork (`dashboard/app/embed/[name]/page.tsx`) iframes
+it and replies to `dashboard-credentials-request` postMessage with
+`{ type: "dashboard-credentials", adminKey, deploymentUrl, deploymentName }`.
+Origin-restricted to the configured `NEXT_PUBLIC_CONVEX_DASHBOARD_URL`.
+
+Don't add credentials to URL hashes/queries — the upstream dashboard
+silently ignores them. The handshake is the only auto-login path
+that survives `docker pull` of new versions of the upstream image.
+
 ## What "done" looks like
 
 A feature is done when:
