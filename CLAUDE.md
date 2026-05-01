@@ -40,7 +40,7 @@ talks to Synapse with the same shape Cloud uses.
 | `installer/lib/` | Pure-bash detection helpers (detect:: namespace) — OS, arch, pkg manager, sudo, has_*, disk/RAM, public_ip |
 | `installer/install/` | Phase scripts the orchestrator composes (preflight, secrets, caddy, compose, verify, ui) + `lifecycle.sh` (upgrade / backup / restore / uninstall / logs / status) |
 | `installer/templates/` | env.tmpl + caddy.fragment + caddy.standalone — rendered with `{{KEY}}` substitution from exported env vars |
-| `installer/test/` | bats unit tests (275 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
+| `installer/test/` | bats unit tests (305 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
 | `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION, HANDOFF |
 | `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile (backend-postgres + minio) and `caddy` profile (TLS reverse proxy) |
 | `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |
@@ -68,7 +68,7 @@ docker volume ls -q --filter name=synapse-data- | xargs -r docker volume rm
 # Tests
 cd synapse && go test ./... -count=1            # ~18s, integration (146 tests)
 cd dashboard && npx playwright test             # ~2.5min, against live stack (24 specs)
-docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/   # bats (266)
+docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/   # bats (305)
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x setup.sh installer/lib/*.sh installer/install/*.sh
 
 # Real-VPS smoke test (when changes affect setup.sh / compose / Go API surface)

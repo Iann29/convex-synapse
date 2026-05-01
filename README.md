@@ -70,7 +70,7 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 | First-run wizard | dashboard `/login` → `/setup` on a fresh install: admin → demo team/project/deployment in three clicks |
 | Pagination | `?limit&?cursor` + `X-Next-Cursor` on every list endpoint |
 
-**Tests:** ~146 Go integration tests + 24 Playwright e2e + 275 bats unit
+**Tests:** ~146 Go integration tests + 24 Playwright e2e + 305 bats unit
 tests, all green in CI on every push.
 
 For roadmap, design notes, and what's deliberately out of scope, see
