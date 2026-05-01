@@ -254,8 +254,19 @@ func (r *Resolver) Invalidate(name string) {
 	delete(r.cache, name)
 }
 
-// Handler returns an http.Handler mounted at /d/. It expects URLs of the
-// form /d/{name}/{rest...} and forwards to http://{address}/{rest...}.
+// Handler returns an http.Handler that proxies to a Convex backend.
+// Two routing modes are supported simultaneously:
+//
+//  1. **Path-based** (always on): URLs of the form
+//     `/d/{name}/{rest...}` are forwarded to `http://{address}/{rest...}`.
+//     This is the v0.2 contract — every operator with `SYNAPSE_PROXY_ENABLED=true`
+//     gets it.
+//
+//  2. **Host-header-based** (v1.0+, opt-in via baseDomain non-empty):
+//     when `r.Host` matches `<name>.<baseDomain>`, route to the named
+//     deployment using `r.URL.Path` as the upstream path. Lets operators
+//     wire wildcard DNS + on-demand TLS so Convex clients see
+//     `https://<name>.<base>` instead of `<base>/d/<name>`.
 //
 // HA failover: ResolveAll returns the replicas in preference order. The
 // handler tries the first; on a connection-level error (Dial / EOF
@@ -263,26 +274,53 @@ func (r *Resolver) Invalidate(name string) {
 // replica. HTTP-level errors (4xx/5xx from the backend) flow through
 // untouched — they're upstream responses, not unreachable replicas, and
 // the caller should see them.
-func Handler(resolver *Resolver, logger *slog.Logger) http.Handler {
+//
+// Empty baseDomain disables host-based routing — the path form keeps
+// working unchanged, so non-custom-domain installs see no behaviour
+// change.
+func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Strip "/d/" prefix and split off the deployment name.
-		raw := strings.TrimPrefix(r.URL.Path, "/d/")
-		if raw == r.URL.Path {
-			http.NotFound(w, r)
-			return
-		}
-		slash := strings.IndexByte(raw, '/')
 		var name, rest string
-		if slash < 0 {
-			name = raw
-			rest = "/"
-		} else {
-			name = raw[:slash]
-			rest = raw[slash:]
+
+		// Host-based dispatch wins when configured AND the Host
+		// matches. We split on the host's leftmost label so a request
+		// to "bold-fox-1234.synapse.example.com" routes to
+		// "bold-fox-1234". Strip any ":port" suffix Caddy may have
+		// passed through. Empty subdomain (just `.<base>`) is a 404
+		// — there's no deployment to address.
+		if baseDomain != "" {
+			host := r.Host
+			if i := strings.IndexByte(host, ':'); i >= 0 {
+				host = host[:i]
+			}
+			if sub := matchHostSubdomain(host, baseDomain); sub != "" {
+				name, rest = sub, r.URL.Path
+				if rest == "" {
+					rest = "/"
+				}
+			}
+		}
+
+		// Path-based fallback. Either baseDomain isn't configured or
+		// the Host doesn't match — try `/d/{name}/{rest}`.
+		if name == "" {
+			raw := strings.TrimPrefix(r.URL.Path, "/d/")
+			if raw == r.URL.Path {
+				http.NotFound(w, r)
+				return
+			}
+			slash := strings.IndexByte(raw, '/')
+			if slash < 0 {
+				name = raw
+				rest = "/"
+			} else {
+				name = raw[:slash]
+				rest = raw[slash:]
+			}
 		}
 		if name == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -319,6 +357,29 @@ func Handler(resolver *Resolver, logger *slog.Logger) http.Handler {
 		}
 		proxyWithFailover(w, r, addrs, rest, logger, name)
 	})
+}
+
+// matchHostSubdomain returns the leftmost label of `host` when it's a
+// subdomain of `base` (host == "<sub>.<base>"), or "" otherwise. Case-
+// insensitive — DNS isn't case-sensitive, and the operator's `.env` may
+// not match the browser's casing.
+//
+//	matchHostSubdomain("bold-fox.synapse.example.com", "synapse.example.com")
+//	  → "bold-fox"
+//	matchHostSubdomain("synapse.example.com",          "synapse.example.com") → ""
+//	matchHostSubdomain("foo.bar.synapse.example.com",  "synapse.example.com")
+//	  → "foo.bar"
+func matchHostSubdomain(host, base string) string {
+	host = strings.ToLower(host)
+	base = strings.ToLower(strings.Trim(base, "."))
+	if base == "" || host == "" {
+		return ""
+	}
+	suffix := "." + base
+	if !strings.HasSuffix(host, suffix) || host == base {
+		return ""
+	}
+	return host[:len(host)-len(suffix)]
 }
 
 // proxyOnce serves the request via a single replica. Equivalent to the

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -103,6 +104,7 @@ func run() error {
 		Version:               Version,
 		PublicURL:             cfg.PublicURL,
 		ProxyEnabled:          cfg.ProxyEnabled,
+		BaseDomain:            cfg.BaseDomain,
 		HA: api.HAConfig{
 			Enabled:             cfg.HAEnabled,
 			BackendPostgresURL:  cfg.BackendPostgresURL,
@@ -162,21 +164,56 @@ func run() error {
 		}
 	}
 
-	// Reverse-proxy mux: route /d/{name}/* to the proxy package, everything
-	// else to the API router. Mounting via http.NewServeMux keeps this
-	// composable without surgery on chi's tree.
+	// Top-level routing decision tree:
+	//
+	//   1. If BaseDomain is set AND r.Host matches `<sub>.<base>` →
+	//      route to the proxy (custom-domains mode, v1.0+).
+	//   2. Else if path starts with /d/ → route to the proxy (legacy
+	//      path-based mode, v0.2+, controlled by SYNAPSE_PROXY_ENABLED).
+	//   3. Else → route to the API.
+	//
+	// Mounting via http.NewServeMux works for #2+#3 but not #1 (mux
+	// doesn't dispatch on Host). So when BaseDomain is set we wrap
+	// the mux in a Host-checking shim. Both modes coexist: an
+	// internal compose-network call to "synapse:8080/d/foo/bar" still
+	// works even with custom domains turned on.
 	var topHandler http.Handler = handler
-	if cfg.ProxyEnabled {
-		mux := http.NewServeMux()
+	if cfg.ProxyEnabled || cfg.BaseDomain != "" {
 		resolver := &proxy.Resolver{
 			DB:            pool,
 			UseNetworkDNS: cfg.HealthcheckViaNetwork,
 			CacheTTL:      30 * time.Second,
 		}
-		mux.Handle("/d/", proxy.Handler(resolver, logger))
+		proxyH := proxy.Handler(resolver, logger, cfg.BaseDomain)
+
+		mux := http.NewServeMux()
+		mux.Handle("/d/", proxyH)
 		mux.Handle("/", handler)
 		topHandler = mux
-		logger.Info("reverse proxy enabled", "mount", "/d/")
+
+		if cfg.BaseDomain != "" {
+			// Wrap with a Host check. The proxy's matchHostSubdomain
+			// owns the parsing — we duplicate the "ends in .<base>"
+			// test here only to short-circuit the dispatch decision.
+			suffix := "." + strings.ToLower(cfg.BaseDomain)
+			baseLower := strings.ToLower(cfg.BaseDomain)
+			inner := topHandler
+			topHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				host := strings.ToLower(r.Host)
+				if i := strings.IndexByte(host, ':'); i >= 0 {
+					host = host[:i]
+				}
+				if strings.HasSuffix(host, suffix) && host != baseLower {
+					proxyH.ServeHTTP(w, r)
+					return
+				}
+				inner.ServeHTTP(w, r)
+			})
+			logger.Info("custom domains enabled", "base_domain", cfg.BaseDomain)
+		}
+		if cfg.ProxyEnabled {
+			logger.Info("reverse proxy enabled", "mount", "/d/")
+		}
 	}
 
 	srv := &http.Server{

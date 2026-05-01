@@ -110,6 +110,10 @@ type SetupOpts struct {
 	// "<PublicURL>/d/<name>". With ProxyEnabled false, it becomes
 	// "<PublicURL>:<host_port>".
 	ProxyEnabled bool
+	// BaseDomain mirrors api.RouterDeps.BaseDomain (v1.0+). When
+	// non-empty, deployment URLs get rewritten to
+	// "https://<name>.<BaseDomain>" — wins over PublicURL+ProxyEnabled.
+	BaseDomain string
 }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
@@ -186,6 +190,7 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		Version:               "test",
 		PublicURL:             opts.PublicURL,
 		ProxyEnabled:          opts.ProxyEnabled,
+		BaseDomain:            opts.BaseDomain,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a

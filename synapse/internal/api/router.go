@@ -39,6 +39,11 @@ type RouterDeps struct {
 	// "<PublicURL>:<port>" (operator still has to expose the port).
 	ProxyEnabled bool
 
+	// BaseDomain (v1.0+) — when set, deployment URLs become
+	// "https://<name>.<BaseDomain>". Wins over PublicURL+ProxyEnabled.
+	// Empty = custom domains disabled (path-based proxy still works).
+	BaseDomain string
+
 	// HA configuration (v0.5+). Zero value = HA disabled, behaves
 	// exactly like pre-v0.5. When HA.Enabled is true, create_deployment
 	// honours the `ha:true` flag in the request body and provisions
@@ -96,6 +101,7 @@ func NewRouter(d RouterDeps) http.Handler {
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
 		PublicURL:             d.PublicURL,
+		BaseDomain:            d.BaseDomain,
 		ProxyEnabled:          d.ProxyEnabled,
 		HA:                    d.HA,
 		Crypto:                d.Crypto,
@@ -117,6 +123,11 @@ func NewRouter(d RouterDeps) http.Handler {
 		// install_status is also public — the dashboard hits it pre-auth
 		// to decide whether to redirect /login → /setup (first-run wizard).
 		r.Method(http.MethodGet, "/install_status", &InstallStatusHandler{DB: d.DB, Version: d.Version})
+		// TLS-ask for Caddy on-demand TLS (v1.0+). Public, no auth —
+		// Caddy hits it from inside the docker network without a JWT.
+		// The handler rejects any host outside `<sub>.<BaseDomain>`,
+		// so an unconfigured cluster (BaseDomain empty) always 404s.
+		r.Method(http.MethodGet, "/internal/tls_ask", &TLSAskHandler{DB: d.DB, BaseDomain: d.BaseDomain})
 
 		// Authenticated.
 		r.Group(func(r chi.Router) {
