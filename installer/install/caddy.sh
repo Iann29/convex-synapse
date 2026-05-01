@@ -151,6 +151,23 @@ caddy::install_host_block() {
     local tmpl="${2:-$INSTALLER_TEMPLATES/caddy.fragment}"
     local rendered
     rendered="$(caddy::_render "$tmpl")" || return 2
+
+    # v1.0 custom domains: append the wildcard site block. In host-
+    # Caddy mode upstream defaults to 127.0.0.1 (Synapse runs on the
+    # host, not behind a service-name DNS). The operator MUST add
+    # `on_demand_tls { ask http://127.0.0.1:8080/v1/internal/tls_ask }`
+    # to the global block of /etc/caddy/Caddyfile themselves —
+    # the managed BEGIN/END markers can't reach into the global
+    # section.
+    if [[ -n "${SYNAPSE_BASE_DOMAIN:-}" ]]; then
+        local wildcard_tmpl="${3:-$INSTALLER_TEMPLATES/caddy.wildcard}"
+        if [[ -r "$wildcard_tmpl" ]]; then
+            local upstream="${CADDY_UPSTREAM_HOST:-127.0.0.1}"
+            rendered+=$'\n'"$(CADDY_UPSTREAM_HOST="$upstream" \
+                caddy::_render "$wildcard_tmpl")"
+        fi
+    fi
+
     if ! caddy::upsert_block "$caddy_file" "synapse" <<<"$rendered"; then
         echo "caddy::install_host_block: upsert failed" >&2
         return 2
@@ -178,8 +195,11 @@ EOF
 
 # caddy::write_standalone <out_file> <standalone_template>
 # caddy_compose mode. Renders the standalone Caddyfile to a path
-# the docker-compose `caddy` service will mount. Refuses to overwrite
-# an existing file unless CADDY_FORCE_OVERWRITE=1 is set.
+# the docker-compose `caddy` service will mount. When
+# SYNAPSE_BASE_DOMAIN is non-empty, also appends the wildcard
+# block (caddy.wildcard) so per-deployment subdomains work via
+# Caddy on-demand TLS. Refuses to overwrite an existing file unless
+# CADDY_FORCE_OVERWRITE=1.
 caddy::write_standalone() {
     local out="${1:?out path required}"
     local tmpl="${2:-$INSTALLER_TEMPLATES/caddy.standalone}"
@@ -189,6 +209,26 @@ caddy::write_standalone() {
     fi
     local rendered
     rendered="$(caddy::_render "$tmpl")" || return 2
+
+    # v1.0 custom domains: append the wildcard site block when the
+    # operator opted in. The standalone template's global already
+    # carries the on_demand_tls { ask } gate — only the site block
+    # itself is conditional.
+    if [[ -n "${SYNAPSE_BASE_DOMAIN:-}" ]]; then
+        local wildcard_tmpl="${3:-$INSTALLER_TEMPLATES/caddy.wildcard}"
+        if [[ ! -r "$wildcard_tmpl" ]]; then
+            echo "caddy::write_standalone: $wildcard_tmpl unreadable" >&2
+            return 2
+        fi
+        # In compose mode the upstream is the synapse-api service
+        # name on the bridge network (NOT 127.0.0.1 — that resolves
+        # inside the Caddy container). Operators who want a different
+        # upstream can preset CADDY_UPSTREAM_HOST.
+        local upstream="${CADDY_UPSTREAM_HOST:-synapse-api}"
+        CADDY_UPSTREAM_HOST="$upstream" rendered+=$'\n'"$(caddy::_render "$wildcard_tmpl")" \
+            || return 2
+    fi
+
     local tmp
     tmp="$(mktemp "${out}.XXXXXX")" || return 2
     printf '%s' "$rendered" >"$tmp"

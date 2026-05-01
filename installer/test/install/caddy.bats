@@ -207,6 +207,7 @@ EOF
     local out="$BATS_TEST_TMPDIR/Caddyfile.standalone"
     DOMAIN=synapse.example.com ACME_EMAIL=ops@example.com \
     DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    SYNAPSE_BASE_DOMAIN= \
         caddy::write_standalone "$out"
     [ -f "$out" ]
     run grep -c "synapse.example.com" "$out"
@@ -215,11 +216,52 @@ EOF
     assert_output "1"
     # Compose mode uses container names, not localhost — so the
     # Caddy container in synapse-network can reach the upstream
-    # services by service name.
+    # services by service name. Two matches now: one for the main
+    # site's reverse_proxy, one for the on_demand_tls ask URL in
+    # the global block (the ask hook is harmless when no
+    # on-demand site exists, so it stays on regardless).
     run grep -c "synapse-api:8080" "$out"
-    assert_output "1"
+    assert_output "2"
     run grep -c "synapse-dashboard:3000" "$out"
     assert_output "1"
+}
+
+# ---- write_standalone + custom domains -----------------------------
+
+@test "write_standalone: appends wildcard block when SYNAPSE_BASE_DOMAIN set" {
+    local out="$BATS_TEST_TMPDIR/Caddyfile.wildcard"
+    DOMAIN=synapse.example.com ACME_EMAIL=ops@example.com \
+    DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    SYNAPSE_BASE_DOMAIN=synapse.example.com \
+        caddy::write_standalone "$out"
+    [ -f "$out" ]
+    # Wildcard site block present
+    run grep -c '^\*\.synapse.example.com {' "$out"
+    assert_output "1"
+    # On-demand TLS directive in the global block (matches once as
+    # a directive plus once or more in template prose comments —
+    # we just want at least one)
+    run grep -E "^\s*on_demand_tls\s*\{" "$out"
+    assert_success
+    # Ask URL points at synapse-api's /v1/internal/tls_ask (only one
+    # actual directive, even if comments mention it)
+    run grep -E "^\s*ask\s+http://synapse-api:8080/v1/internal/tls_ask" "$out"
+    assert_success
+    # Wildcard reverse_proxy points at the synapse-api service
+    run grep -c "reverse_proxy synapse-api:8080" "$out"
+    assert_output "2"  # one for the main site's catch-all, one for the wildcard
+}
+
+@test "write_standalone: NO wildcard block when SYNAPSE_BASE_DOMAIN empty" {
+    local out="$BATS_TEST_TMPDIR/Caddyfile.no-wildcard"
+    DOMAIN=synapse.example.com ACME_EMAIL=ops@example.com \
+    DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    SYNAPSE_BASE_DOMAIN= \
+        caddy::write_standalone "$out"
+    [ -f "$out" ]
+    # No wildcard site
+    run grep -c "^\*\." "$out"
+    assert_output "0"
 }
 
 @test "write_standalone: refuses to overwrite without CADDY_FORCE_OVERWRITE" {

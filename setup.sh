@@ -101,6 +101,13 @@ Options:
     --domain=<host>          Public hostname for Synapse (e.g.
                              synapse.example.com). Required for
                              non-interactive installs.
+    --base-domain=<host>     Wildcard subdomain for per-deployment
+                             URLs (e.g. synapse.example.com → each
+                             deployment becomes <name>.synapse.example.com).
+                             Requires *.<host> DNS pointed at this VPS;
+                             Caddy on-demand TLS issues certs lazily.
+                             v1.0+. Empty = use the legacy
+                             <PublicURL>/d/<name>/ proxy form.
     --acme-email=<address>   Email for Let's Encrypt account. Defaults
                              to admin@<domain>.
     --enable-ha              Enable HA mode (requires
@@ -176,6 +183,7 @@ EOF
 
 parse_flags() {
     DOMAIN=""
+    BASE_DOMAIN=""
     ACME_EMAIL=""
     ENABLE_HA=0
     NO_TLS=0
@@ -201,6 +209,7 @@ parse_flags() {
     while (( $# > 0 )); do
         case "$1" in
             --domain=*)        DOMAIN="${1#*=}" ;;
+            --base-domain=*)   BASE_DOMAIN="${1#*=}" ;;
             --acme-email=*)    ACME_EMAIL="${1#*=}" ;;
             --enable-ha)       ENABLE_HA=1 ;;
             --no-tls)          NO_TLS=1 ;;
@@ -388,6 +397,9 @@ phase_banner() {
     if [[ -n "$DOMAIN" ]]; then
         ui::info "Domain: $DOMAIN"
     fi
+    if [[ -n "$BASE_DOMAIN" ]]; then
+        ui::info "Custom domains: *.${BASE_DOMAIN#.} (per-deployment subdomains)"
+    fi
 }
 
 phase_preflight() {
@@ -397,7 +409,15 @@ phase_preflight() {
     if (( SKIP_DNS )); then
         domain_arg=""
     fi
-    if ! preflight::run_all "$domain_arg"; then
+    # Pass BASE_DOMAIN through the env so preflight::run_all can pick
+    # up check_base_domain (--skip-dns-check disables it just like
+    # --domain's check_dns).
+    local base_domain_for_preflight="$BASE_DOMAIN"
+    if (( SKIP_DNS )); then
+        base_domain_for_preflight=""
+    fi
+    if ! SYNAPSE_BASE_DOMAIN="$base_domain_for_preflight" \
+            preflight::run_all "$domain_arg"; then
         return 2
     fi
 }
@@ -561,6 +581,11 @@ phase_secrets() {
         export SYNAPSE_PUBLIC_URL="$public_url"
         export SYNAPSE_ALLOWED_ORIGINS="$allowed_origins"
         export PUBLIC_CONVEX_DASHBOARD_URL="$public_dash_url"
+        # Custom domains (v1.0+). Operator passes --base-domain or
+        # presets SYNAPSE_BASE_DOMAIN. Strip leading dots so operators
+        # who type ".synapse.example.com" by accident don't end up
+        # with double dots in URLs.
+        export SYNAPSE_BASE_DOMAIN="${BASE_DOMAIN#.}"
         local ha_flag="false"
         (( ENABLE_HA )) && ha_flag="true"
         export SYNAPSE_HA_ENABLED="$ha_flag"
