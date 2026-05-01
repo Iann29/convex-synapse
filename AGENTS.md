@@ -112,6 +112,39 @@ Cross-reference rules:
   `create_deployment` — Synapse calls `docker run` against it
   directly and 500s with "no such image" otherwise.
 
+## v0.6.1 ground rules (lifecycle commands)
+
+`setup.sh` is the entry point for everything an operator does after
+the initial install — `--upgrade`, `--backup`, `--restore`,
+`--uninstall`, `--logs`, `--status`, `--doctor`. They live in
+`installer/install/lifecycle.sh` (one function per command) and are
+wired via the early-return branches in `setup.sh::main()`.
+
+- **Validate first, mutate second.** Every lifecycle command starts
+  by asserting `$INSTALL_DIR/.env` and `docker-compose.yml` exist.
+  No silent "create on the fly" — the operator wanted to mutate an
+  install they expected to be there.
+- **Audit trail to `$INSTALL_DIR/upgrade.log`** (or `backup.log`,
+  etc). ISO-8601 timestamps. Best-effort — never fails the user
+  request. This is the first thing operators `tail` when something
+  goes sideways.
+- **Cleanup pattern: NO `trap RETURN`.** Bash fires it on every
+  function return inside the trap-setting function (ui::spin,
+  helpers, ...) — you'll wipe your work-dir before rsync ever runs.
+  Wrap the command logic in `_<cmd>_inner` and have the public
+  function rm/cleanup once on return, with state passed back via
+  `printf -v` + a non-shadowing var name. See `lifecycle::upgrade`.
+- **Image tags ≠ version stamps.** `docker-compose.yml` pins
+  `synapse:local` and `synapse-dashboard:local` regardless of
+  `SYNAPSE_VERSION` because the version may contain characters
+  Docker rejects in tags (`feat/foo`). Snapshot/rollback uses
+  image_id, not the tag — so `:local` is robust. Lifecycle commands
+  that stamp a version into .env should also sanitize `/` → `-`
+  belt-and-suspenders for any legacy compose still using
+  `${SYNAPSE_VERSION}` as a tag.
+- **`docker compose images --format json` uses `.ContainerName`,
+  NOT `.Service`.** Older docs/examples have it wrong.
+
 ## URL rewrite contract (PR #10 + #24)
 
 Every endpoint that returns a `models.Deployment` (raw or wrapped)

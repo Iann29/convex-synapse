@@ -115,17 +115,15 @@ Two minutes later, the operator's VPS has Synapse running on `https://<their-dom
   - [x] **Fix-up #25** — `docker-compose.yml` synapse service now passes `SYNAPSE_PUBLIC_URL` + `SYNAPSE_ALLOWED_ORIGINS` from the `.env` into the container. Without this the value lived in `.env` but never reached the binary, so `h.PublicURL` was empty and the rewrite was a no-op even after #24
   - [x] **Fix-up #26** — Convex Dashboard hosted alongside Synapse (the data/functions/logs UI for individual deployments), auto-logged-in via `postMessage` handshake. New `/embed/<name>` route in the dashboard fork iframes the upstream `ghcr.io/get-convex/convex-dashboard` image and replies to its `dashboard-credentials-request` postMessage with the deployment's adminKey + URL. A Caddy sidecar in front of the convex-dashboard container strips its `X-Frame-Options` + `frame-ancestors` headers so the iframe can render. This was originally bookmarked for v0.6.3 but it's UX-critical (without it operators can't see their data), so brought forward
   - [x] Test counts after v0.6.0 + fix-ups: 211 bats + 136 Go (+5 URL-rewrite integration tests); shellcheck `-x` clean across 9 .sh files
-- [ ] **v0.6.1 — Lifecycle commands.** Same binary the installer drops, exposing maintenance subcommands.
-  - [ ] `synapse status` — diagnostic snapshot (containers, ports, DNS, TLS, disk)
-  - [ ] `synapse upgrade` — `git pull && docker compose pull && up -d` with rollback
-  - [ ] `synapse backup` — `pg_dump` + per-deployment volume snapshots → tarball
-  - [ ] `synapse restore <backup.tar>` — reverse of backup
-  - [ ] `synapse uninstall` — remove everything, mandatory backup-first prompt
-  - [ ] `synapse logs <component>` — aggregated logs (synapse / dashboard / postgres / caddy)
-  - [ ] `synapse doctor` — runs the pre-flight checks against an existing install
+- [ ] **v0.6.1 — Lifecycle commands.** `setup.sh` itself exposes maintenance subcommands; same script the installer drops in `$INSTALL_DIR`. **In progress** — chunk 1 (upgrade) lands on `feat/installer-upgrade`.
+  - [x] `setup.sh --doctor` — preflight checks against an existing install (already shipped with v0.6.0)
+  - [x] **Chunk 1** — `setup.sh --upgrade [--ref=<git-ref>] [--force]`: clones target ref → rsync into install dir (preserves .env / Caddyfile / log / snapshot) → pre-pull external images → `compose up -d --build` → wait `/health` → on failure, re-tag from `.upgrade-snapshot.tsv` and bring stack back up. Auto-detects target via GitHub Releases /latest. SYNAPSE_VERSION stamped in .env (slashes sanitized → `-`). Audit log at `$INSTALL_DIR/upgrade.log`. Real-VPS validated v0.6.0 → feat-branch and idempotent re-runs (PR pending). 21 new bats cases + 3 new secrets bats; total 229 bats green; shellcheck clean across 10 .sh files
+  - [ ] **Chunk 2** — `setup.sh --backup` + `--restore <path>`: `pg_dump synapse-postgres` + `tar` of every `synapse-data-*` volume into one timestamped archive; restore reverses
+  - [ ] **Chunk 3** — `setup.sh --uninstall` (mandatory backup-first prompt; `--skip-backup` overrides)
+  - [ ] **Chunk 4** — `setup.sh --logs <component>` (synapse / dashboard / postgres / caddy / convex-dashboard) + `setup.sh --status` (diagnostic snapshot table)
 - [ ] **v0.6.2 — Hosted install script.** `curl -sf https://get.synapse.dev | sh` one-liner pinned to git tags. (`get.synapse.dev` registration deferred — v0.6.2 may ship as a stable GitHub raw URL first.)
 - [ ] **v0.6.3 — Browser-driven first-run wizard.** Dashboard's `/login` redirects to `/setup` when no users exist; walks the operator through admin-create → optional HA → demo deployment + CLI snippet. Operator never sees a config file. The "Open dashboard" standalone-host fix originally scoped here was brought forward to v0.6.0 fix-up #26 (already merged).
-- [ ] **v0.6.4 — Cloud images (stretch).** Pre-built DigitalOcean / Hetzner / Linode snapshots, Packer-built on each tag, listed in each provider's marketplace. Out of scope for the initial v0.6 milestone; bookmarked for v0.7.
+- ~~v0.6.4 — Cloud images (stretch)~~ — deprioritized 2026-05-01; bookmarked for v0.7+ if it surfaces as a real operator ask.
 
 ## v0.5.1 — "HA polish" 📋 DEFERRED
 

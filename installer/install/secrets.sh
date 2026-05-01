@@ -102,6 +102,34 @@ secrets::ensure_env_var() {
     mv -f "$tmp" "$file"
 }
 
+# secrets::set_env_var <env_file> <key> <value>
+# Force-overwrite KEY=value. Same in-place semantics as ensure_env_var
+# but does NOT preserve an existing non-empty value — used for stamps
+# (SYNAPSE_VERSION) that legitimately change on every upgrade. Append
+# the line if the key is missing entirely.
+#
+# Note: the strict idempotency contract on the secret-generators is
+# preserved because nobody calls set_env_var on JWT/PG/storage keys.
+# Reach for this helper only when you actually want a fresh value.
+secrets::set_env_var() {
+    local file="$1" key="$2" value="$3"
+    [[ -f "$file" ]] || { : >"$file"; chmod 0600 "$file"; }
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX")" || return 2
+    if grep -qE "^${key}=" "$file"; then
+        awk -v k="$key" -v v="$value" '
+            BEGIN { FS = "=" }
+            $1 == k { print k "=" v; next }
+            { print }
+        ' "$file" >"$tmp"
+    else
+        cat "$file" >"$tmp"
+        printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    fi
+    chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+    mv -f "$tmp" "$file"
+}
+
 # secrets::render_env_tmpl <template> <out>
 # Substitutes {{KEY}} placeholders in <template> with the values of
 # the same-named exported env vars, writes the result to <out>

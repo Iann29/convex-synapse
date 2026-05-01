@@ -38,7 +38,12 @@ services:
       context: ./synapse
       args:
         VERSION: ${SYNAPSE_VERSION:-dev}
-    image: synapse:${SYNAPSE_VERSION:-dev}
+    # Tagged :local because SYNAPSE_VERSION is human-readable and may
+    # contain characters Docker rejects in tags (e.g. `feat/foo`).
+    # The version stamp lives in .env + the binary's compile-time
+    # constant + .upgrade-snapshot.tsv (image_id) — the docker tag
+    # itself doesn't need to track it.
+    image: synapse:local
     container_name: synapse-api
     restart: unless-stopped
     depends_on:
@@ -99,7 +104,7 @@ services:
         # convex-dashboard service below; setup.sh wires this to
         # http://<vps-ip>:6791 (or https://<domain>:6791 with TLS).
         NEXT_PUBLIC_CONVEX_DASHBOARD_URL: ${PUBLIC_CONVEX_DASHBOARD_URL:-http://localhost:6791}
-    image: synapse-dashboard:${SYNAPSE_VERSION:-dev}
+    image: synapse-dashboard:local
     container_name: synapse-dashboard
     restart: unless-stopped
     depends_on:
