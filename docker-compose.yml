@@ -73,6 +73,14 @@ services:
       # local dev (no rewrite); setup.sh sets it to "https://<domain>"
       # or "http://<public-ip>:<port>" depending on --no-tls.
       SYNAPSE_PUBLIC_URL: ${SYNAPSE_PUBLIC_URL:-}
+      # SYNAPSE_BASE_DOMAIN (v1.0+) — wildcard subdomain for per-
+      # deployment URLs. When set, deployment URLs become
+      # "https://<name>.<base>" and the proxy accepts Host-header
+      # routing. /v1/internal/tls_ask gates Caddy on-demand TLS.
+      # Same pattern as SYNAPSE_PUBLIC_URL above: lives in .env, MUST
+      # be passed through the environment block to actually reach the
+      # binary (real-VPS smoke caught this missing in v1.0 chunk 1).
+      SYNAPSE_BASE_DOMAIN: ${SYNAPSE_BASE_DOMAIN:-}
       # CORS — locked to the dashboard origin in production. Defaults
       # to "*" for local dev so a browser opened against an arbitrary
       # IP/port can still call the API.
