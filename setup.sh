@@ -685,7 +685,16 @@ phase_verify() {
     CURRENT_STEP="verify"
     ui::step "Self-test: register → team → project → deployment"
     local synapse_url="http://localhost:${SYNAPSE_PORT:-8080}"
-    local verify_args=(--keep-demo)
+    # Default: full teardown after success. Leaves the install in a
+    # zero-user / zero-team state so the v0.6.3 first-run wizard at
+    # /setup fires when the operator opens the dashboard. Operators
+    # who want a pre-baked demo deployment can re-run setup.sh with
+    # SYNAPSE_VERIFY_KEEP=1 (keeps the demo + the self-test admin —
+    # the wizard then short-circuits to /login).
+    local verify_args=()
+    if [[ -n "${SYNAPSE_VERIFY_KEEP:-}" ]]; then
+        verify_args+=(--keep-demo)
+    fi
     # When the operator ran with --no-tls or didn't supply --domain,
     # SYNAPSE_PUBLIC_URL is empty and /cli_credentials returns the
     # legacy loopback URL. That's the documented dev/local-only
