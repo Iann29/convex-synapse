@@ -674,13 +674,19 @@ lifecycle::_restore_inner() {
     fi
 
     # 5. Wipe pgdata so postgres comes up empty, ready to accept the
-    #    pg_dump replay. The volume name follows compose's
-    #    `<project>_<volume>` rule; the project name is the dir
-    #    basename of $compose_file's parent.
-    local project_name
-    project_name="$(basename "$install_dir")"
-    local pgdata_vol="${project_name}_synapse-pgdata"
-    "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+    #    pg_dump replay. Compose's project-name resolution is
+    #    sensitive to COMPOSE_PROJECT_NAME, the compose file's
+    #    parent dir, and operator overrides — we can't reliably
+    #    predict the volume name. Match by suffix instead: any volume
+    #    ending in `synapse-pgdata` is ours. (Real-VPS smoke caught a
+    #    case where compose used 'synapse_synapse-pgdata' even though
+    #    install_dir was /opt/synapse-test, leaving stale pgdata
+    #    behind and breaking the password check on restore.)
+    local pgdata_vol
+    while IFS= read -r pgdata_vol; do
+        [[ -n "$pgdata_vol" ]] || continue
+        "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+    done < <("$docker_cmd" volume ls -q 2>/dev/null | grep 'synapse-pgdata$' || true)
 
     # 6. Bring postgres up alone, wait for it, then pipe the dump in.
     if ! ui::spin "Starting postgres" \
@@ -850,18 +856,15 @@ lifecycle::uninstall() {
             "$docker_cmd" volume rm "$vol" >/dev/null 2>&1 || true
         done < <("$docker_cmd" volume ls -q 2>/dev/null | grep -E '^synapse-data-' || true)
 
-        # pgdata volume name follows compose's <project>_<volume>
-        # rule. Compose's project name defaults to the basename of
-        # the dir CONTAINING the compose file, not the install dir
-        # itself when it differs. We try both common candidates so
-        # we don't leave a stale volume behind.
-        local project_name candidate pgdata_candidates=()
-        project_name="$(basename "$install_dir")"
-        pgdata_candidates+=("${project_name}_synapse-pgdata")
-        pgdata_candidates+=("synapse_synapse-pgdata")
-        for candidate in "${pgdata_candidates[@]}"; do
-            "$docker_cmd" volume rm "$candidate" >/dev/null 2>&1 || true
-        done
+        # Match pgdata by suffix — compose's project-name resolution
+        # depends on COMPOSE_PROJECT_NAME / compose-file's parent dir
+        # / operator overrides, so we can't predict the exact name.
+        # Anything ending in `synapse-pgdata` is ours.
+        local pgdata_vol
+        while IFS= read -r pgdata_vol; do
+            [[ -n "$pgdata_vol" ]] || continue
+            "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+        done < <("$docker_cmd" volume ls -q 2>/dev/null | grep 'synapse-pgdata$' || true)
         ui::success "Volumes wiped"
     fi
 

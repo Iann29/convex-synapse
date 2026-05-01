@@ -807,7 +807,12 @@ echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
 case "$1" in
     volume)
         case "$2" in
-            ls) printf 'synapse-data-foo\nsynapse-data-bar\nsomething-else\n' ;;
+            ls)
+                printf 'synapse-data-foo\nsynapse-data-bar\nsomething-else\n'
+                # Two pgdata candidates a real install might have
+                # depending on compose project-name resolution.
+                printf 'install_synapse-pgdata\nsynapse_synapse-pgdata\n'
+                ;;
         esac
         ;;
     ps) echo "" ;;
@@ -822,8 +827,8 @@ EOF
     run cat "$BATS_TEST_TMPDIR/docker.calls"
     assert_output --partial "volume rm synapse-data-foo"
     assert_output --partial "volume rm synapse-data-bar"
-    # pgdata candidates: <install-basename>_synapse-pgdata AND
-    # synapse_synapse-pgdata (legacy installs from a different dir).
+    # Suffix-match wipes EVERY volume ending in synapse-pgdata —
+    # avoids the predict-the-project-name trap.
     assert_output --partial "volume rm install_synapse-pgdata"
     assert_output --partial "volume rm synapse_synapse-pgdata"
     refute_output --partial "volume rm something-else"
