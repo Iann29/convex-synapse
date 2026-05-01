@@ -85,19 +85,20 @@ PR #1 on 2026-04-29.
 - [x] **Chunk 10** — `POST /v1/deployments/{name}/upgrade_to_ha` endpoint with full validation (`ha_disabled` / `ha_misconfigured` / `already_ha` / `cannot_upgrade_adopted` / `deployment_not_running`); worker mechanics deferred to v0.5.1
 - [x] Test counts: ~101 → ~131 Go (added crypto/ha provisioner/proxy/upgrade integration); 16 → 20 Playwright (HA toggle + badge specs)
 
-## v0.6 — "Auto-installer" 🚀 IN PROGRESS
+## v0.6 — "Auto-installer" ✅ DONE
 
-> **The installer is the single most important thing on the roadmap.** Synapse's reason to exist is to make self-hosting Convex painless. The current "clone the repo, edit .env, edit Caddyfile, sudo reload, docker compose up, manually verify" flow is the exact pain we're supposed to be solving. Operators should run **one command** and get a fully-configured production-ready install.
+> **The installer is the single most important thing on the roadmap.** Synapse's reason to exist is to make self-hosting Convex painless. v0.6 ships every piece: foundation + lifecycle commands + `curl | sh` one-liner + browser first-run wizard. Tagged as `v0.6.3` on GitHub Releases.
 
 Full design + phased plan: **[docs/V0_6_INSTALLER_PLAN.md](V0_6_INSTALLER_PLAN.md)**.
 
-North star:
+North star (achieved):
 
 ```
-$ curl -sf https://get.synapse.dev | sh
+$ curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+    | bash -s -- --domain=synapse.example.com
 ```
 
-Two minutes later, the operator's VPS has Synapse running on `https://<their-domain>` with TLS, a registered admin user, and the Convex backend image pre-pulled.
+Three minutes later, the operator's VPS has Synapse running on `https://<their-domain>` with TLS, the admin user created via the browser wizard, and the Convex backend image pre-pulled.
 
 - [x] **v0.6.0 — Foundation ✅ DONE.** `./setup.sh` script + supporting compose changes. **Validated end-to-end against a real Hetzner CPX22** (Ubuntu 24.04). One-line `git clone && ./setup.sh --domain=<host>` produces a working install in ~3 min cold.
   - [x] Chunk 1 — `installer/lib/detect.sh` + `port.sh` — pure-bash helpers + 66 bats unit tests (PR #12; CRLF, Mint codename, `df -kP`, host-deps fixes after independent code-review)
@@ -150,17 +151,32 @@ behind it needs to land), so adding them is a runtime-only change.
 
 ## v1.0 — "Safe to depend on" 🚀 IN PROGRESS
 
-- [x] Audit log writer + reader (subset of cloud's vocabulary)
-- [x] **Custom domains with auto-TLS** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Backend (PR #35) + installer (PR #36) both shipped; real-VPS smoke pending wildcard DNS setup. Subchunks:
+The v1.0 surface area takes Synapse from "works for one operator on a Hetzner box" to "ships to thousands of self-hosters across providers". Each item below is its own chunk-able body of work — operator picks priority.
+
+### ✅ Shipped this milestone
+
+- [x] **Audit log** writer + reader (subset of cloud's vocabulary)
+- [x] **Custom domains with auto-TLS** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Real-VPS smoke pending wildcard DNS setup (operator-side).
   - [x] Chunk 1 — `SYNAPSE_BASE_DOMAIN` config, `publicDeploymentURL` rewrite, proxy Host-header routing, `/v1/internal/tls_ask` endpoint. 14 new Go tests (139 → 146) (PR #35)
   - [x] Chunk 2 — `setup.sh --base-domain=<host>`, env.tmpl, DNS preflight (`check_base_domain` synthetic-subdomain probe), Caddy global `on_demand_tls { ask }`, new `caddy.wildcard` template appended to standalone + host fragments. 7 new bats (266 → 273) (PR #36)
-  - [ ] Chunk 3 — dashboard polish: explain new URL form on the deployment row, success screen mentions custom-domain mode
-- [ ] Volume snapshot backups → S3
-- [ ] RBAC: project-level roles
-- [ ] OAuth/SSO via OIDC (works with Authentik, Zitadel, Keycloak)
-- [ ] Kubernetes provisioner (alternative to Docker)
-- [ ] Helm chart
-- [ ] Public API stability guarantees + versioned releases
+
+### 📋 Left to ship (priority order — operator can override)
+
+Effort scale: **S** ≈ 1 session · **M** ≈ 2-3 sessions · **L** ≈ multi-week.
+
+- [ ] **Custom domains chunk 3 — dashboard polish (S)**. Deployment row hover explains the new URL form; success screen mentions custom-domain mode; operator-facing copy in `--status` reflects the wildcard. No new mechanics.
+
+- [ ] **Volume snapshot backups → S3 (M)**. Extension of v0.6.1 chunk 2 (`setup.sh --backup`). Same archive format, but write to a configured S3 bucket on a cron schedule. Retention policy. Operator opts in via env vars (`SYNAPSE_BACKUP_S3_BUCKET`, `SYNAPSE_BACKUP_SCHEDULE`). Touches: `lifecycle.sh` (s3-aware path), new env vars, audit log entries. Solves: "I lost my VPS, I want my backups in S3."
+
+- [ ] **RBAC: project-level roles (M)**. Today roles are team-scoped (admin / member). Add admin / member / viewer per project so a contractor on team can edit project A but only view project B. Touches: db migration adding `project_members` table, every project handler's authz check, dashboard role-toggle UI in the Members pane. Solves: "I can't safely invite my team without per-project gates."
+
+- [ ] **OAuth / SSO via OIDC (M-L)**. Works with Authentik, Zitadel, Keycloak, Google Workspace, Okta. Auth handler grows an OIDC discovery + callback flow alongside email+password. JWT issuer accepts the OIDC sub claim. Dashboard `/login` adds "Sign in with `<Provider>`" when configured. Touches: `internal/auth/`, `internal/api/auth.go`, dashboard auth, env vars (`SYNAPSE_OIDC_ISSUER`, `SYNAPSE_OIDC_CLIENT_ID`, etc). Solves: "Company won't let me ship without SSO."
+
+- [ ] **Public API stability guarantees + versioned releases (S)**. Already half-shipped — `v0.6.3` tagged on GitHub Releases, `--upgrade` queries the API. Outstanding: semver discipline on the OpenAPI shape (breaking changes bump major), document the contract in `docs/API.md`, add a deprecation policy. Touches: docs only.
+
+- [ ] **Kubernetes provisioner (L)**. Alternative to Docker. The `Provisioner` interface is already factored (`Provision/Destroy/Restart`). Add `internal/k8sprov/` that creates Deployment + Service + PVC per Synapse deployment. Configured via `SYNAPSE_PROVISIONER=k8s` + kubeconfig. Touches: `cmd/server/main.go` wiring, `internal/health/` (k8s-aware status), Helm chart (depends-on). Solves: "I run K8s, can't introduce Docker."
+
+- [ ] **Helm chart (L)**. Installs Synapse on an existing K8s cluster. Helm umbrella over postgres (CloudNative-PG operator), synapse, dashboard, optional cluster-issuer for cert-manager. Depends on the Kubernetes provisioner above. Touches: new `helm/` dir, GitHub Actions to publish to a chart repo on each tag.
 
 ## Maybe never
 
@@ -179,7 +195,7 @@ OpenAPI v1 endpoint coverage today:
 | Profile (`/me`) | ✅ |
 | Teams | ~80% — no SSO, no billing endpoints |
 | Projects | ~70% — no preview deploy keys, no transfer |
-| Deployments | ~60% — no transfer, no custom domains, no patch |
+| Deployments | ~70% — custom domains ✅ (v1.0); no transfer, no patch |
 | Personal access tokens | ✅ create / list / delete |
 | Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |
 | Audit log | ✅ team-scoped read; admin-only |
