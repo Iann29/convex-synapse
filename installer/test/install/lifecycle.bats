@@ -845,3 +845,299 @@ EOF
     assert_output --partial "aborted by operator"
     [ -d "$INSTALL_DIR" ]
 }
+
+# ====================================================================
+# logs (v0.6.1 chunk 4)
+# ====================================================================
+
+@test "logs: aborts when component name is missing" {
+    : >"$COMPOSE_FILE"
+    run lifecycle::logs "$INSTALL_DIR" ""
+    assert_failure 2
+    assert_output --partial "missing component"
+    assert_output --partial "synapse"
+    assert_output --partial "convex-dashboard-proxy"
+}
+
+@test "logs: aborts when component name is unknown and lists valid ones" {
+    : >"$COMPOSE_FILE"
+    run lifecycle::logs "$INSTALL_DIR" "nope"
+    assert_failure 2
+    assert_output --partial "unknown component: nope"
+    assert_output --partial "synapse"
+    assert_output --partial "dashboard"
+    assert_output --partial "postgres"
+    assert_output --partial "caddy"
+    assert_output --partial "convex-dashboard"
+}
+
+@test "logs: aborts when docker-compose.yml is missing" {
+    run lifecycle::logs "$INSTALL_DIR" "synapse"
+    assert_failure 2
+    assert_output --partial "no docker-compose.yml"
+}
+
+@test "logs: defaults to compose logs --tail=200 for valid component" {
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::logs "$INSTALL_DIR" "synapse"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "compose -f $INSTALL_DIR/docker-compose.yml logs --tail=200 synapse"
+    refute_output --partial "--follow"
+}
+
+@test "logs: passes --follow when --follow flag is set" {
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::logs "$INSTALL_DIR" "dashboard" --follow
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "logs --tail=200 --follow dashboard"
+}
+
+@test "logs: forwards a custom --tail=<n>" {
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::logs "$INSTALL_DIR" "postgres" --tail=42
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "logs --tail=42 postgres"
+}
+
+@test "logs: convex-dashboard-proxy is a valid component" {
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::logs "$INSTALL_DIR" "convex-dashboard-proxy"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "convex-dashboard-proxy"
+}
+
+# ====================================================================
+# status (v0.6.1 chunk 4)
+# ====================================================================
+
+@test "status: aborts when .env is missing" {
+    : >"$COMPOSE_FILE"
+    run lifecycle::status "$INSTALL_DIR"
+    assert_failure 2
+    assert_output --partial "no .env"
+}
+
+@test "status: aborts when docker-compose.yml is missing" {
+    : >"$ENV_FILE"
+    run lifecycle::status "$INSTALL_DIR"
+    assert_failure 2
+    assert_output --partial "no docker-compose.yml"
+}
+
+@test "status: prints version + public URL from .env on a healthy stack" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+SYNAPSE_PUBLIC_URL=https://synapse.example.com
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    compose)
+        # `compose -f <file> ps --format ...`
+        printf 'synapse-postgres\tpostgres:16\trunning\tUp 2 hours\n'
+        printf 'synapse\tlocal/synapse:latest\trunning\tUp 1 hour\n'
+        ;;
+    ps)
+        # docker ps --filter label=synapse.managed=true
+        printf 'happy-deployment\nfast-deployment\n'
+        ;;
+    volume)
+        printf 'synapse-data-foo\nsynapse-data-bar\ninstall_synapse-pgdata\nother\n'
+        ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "1.2.3.4"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF'
+#!/usr/bin/env bash
+# First call: s_client → emit cert text on stdout, ignored.
+# Second call: x509 -noout -enddate → emit a far-future expiry.
+# We use ISO-8601 instead of OpenSSL's `Dec 31 23:59:59 2099 GMT`
+# because busybox `date -d` (Alpine in the bats image) only parses
+# ISO-8601. Real systems use GNU date which handles both.
+if [[ "$1" == "s_client" ]]; then
+    echo "(fake-cert)"
+    exit 0
+fi
+if [[ "$1" == "x509" ]]; then
+    echo "notAfter=2099-12-31 23:59:59"
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem      Size  Used Avail Use% Mounted on"
+echo "/dev/sda1       100G   20G   80G  20% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DIG="$SYN_MOCK_BIN/dig" \
+        LIFECYCLE_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        DETECT_PUBLIC_IP_OVERRIDE="1.2.3.4" \
+        run lifecycle::status "$INSTALL_DIR"
+    assert_success
+    assert_output --partial "Version"
+    assert_output --partial "0.6.1"
+    assert_output --partial "synapse.example.com"
+    assert_output --partial "synapse-postgres"
+    assert_output --partial "Deployment containers"
+    assert_output --partial "2 running"
+    assert_output --partial "synapse-data-foo"
+    assert_output --partial "DNS"
+    assert_output --partial "TLS cert"
+    assert_output --partial "Status: OK"
+}
+
+@test "status: counts deployment containers via docker ps --filter label" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+case "$1" in
+    compose) printf 'synapse\tlocal/synapse:latest\trunning\tUp\n' ;;
+    ps)
+        # Sanity: confirm the filter we received.
+        printf 'd-one\nd-two\nd-three\n'
+        ;;
+    volume) : ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem Size Used Avail Use% Mounted on"
+echo "/dev/x 1G 1G 0G 0% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        run lifecycle::status "$INSTALL_DIR"
+    # 3 deployment containers — degraded=0 still, returns 0.
+    assert_success
+    assert_output --partial "3 running"
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "ps --filter label=synapse.managed=true"
+}
+
+@test "status: returns 1 (degraded) when a compose service is exited" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    compose)
+        printf 'synapse-postgres\tpostgres:16\trunning\tUp\n'
+        printf 'synapse\tlocal/synapse:latest\texited\tExited (1) 2 minutes ago\n'
+        ;;
+    ps)     echo "" ;;
+    volume) : ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem Size Used Avail Use% Mounted on"
+echo "/dev/x 1G 1G 0G 0% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        run lifecycle::status "$INSTALL_DIR"
+    assert_failure 1
+    # `Exited` is in the docker ps Status field; case-sensitive match
+    # so we don't false-positive on other words.
+    assert_output --partial "Exited"
+    assert_output --partial "DEGRADED"
+}
+
+@test "status: returns 1 (degraded) when DNS doesn't match this VPS" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+SYNAPSE_PUBLIC_URL=https://wrong.example.com
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    compose) printf 'synapse\tlocal/synapse:latest\trunning\tUp\n' ;;
+    ps)      echo "" ;;
+    volume)  : ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "9.9.9.9"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF'
+#!/usr/bin/env bash
+# Pretend cert fetch silently fails (firewall) so we don't double-warn.
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem Size Used Avail Use% Mounted on"
+echo "/dev/x 1G 1G 0G 0% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DIG="$SYN_MOCK_BIN/dig" \
+        LIFECYCLE_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        DETECT_PUBLIC_IP_OVERRIDE="1.2.3.4" \
+        run lifecycle::status "$INSTALL_DIR"
+    assert_failure 1
+    assert_output --partial "wrong.example.com -> 9.9.9.9"
+    assert_output --partial "DEGRADED"
+}

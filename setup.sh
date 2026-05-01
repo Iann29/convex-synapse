@@ -117,6 +117,18 @@ Options:
                              when you're sure you don't need rollback).
     --purge-volumes          Also wipe per-deployment data volumes +
                              metadata pgdata. Implies data loss.
+    --logs=<component>       Stream docker compose logs for a single
+                             service (synapse, dashboard, postgres,
+                             caddy, convex-dashboard,
+                             convex-dashboard-proxy).
+    --follow                 With --logs, keep tailing (docker compose
+                             logs --follow). Default: one-shot tail.
+    --tail=<n>               With --logs, lines of history to print
+                             before --follow (default: 200).
+    --status                 Print a read-only diagnostic snapshot of
+                             the install: containers, volumes, public
+                             URL, DNS, TLS expiry, disk. Exit 0 healthy,
+                             1 degraded, 2 broken.
     --install-dir=<path>     Override $INSTALL_DIR_DEFAULT.
     --version                Print installer version and exit.
     --help                   This message.
@@ -147,6 +159,10 @@ parse_flags() {
     UNINSTALL=0
     SKIP_BACKUP=0
     PURGE_VOLUMES=0
+    LOGS_COMPONENT=""
+    LOGS_FOLLOW=0
+    LOGS_TAIL=""
+    STATUS=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
         case "$1" in
@@ -168,6 +184,12 @@ parse_flags() {
             --uninstall)       UNINSTALL=1 ;;
             --skip-backup)     SKIP_BACKUP=1 ;;
             --purge-volumes)   PURGE_VOLUMES=1 ;;
+            --logs=*)          LOGS_COMPONENT="${1#*=}" ;;
+            --logs)            LOGS_COMPONENT="${2:-}"; shift ;;
+            --follow)          LOGS_FOLLOW=1 ;;
+            --tail=*)          LOGS_TAIL="${1#*=}" ;;
+            --tail)            LOGS_TAIL="${2:-}"; shift ;;
+            --status)          STATUS=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
@@ -648,6 +670,26 @@ main() {
             un_args+=(--non-interactive)
         fi
         lifecycle::uninstall "$INSTALL_DIR" "${un_args[@]}"
+        exit $?
+    fi
+    if [[ -n "$LOGS_COMPONENT" ]]; then
+        # No tee-to-log: the operator wants the raw stream (often piped
+        # to less / grep). Mixing in installer log noise would break
+        # those pipelines.
+        source_libs
+        local lg_args=()
+        if (( LOGS_FOLLOW )); then
+            lg_args+=(--follow)
+        fi
+        if [[ -n "$LOGS_TAIL" ]]; then
+            lg_args+=(--tail="$LOGS_TAIL")
+        fi
+        lifecycle::logs "$INSTALL_DIR" "$LOGS_COMPONENT" "${lg_args[@]}"
+        exit $?
+    fi
+    if (( STATUS )); then
+        source_libs
+        lifecycle::status "$INSTALL_DIR"
         exit $?
     fi
 
