@@ -472,3 +472,275 @@ EOF
     # Slashes replaced with hyphens — docker image tags reject '/'.
     assert_output "feat-installer-upgrade"
 }
+
+# ====================================================================
+# backup / restore (v0.6.1 chunk 2)
+# ====================================================================
+
+# Helper: minimal install fixture for backup tests.
+_setup_install_fixture() {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+POSTGRES_USER=synapse
+POSTGRES_DB=synapse
+SYNAPSE_PORT=8080
+EOF
+    cat >"$COMPOSE_FILE" <<EOF
+services:
+  synapse: {}
+EOF
+}
+
+# ---- backup: validation -------------------------------------------
+
+@test "backup: aborts when .env is missing" {
+    : >"$COMPOSE_FILE"
+    run lifecycle::backup "$INSTALL_DIR"
+    assert_failure 2
+    assert_output --partial "no Synapse install"
+}
+
+@test "backup: aborts when docker-compose.yml is missing" {
+    : >"$ENV_FILE"
+    run lifecycle::backup "$INSTALL_DIR"
+    assert_failure 2
+    assert_output --partial "no Synapse install"
+}
+
+# ---- backup: happy path -------------------------------------------
+
+@test "backup: produces a tarball with manifest + .env + db dump" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)
+        # docker exec synapse-postgres pg_dump ...
+        if [[ "$2" == "synapse-postgres" && "$3" == "pg_dump" ]]; then
+            echo "-- fake pg_dump output --"
+            exit 0
+        fi
+        ;;
+    volume)
+        case "$2" in
+            ls) printf 'synapse-data-foo\nsynapse-data-bar\nother-vol\n' ;;
+        esac
+        ;;
+    run)
+        # docker run --rm -v $vol:/source ... busybox tar czf /dest/$vol.tar.gz
+        # Find the output tar path from the args.
+        out=""
+        seen=0
+        for a in "$@"; do
+            if (( seen == 1 )); then out="$a"; break; fi
+            [[ "$a" == "tar" ]] && seen=1
+            true
+        done
+        # Cheap synthesis: write an empty gzip-compatible file at the
+        # mounted dest path. The mount target is $stage/volumes (host
+        # side); we infer it from the -v args. Simpler: create a 1-byte
+        # file at the path the next arg names, but that's complex.
+        # Easiest: just make the tar binary work. We only need the
+        # presence of /volumes/<vol>.tar.gz in the staged dir; busybox
+        # is mocked out, so we have to re-create that effect.
+        : # no-op, the staged volumes dir stays empty for unit tests
+        ;;
+esac
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    local out_path="$BATS_TEST_TMPDIR/test-backup.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::backup "$INSTALL_DIR" --out="$out_path"
+    assert_success
+    assert_output --partial "Backup ready"
+    [ -f "$out_path" ]
+
+    # Inspect the archive
+    local extract_dir="$BATS_TEST_TMPDIR/extract"
+    mkdir -p "$extract_dir"
+    tar xzf "$out_path" -C "$extract_dir"
+    [ -f "$extract_dir/manifest.txt" ]
+    [ -f "$extract_dir/.env" ]
+    [ -f "$extract_dir/docker-compose.yml" ]
+    [ -f "$extract_dir/synapse.sql.gz" ]
+    run grep '^format=' "$extract_dir/manifest.txt"
+    assert_output "format=synapse-backup-v1"
+    run grep '^env_included=' "$extract_dir/manifest.txt"
+    assert_output "env_included=1"
+}
+
+@test "backup: --exclude-env omits .env from archive" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)   [[ "$3" == "pg_dump" ]] && echo "-- dump --" ;;
+    volume) [[ "$2" == "ls" ]] && true ;;
+    run)    : ;;
+esac
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    local out_path="$BATS_TEST_TMPDIR/no-env.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::backup "$INSTALL_DIR" --out="$out_path" --exclude-env
+    assert_success
+    local extract_dir="$BATS_TEST_TMPDIR/no-env-extract"
+    mkdir -p "$extract_dir"
+    tar xzf "$out_path" -C "$extract_dir"
+    [ ! -f "$extract_dir/.env" ]
+    run grep '^env_included=' "$extract_dir/manifest.txt"
+    assert_output "env_included=0"
+}
+
+@test "backup: aborts when pg_dump fails (postgres not running)" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "exec" ]] && exit 1   # pg_dump fails
+[[ "$1" == "volume" ]] && true
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::backup "$INSTALL_DIR" --out="$BATS_TEST_TMPDIR/wont-exist.tar.gz"
+    assert_failure 2
+    assert_output --partial "pg_dump failed"
+}
+
+# ---- restore: validation ------------------------------------------
+
+@test "restore: aborts when archive is missing" {
+    _setup_install_fixture
+    run lifecycle::restore "$INSTALL_DIR" "/nope.tar.gz" --non-interactive
+    assert_failure 2
+    assert_output --partial "archive not found"
+}
+
+@test "restore: aborts when archive lacks manifest.txt" {
+    _setup_install_fixture
+    local bad_archive="$BATS_TEST_TMPDIR/bad.tar.gz"
+    local stage="$BATS_TEST_TMPDIR/bad-stage"
+    mkdir -p "$stage"
+    echo "junk" >"$stage/random.txt"
+    tar czf "$bad_archive" -C "$stage" .
+    run lifecycle::restore "$INSTALL_DIR" "$bad_archive" --non-interactive
+    assert_failure 2
+    assert_output --partial "missing manifest.txt"
+}
+
+@test "restore: aborts on unknown manifest format" {
+    _setup_install_fixture
+    local bad_archive="$BATS_TEST_TMPDIR/wrong-fmt.tar.gz"
+    local stage="$BATS_TEST_TMPDIR/wrong-fmt-stage"
+    mkdir -p "$stage"
+    echo "format=synapse-backup-v999" >"$stage/manifest.txt"
+    tar czf "$bad_archive" -C "$stage" .
+    run lifecycle::restore "$INSTALL_DIR" "$bad_archive" --non-interactive
+    assert_failure 2
+    assert_output --partial "unsupported backup format"
+}
+
+@test "restore: --keep-env preserves the current .env across restore" {
+    _setup_install_fixture
+    # Pre-existing .env we want preserved
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.1
+POSTGRES_USER=synapse
+POSTGRES_DB=synapse
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=must-not-be-clobbered
+EOF
+    # Build an archive whose .env is DIFFERENT
+    local archive="$BATS_TEST_TMPDIR/with-env.tar.gz"
+    local stage="$BATS_TEST_TMPDIR/with-env-stage"
+    mkdir -p "$stage/volumes"
+    cat >"$stage/manifest.txt" <<EOF
+format=synapse-backup-v1
+timestamp=20260501-120000
+version=0.6.1
+env_included=1
+volume_count=0
+EOF
+    cat >"$stage/.env" <<EOF
+SYNAPSE_JWT_SECRET=archive-secret-different
+POSTGRES_USER=synapse
+POSTGRES_DB=synapse
+EOF
+    : >"$stage/docker-compose.yml"
+    : >"$stage/synapse.sql.gz"
+    tar czf "$archive" -C "$stage" .
+
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+# minimal: succeed for compose down/up, exec pg_isready, exec psql
+case "$1" in
+    ps)     echo "" ;;
+    rm)     true ;;
+    compose|exec|volume|run) true ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::restore "$INSTALL_DIR" "$archive" --keep-env --non-interactive
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
+    # Original preserved, archive's value rejected.
+    assert_output "must-not-be-clobbered"
+}
+
+@test "restore: replaces .env from archive by default" {
+    _setup_install_fixture
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_JWT_SECRET=before-restore
+POSTGRES_USER=synapse
+POSTGRES_DB=synapse
+SYNAPSE_PORT=8080
+EOF
+    local archive="$BATS_TEST_TMPDIR/replaces.tar.gz"
+    local stage="$BATS_TEST_TMPDIR/replaces-stage"
+    mkdir -p "$stage/volumes"
+    cat >"$stage/manifest.txt" <<EOF
+format=synapse-backup-v1
+timestamp=20260501-120000
+version=0.6.1
+env_included=1
+volume_count=0
+EOF
+    cat >"$stage/.env" <<EOF
+SYNAPSE_JWT_SECRET=after-restore
+POSTGRES_USER=synapse
+POSTGRES_DB=synapse
+EOF
+    : >"$stage/docker-compose.yml"
+    : >"$stage/synapse.sql.gz"
+    tar czf "$archive" -C "$stage" .
+
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    ps) echo "" ;;
+    *)  true ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::restore "$INSTALL_DIR" "$archive" --non-interactive
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
+    assert_output "after-restore"
+}
