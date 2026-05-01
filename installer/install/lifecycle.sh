@@ -734,3 +734,155 @@ lifecycle::_restore_inner() {
     lifecycle::log "$restore_log" "restore success: archive=$archive_path"
     return 0
 }
+
+# ====================================================================
+# Uninstall (v0.6.1 chunk 3)
+# ====================================================================
+#
+# Mandatory backup-first (--skip-backup overrides for unattended use).
+# Then: stop synapse-managed deployment containers, compose down,
+# strip the host-Caddy managed block if it was a caddy_host install,
+# rm install dir. Volumes are preserved by default (operator can
+# always re-install and --restore the backup); --purge-volumes also
+# wipes synapse-data-* and the pgdata volume.
+
+# lifecycle::uninstall <install_dir> [options]
+# Options:
+#   --skip-backup           Skip the mandatory pre-uninstall backup
+#   --backup-out=<path>     Where to write the backup (default:
+#                           /tmp/synapse-uninstall-backup-<ts>.tar.gz)
+#   --purge-volumes         Also remove synapse-data-* volumes and
+#                           the metadata pgdata volume
+#   --non-interactive       Skip the confirmation prompt
+lifecycle::uninstall() {
+    local install_dir="$1"
+    shift
+    local skip_backup=0 purge_volumes=0 non_interactive=0
+    local backup_out=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --skip-backup)        skip_backup=1 ;;
+            --backup-out=*)       backup_out="${1#*=}" ;;
+            --backup-out)         backup_out="${2:-}"; shift ;;
+            --purge-volumes)      purge_volumes=1 ;;
+            --non-interactive)    non_interactive=1 ;;
+        esac
+        shift
+    done
+
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+
+    if [[ ! -f "$env_file" || ! -f "$compose_file" ]]; then
+        ui::fail "no Synapse install at $install_dir"
+        return 2
+    fi
+
+    ui::step "Synapse uninstall"
+    ui::info "Install dir: $install_dir"
+    if (( skip_backup )); then
+        ui::warn "Skipping pre-uninstall backup (--skip-backup)"
+    else
+        if [[ -z "$backup_out" ]]; then
+            local ts
+            ts="$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%s)"
+            backup_out="/tmp/synapse-uninstall-backup-${ts}.tar.gz"
+        fi
+        ui::info "Pre-uninstall backup: $backup_out"
+    fi
+    if (( purge_volumes )); then
+        ui::warn "Will wipe per-deployment volumes AND pgdata (--purge-volumes)"
+    else
+        ui::info "Volumes preserved (re-install + --restore to recover)"
+    fi
+
+    if (( ! non_interactive )); then
+        printf 'This will REMOVE the Synapse install at %s. Continue? [y/N] ' "$install_dir" >&2
+        local reply=""
+        read -r reply || true
+        if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
+            ui::warn "aborted by operator"
+            return 1
+        fi
+    fi
+
+    # 1. Pre-uninstall backup. We tolerate failure here (e.g. postgres
+    #    already gone) to let the operator complete the uninstall —
+    #    but we LOUDLY warn so they know they're nuking without a net.
+    if (( ! skip_backup )); then
+        if ! lifecycle::backup "$install_dir" --out="$backup_out"; then
+            ui::warn "pre-uninstall backup FAILED — continuing anyway, but you have no rollback"
+            ui::warn "abort and inspect with: docker compose -f $compose_file logs --tail=100"
+            ui::warn "or re-run with --skip-backup if you intentionally want no backup"
+        fi
+    fi
+
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+
+    # 2. Force-stop synapse-managed deployment containers. They mount
+    #    synapse-data-* volumes; if --purge-volumes is set we need
+    #    those locks released before docker volume rm.
+    ui::spin "Stopping synapse-managed deployment containers" \
+        bash -c "ids=\$('$docker_cmd' ps -aq --filter label=synapse.managed=true 2>/dev/null); if [[ -n \"\$ids\" ]]; then '$docker_cmd' rm -f \$ids >/dev/null 2>&1; fi; true"
+
+    # 3. compose down. We deliberately do NOT pass --volumes here even
+    #    when --purge-volumes is set — compose only knows about the
+    #    pgdata volume, not the synapse-managed ones, so we wipe
+    #    everything by hand below. Same code path either way keeps
+    #    the flow predictable.
+    ui::spin "Stopping compose stack" \
+        "$docker_cmd" compose -f "$compose_file" down
+
+    # 4. If --purge-volumes, also wipe synapse-data-* + pgdata.
+    if (( purge_volumes )); then
+        local vol
+        while IFS= read -r vol; do
+            [[ -n "$vol" ]] || continue
+            "$docker_cmd" volume rm "$vol" >/dev/null 2>&1 || true
+        done < <("$docker_cmd" volume ls -q 2>/dev/null | grep -E '^synapse-data-' || true)
+
+        local project_name pgdata_vol
+        project_name="$(basename "$install_dir")"
+        pgdata_vol="${project_name}_synapse-pgdata"
+        "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
+        ui::success "Volumes purged"
+    fi
+
+    # 5. Strip the host-Caddy managed block if present. caddy_host
+    #    mode is the only one that touches a shared file outside the
+    #    install dir; the standalone Caddyfile lives in $install_dir
+    #    and goes away with the rm -rf.
+    local caddy_file="${SYNAPSE_HOST_CADDYFILE:-/etc/caddy/Caddyfile}"
+    if [[ -f "$caddy_file" ]] && grep -q '# BEGIN synapse (managed by synapse setup.sh' "$caddy_file"; then
+        local prefix=""
+        prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+        $prefix bash -c "$(declare -f caddy::remove_block); caddy::remove_block '$caddy_file' synapse"
+        ui::success "Removed managed block from $caddy_file"
+        # Best-effort caddy reload — operator may have a non-systemd
+        # caddy or it may already be down. Don't fail uninstall on
+        # reload failure.
+        if detect::has_cmd systemctl; then
+            $prefix systemctl reload caddy 2>/dev/null \
+                || $prefix systemctl restart caddy 2>/dev/null \
+                || ui::warn "couldn't reload caddy — reload manually"
+        fi
+    fi
+
+    # 6. Remove the install dir. Operator's pre-uninstall backup
+    #    lives at $backup_out (outside $install_dir), so this is safe.
+    local prefix=""
+    prefix="$(detect::sudo_cmd 2>/dev/null || true)"
+    if ! $prefix rm -rf "$install_dir"; then
+        ui::fail "could not remove $install_dir — check permissions and inspect by hand"
+        return 2
+    fi
+    ui::success "Removed $install_dir"
+
+    if (( ! skip_backup )) && [[ -f "$backup_out" ]]; then
+        ui::info ""
+        ui::info "Backup preserved at: $backup_out"
+        ui::info "To recover: re-install via setup.sh, then setup.sh --restore=$backup_out"
+    fi
+    ui::success "Synapse uninstalled."
+    return 0
+}

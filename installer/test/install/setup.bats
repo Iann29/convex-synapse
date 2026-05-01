@@ -52,12 +52,14 @@ setup() {
     [[ "$stderr" == *"unknown flag"* ]]
 }
 
-# ---- not-yet-implemented flags fail explicitly ---------------------
+# ---- --uninstall flag wiring ----------------------------------------
 
-@test "setup.sh --uninstall: exit 2 with 'not yet implemented'" {
-    run --separate-stderr "$SETUP" --uninstall
+@test "setup.sh --uninstall: complains when install dir has no .env" {
+    local fake_dir="$BATS_TEST_TMPDIR/empty-uninstall"
+    mkdir -p "$fake_dir"
+    run "$SETUP" --uninstall --non-interactive --install-dir="$fake_dir"
     assert_failure 2
-    [[ "$stderr" == *"not yet implemented"* ]]
+    assert_output --partial "no Synapse install"
 }
 
 # ---- --upgrade flag wiring -----------------------------------------
