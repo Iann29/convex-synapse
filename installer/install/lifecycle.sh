@@ -926,3 +926,275 @@ lifecycle::uninstall() {
     ui::success "Synapse uninstalled."
     return 0
 }
+
+# ====================================================================
+# Logs + Status (v0.6.1 chunk 4)
+# ====================================================================
+#
+# `--logs <component>` is a thin pass-through to `docker compose logs`,
+# scoped to the install dir's compose file so an operator with
+# multiple Synapse instances doesn't have to cd around. Component
+# names are validated against the known compose service set so a typo
+# fails loudly instead of silently tailing nothing.
+#
+# `--status` is read-only — never mutates state. Designed to be the
+# first thing an operator runs when something feels wrong: containers,
+# volumes, public URL, DNS, TLS expiry, disk. Returns 0 when all green,
+# 1 when something is degraded but recoverable, 2 when the install
+# itself is broken (no .env / compose file).
+
+# Components map 1:1 to compose service names. Listing them as an
+# array keeps the validation message and the `case` arms in lock-step.
+LIFECYCLE_LOG_COMPONENTS=(synapse dashboard postgres caddy convex-dashboard convex-dashboard-proxy)
+
+# lifecycle::logs <install_dir> <component> [--follow] [--tail=<n>]
+# Stream/dump compose logs for a single service. We deliberately do
+# NOT capture to a file — operators almost always pipe to less / grep
+# themselves, and saving a file would surprise --follow callers with
+# never-finishing writes.
+lifecycle::logs() {
+    local install_dir="$1"
+    local component="${2:-}"
+    shift 2 2>/dev/null || true
+    local follow=0 tail_n="200"
+    while (( $# > 0 )); do
+        case "$1" in
+            --follow)   follow=1 ;;
+            --tail=*)   tail_n="${1#*=}" ;;
+            --tail)     tail_n="${2:-200}"; shift ;;
+        esac
+        shift
+    done
+
+    local compose_file="$install_dir/docker-compose.yml"
+    if [[ ! -f "$compose_file" ]]; then
+        ui::fail "no docker-compose.yml at $compose_file"
+        return 2
+    fi
+    if [[ -z "$component" ]]; then
+        ui::fail "missing component name"
+        ui::info "Valid components: ${LIFECYCLE_LOG_COMPONENTS[*]}"
+        return 2
+    fi
+    local known=0 c
+    for c in "${LIFECYCLE_LOG_COMPONENTS[@]}"; do
+        if [[ "$c" == "$component" ]]; then
+            known=1
+            break
+        fi
+    done
+    if (( ! known )); then
+        ui::fail "unknown component: $component"
+        ui::info "Valid components: ${LIFECYCLE_LOG_COMPONENTS[*]}"
+        return 2
+    fi
+
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+    local args=(compose -f "$compose_file" logs --tail="$tail_n")
+    if (( follow )); then
+        args+=(--follow)
+    fi
+    args+=("$component")
+    "$docker_cmd" "${args[@]}"
+}
+
+# ---- status helpers ------------------------------------------------
+
+# lifecycle::_status_row <label> <state> <message>
+# Print a label + colored state + message in aligned columns. State is
+# one of: ok | warn | fail. Used for the per-row health summary.
+lifecycle::_status_row() {
+    local label="$1" state="$2" message="$3"
+    case "$state" in
+        ok)   ui::success "$(printf '%-22s %s' "$label" "$message")" ;;
+        warn) ui::warn    "$(printf '%-22s %s' "$label" "$message")" ;;
+        fail) ui::fail    "$(printf '%-22s %s' "$label" "$message")" ;;
+        *)    ui::info    "$(printf '%-22s %s' "$label" "$message")" ;;
+    esac
+}
+
+# lifecycle::status <install_dir>
+# Read-only diagnostic snapshot. Exit codes:
+#   0 — all checks green
+#   1 — at least one degraded check, install is recoverable
+#   2 — install is broken (no .env / no compose file)
+lifecycle::status() {
+    local install_dir="$1"
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+
+    if [[ ! -f "$env_file" ]]; then
+        ui::fail "no .env at $env_file — is this a Synapse install dir?"
+        return 2
+    fi
+    if [[ ! -f "$compose_file" ]]; then
+        ui::fail "no docker-compose.yml at $compose_file"
+        return 2
+    fi
+
+    ui::step "Synapse status"
+    ui::info "Install dir: $install_dir"
+
+    local degraded=0
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+    local dig_cmd="${LIFECYCLE_DIG:-dig}"
+    local openssl_cmd="${LIFECYCLE_OPENSSL:-openssl}"
+    local df_cmd="${LIFECYCLE_DF:-df}"
+
+    # ---- Version + Public URL (.env values) -----------------------
+    local version public_url
+    version="$(secrets::env_get "$env_file" SYNAPSE_VERSION)"
+    public_url="$(secrets::env_get "$env_file" SYNAPSE_PUBLIC_URL)"
+    ui::info ""
+    ui::info "$(printf '%-22s %s' "Version" "${version:-unknown}")"
+    ui::info "$(printf '%-22s %s' "Public URL" "${public_url:-(unset — local-only)}")"
+
+    # ---- Compose stack containers ---------------------------------
+    ui::info ""
+    ui::info "Compose stack containers:"
+    local ps_out
+    if ps_out="$("$docker_cmd" compose -f "$compose_file" ps \
+            --format '{{.Name}}\t{{.Image}}\t{{.State}}\t{{.Status}}' 2>/dev/null)" \
+            && [[ -n "$ps_out" ]]; then
+        while IFS=$'\t' read -r name image state status_str; do
+            [[ -z "$name" ]] && continue
+            local rstate="ok"
+            case "$state" in
+                running)  rstate="ok" ;;
+                restarting|paused|created) rstate="warn"; degraded=1 ;;
+                exited|dead) rstate="fail"; degraded=1 ;;
+                *) rstate="warn"; degraded=1 ;;
+            esac
+            lifecycle::_status_row "  $name" "$rstate" "$image — $status_str"
+        done <<< "$ps_out"
+    else
+        lifecycle::_status_row "Compose stack" "fail" "no containers (compose down?)"
+        degraded=1
+    fi
+
+    # ---- Synapse-managed deployment containers --------------------
+    ui::info ""
+    local managed_count managed_names
+    managed_names="$("$docker_cmd" ps --filter label=synapse.managed=true \
+        --format '{{.Names}}' 2>/dev/null || true)"
+    if [[ -z "$managed_names" ]]; then
+        managed_count=0
+    else
+        managed_count="$(printf '%s\n' "$managed_names" | grep -c .)"
+    fi
+    lifecycle::_status_row "Deployment containers" "ok" "$managed_count running"
+    if (( managed_count > 0 )); then
+        local n
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            ui::info "  - $n"
+        done <<< "$managed_names"
+    fi
+
+    # ---- Volumes --------------------------------------------------
+    ui::info ""
+    ui::info "Volumes:"
+    local vol_list
+    vol_list="$("$docker_cmd" volume ls -q 2>/dev/null \
+        | grep -E '^(synapse-data-|.*_synapse-pgdata$)' || true)"
+    if [[ -z "$vol_list" ]]; then
+        lifecycle::_status_row "  (none)" "warn" "no synapse-data-* / pgdata volumes found"
+    else
+        local v
+        while IFS= read -r v; do
+            [[ -z "$v" ]] && continue
+            ui::info "  - $v"
+        done <<< "$vol_list"
+    fi
+
+    # ---- DNS ------------------------------------------------------
+    # Only meaningful when SYNAPSE_PUBLIC_URL is a hostname (not raw
+    # IP, not localhost). Compare with the host's externally-visible
+    # IP — when those don't match, the dashboard is reachable from
+    # the local VPS but not from the operator's laptop.
+    ui::info ""
+    if [[ -n "$public_url" ]]; then
+        local host
+        host="${public_url#*://}"
+        host="${host%%/*}"
+        host="${host%%:*}"
+        if [[ -n "$host" && ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ \
+                && "$host" != "localhost" ]]; then
+            local resolved my_ip
+            resolved="$("$dig_cmd" +short "$host" 2>/dev/null | head -n1)"
+            my_ip="$(detect::public_ip 2>/dev/null || true)"
+            if [[ -z "$resolved" ]]; then
+                lifecycle::_status_row "DNS" "warn" "$host did not resolve"
+                degraded=1
+            elif [[ -n "$my_ip" && "$resolved" != "$my_ip" ]]; then
+                lifecycle::_status_row "DNS" "warn" \
+                    "$host -> $resolved (this VPS is $my_ip)"
+                degraded=1
+            else
+                lifecycle::_status_row "DNS" "ok" "$host -> $resolved"
+            fi
+        else
+            lifecycle::_status_row "DNS" "ok" "skipped (IP / localhost public URL)"
+        fi
+
+        # ---- TLS expiry --------------------------------------------
+        if [[ "$public_url" == https://* && -n "$host" ]]; then
+            local cert_end days_left
+            cert_end="$(echo | "$openssl_cmd" s_client -servername "$host" \
+                -connect "$host:443" 2>/dev/null \
+                | "$openssl_cmd" x509 -noout -enddate 2>/dev/null \
+                | sed 's/notAfter=//')"
+            if [[ -n "$cert_end" ]]; then
+                local end_epoch now_epoch
+                end_epoch="$(date -d "$cert_end" +%s 2>/dev/null || echo 0)"
+                now_epoch="$(date +%s)"
+                if (( end_epoch > 0 )); then
+                    days_left=$(( (end_epoch - now_epoch) / 86400 ))
+                    if (( days_left < 0 )); then
+                        lifecycle::_status_row "TLS cert" "fail" \
+                            "expired ${days_left#-} days ago ($cert_end)"
+                        degraded=1
+                    elif (( days_left < 14 )); then
+                        lifecycle::_status_row "TLS cert" "warn" \
+                            "expires in $days_left days ($cert_end)"
+                        degraded=1
+                    else
+                        lifecycle::_status_row "TLS cert" "ok" \
+                            "expires in $days_left days ($cert_end)"
+                    fi
+                else
+                    lifecycle::_status_row "TLS cert" "warn" \
+                        "could not parse end date '$cert_end'"
+                    degraded=1
+                fi
+            else
+                lifecycle::_status_row "TLS cert" "warn" \
+                    "could not fetch certificate (firewall? service down?)"
+                degraded=1
+            fi
+        fi
+    else
+        lifecycle::_status_row "DNS" "ok" "skipped (no SYNAPSE_PUBLIC_URL)"
+    fi
+
+    # ---- Disk -----------------------------------------------------
+    ui::info ""
+    local df_target="/var/lib/docker"
+    [[ -d "$df_target" ]] || df_target="/"
+    local df_line
+    df_line="$("$df_cmd" -hP "$df_target" 2>/dev/null | awk 'NR==2 {print}')"
+    if [[ -n "$df_line" ]]; then
+        lifecycle::_status_row "Disk ($df_target)" "ok" "$df_line"
+    else
+        lifecycle::_status_row "Disk ($df_target)" "warn" "df failed"
+        degraded=1
+    fi
+
+    ui::info ""
+    if (( degraded )); then
+        ui::warn "Status: DEGRADED — see warnings above"
+        return 1
+    fi
+    ui::success "Status: OK"
+    return 0
+}
