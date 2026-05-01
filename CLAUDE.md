@@ -40,7 +40,7 @@ talks to Synapse with the same shape Cloud uses.
 | `installer/lib/` | Pure-bash detection helpers (detect:: namespace) — OS, arch, pkg manager, sudo, has_*, disk/RAM, public_ip |
 | `installer/install/` | Phase scripts the orchestrator composes (preflight, secrets, caddy, compose, verify, ui) + `lifecycle.sh` (upgrade / backup / restore / uninstall / logs / status) |
 | `installer/templates/` | env.tmpl + caddy.fragment + caddy.standalone — rendered with `{{KEY}}` substitution from exported env vars |
-| `installer/test/` | bats unit tests (273 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
+| `installer/test/` | bats unit tests (275 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
 | `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION, HANDOFF |
 | `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile (backend-postgres + minio) and `caddy` profile (TLS reverse proxy) |
 | `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |

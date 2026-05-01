@@ -156,15 +156,14 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 ### ✅ Shipped this milestone
 
 - [x] **Audit log** writer + reader (subset of cloud's vocabulary)
-- [x] **Custom domains with auto-TLS** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Real-VPS smoke pending wildcard DNS setup (operator-side).
+- [x] **Custom domains with auto-TLS ✅ DONE** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Real-VPS smoke pending wildcard DNS setup (operator-side).
   - [x] Chunk 1 — `SYNAPSE_BASE_DOMAIN` config, `publicDeploymentURL` rewrite, proxy Host-header routing, `/v1/internal/tls_ask` endpoint. 14 new Go tests (139 → 146) (PR #35)
   - [x] Chunk 2 — `setup.sh --base-domain=<host>`, env.tmpl, DNS preflight (`check_base_domain` synthetic-subdomain probe), Caddy global `on_demand_tls { ask }`, new `caddy.wildcard` template appended to standalone + host fragments. 7 new bats (266 → 273) (PR #36)
+  - [x] Chunk 3 — installer polish: `success_screen` reminds the operator about wildcard DNS when `--base-domain` was used (with copy-pasteable `dig` probe); `--status` shows a `Custom domains *.<host> (v1.0)` row when configured. No backend changes — `publicDeploymentURL` already emits the right URLs to the dashboard. 2 new bats (273 → 275) (PR #37)
 
 ### 📋 Left to ship (priority order — operator can override)
 
 Effort scale: **S** ≈ 1 session · **M** ≈ 2-3 sessions · **L** ≈ multi-week.
-
-- [ ] **Custom domains chunk 3 — dashboard polish (S)**. Deployment row hover explains the new URL form; success screen mentions custom-domain mode; operator-facing copy in `--status` reflects the wildcard. No new mechanics.
 
 - [ ] **Volume snapshot backups → S3 (M)**. Extension of v0.6.1 chunk 2 (`setup.sh --backup`). Same archive format, but write to a configured S3 bucket on a cron schedule. Retention policy. Operator opts in via env vars (`SYNAPSE_BACKUP_S3_BUCKET`, `SYNAPSE_BACKUP_SCHEDULE`). Touches: `lifecycle.sh` (s3-aware path), new env vars, audit log entries. Solves: "I lost my VPS, I want my backups in S3."
 
