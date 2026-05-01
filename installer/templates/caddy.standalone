@@ -8,6 +8,19 @@
     # Email used for Let's Encrypt account registration. Cert renewal
     # warnings go here.
     email {{ACME_EMAIL}}
+
+    # On-demand TLS gate (v1.0+). When SYNAPSE_BASE_DOMAIN is set the
+    # wildcard block below uses `tls { on_demand }`; this `ask`
+    # directive tells Caddy to check with Synapse before issuing a
+    # cert. Synapse's /v1/internal/tls_ask returns 200 only for real,
+    # non-deleted deployments under the base — without it any TLS
+    # handshake to a random subdomain would burn Let's Encrypt
+    # quota. Empty SYNAPSE_BASE_DOMAIN renders an empty `ask` URL,
+    # which Caddy ignores (no on-demand sites means the directive
+    # never fires).
+    on_demand_tls {
+        ask http://synapse-api:8080/v1/internal/tls_ask
+    }
 }
 
 {{DOMAIN}} {

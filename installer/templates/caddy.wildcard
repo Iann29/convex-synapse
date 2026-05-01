@@ -1,0 +1,23 @@
+# Wildcard block for v1.0 custom domains. Appended to the rendered
+# Caddyfile when SYNAPSE_BASE_DOMAIN is set. Each provisioned
+# deployment becomes "<name>.<BASE_DOMAIN>"; Caddy on-demand TLS
+# issues per-host certs lazily.
+#
+# IMPORTANT: this block needs a sibling global directive to gate
+# issuance on real Synapse deployments. Without `on_demand_tls { ask }`
+# anyone could trigger Let's Encrypt cert requests for any subdomain
+# under the base by sending TLS handshakes (Let's Encrypt's rate
+# limits help, but explicit refusal is cleaner).
+#
+# In compose mode (caddy_compose) the standalone Caddyfile already
+# includes the global. In host-Caddy mode the operator has to add
+# the global block to their /etc/caddy/Caddyfile themselves; the
+# managed BEGIN/END markers can't reach into the operator's global
+# section.
+
+*.{{SYNAPSE_BASE_DOMAIN}} {
+    tls {
+        on_demand
+    }
+    reverse_proxy {{CADDY_UPSTREAM_HOST}}:{{SYNAPSE_PORT}}
+}

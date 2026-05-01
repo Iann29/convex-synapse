@@ -410,3 +410,62 @@ EOF
     assert_success
     assert_output --partial "warn"
 }
+
+# ---- check_base_domain (v1.0+ wildcard probe) ----------------------
+
+@test "check_base_domain: empty base -> success (skip)" {
+    run preflight::check_base_domain ""
+    assert_success
+}
+
+@test "check_base_domain: dig missing -> warn" {
+    detect::has_cmd() { [[ "$1" == "dig" ]] && return 1; return 0; }
+    run preflight::check_base_domain "synapse.example.com"
+    assert_failure 1
+    assert_output --partial "'dig' not installed"
+}
+
+@test "check_base_domain: wildcard matches host -> success" {
+    detect::has_cmd() { return 0; }
+    # dig returns the same IP for any subdomain — that's what a
+    # wildcard A record looks like.
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "203.0.113.5"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "203.0.113.5"
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    run preflight::check_base_domain "synapse.example.com"
+    assert_success
+    assert_output --partial "matches this host"
+}
+
+@test "check_base_domain: no wildcard A record -> warn" {
+    detect::has_cmd() { return 0; }
+    mock_cmd dig 0 ""
+    mock_cmd curl 0 "203.0.113.5"
+    run preflight::check_base_domain "synapse.example.com"
+    assert_failure 1
+    assert_output --partial "wildcard not resolving"
+}
+
+@test "check_base_domain: wildcard points elsewhere -> warn" {
+    detect::has_cmd() { return 0; }
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "10.0.0.1"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "203.0.113.5"
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    run preflight::check_base_domain "synapse.example.com"
+    assert_failure 1
+    assert_output --partial "but this host is"
+}

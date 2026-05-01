@@ -219,6 +219,50 @@ preflight::check_dns() {
     return 1
 }
 
+# preflight::check_base_domain <base_domain>
+# Probe wildcard DNS (`*.<base>` → host's public IP) by querying a
+# synthetic random subdomain. If the wildcard A record is set, the
+# resolver returns the same IP for any subdomain (including ones that
+# don't exist). Mismatches surface as warns — operator may still be
+# in DNS propagation; --skip-dns-check is the explicit override.
+preflight::check_base_domain() {
+    local base="${1:-}"
+    if [[ -z "$base" ]]; then
+        return 0
+    fi
+    if ! detect::has_cmd dig; then
+        ui::warn "Custom domains: 'dig' not installed; can't verify *.${base} wildcard"
+        return 1
+    fi
+    if ! detect::has_cmd curl; then
+        ui::warn "Custom domains: 'curl' not installed; can't compare against public IP"
+        return 1
+    fi
+    # Random subdomain so caches don't lie. If the wildcard isn't
+    # configured, dig returns nothing for a never-resolved name.
+    local probe rand
+    rand="${RANDOM}-${RANDOM}"
+    probe="probe-${rand}.${base}"
+    local resolved my_ip
+    resolved="$(dig +short "$probe" 2>/dev/null | head -n1)"
+    my_ip="$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "")"
+    if [[ -z "$resolved" ]]; then
+        ui::warn "Custom domains: *.${base} wildcard not resolving (dig $probe → empty)"
+        ui::info "  Add an A record for *.${base} pointing at this host."
+        return 1
+    fi
+    if [[ -z "$my_ip" ]]; then
+        ui::warn "Custom domains: can't determine this host's public IP; resolved $probe → $resolved"
+        return 1
+    fi
+    if [[ "$resolved" == "$my_ip" ]]; then
+        ui::success "Custom domains: *.${base} wildcard → $resolved (matches this host)"
+        return 0
+    fi
+    ui::warn "Custom domains: *.${base} wildcard → $resolved, but this host is $my_ip"
+    return 1
+}
+
 # preflight::run_all [domain]
 # Runs every check in order. Returns:
 #   0 — all pass (or pass+warn)
@@ -230,13 +274,17 @@ preflight::check_dns() {
 # VPS ready?".
 preflight::run_all() {
     local domain="${1:-}"
+    local base_domain="${SYNAPSE_BASE_DOMAIN:-}"
     local fails=0 warns=0
     local checks=(check_os check_arch check_sudo check_docker check_compose check_disk check_ram check_outbound)
     [[ -n "$domain" ]] && checks+=(check_dns)
+    [[ -n "$base_domain" ]] && checks+=(check_base_domain)
     local check rc
     for check in "${checks[@]}"; do
         if [[ "$check" == "check_dns" ]]; then
             preflight::"$check" "$domain"
+        elif [[ "$check" == "check_base_domain" ]]; then
+            preflight::"$check" "$base_domain"
         else
             preflight::"$check"
         fi
