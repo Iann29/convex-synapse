@@ -799,7 +799,7 @@ EOF
     [ ! -d "$INSTALL_DIR" ]
 }
 
-@test "uninstall: --purge-volumes calls docker volume rm for synapse-data-*" {
+@test "uninstall: wipes synapse-data-* + pgdata by default" {
     _setup_install_fixture
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -817,16 +817,41 @@ EOF
     chmod +x "$SYN_MOCK_BIN/docker"
     COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
         run lifecycle::uninstall "$INSTALL_DIR" \
-            --non-interactive --skip-backup --purge-volumes
+            --non-interactive --skip-backup
     assert_success
     run cat "$BATS_TEST_TMPDIR/docker.calls"
     assert_output --partial "volume rm synapse-data-foo"
     assert_output --partial "volume rm synapse-data-bar"
-    # Pgdata volume name follows compose's <project>_<volume> rule.
-    # Our fixture has install dir named "install", so pgdata =
-    # install_synapse-pgdata.
+    # pgdata candidates: <install-basename>_synapse-pgdata AND
+    # synapse_synapse-pgdata (legacy installs from a different dir).
     assert_output --partial "volume rm install_synapse-pgdata"
+    assert_output --partial "volume rm synapse_synapse-pgdata"
     refute_output --partial "volume rm something-else"
+}
+
+@test "uninstall: --keep-volumes preserves volumes (only useful with saved .env)" {
+    _setup_install_fixture
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+case "$1" in
+    volume)
+        case "$2" in
+            ls) printf 'synapse-data-foo\n' ;;
+        esac
+        ;;
+    ps) echo "" ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        run lifecycle::uninstall "$INSTALL_DIR" \
+            --non-interactive --skip-backup --keep-volumes
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    refute_output --partial "volume rm synapse-data-foo"
+    refute_output --partial "volume rm install_synapse-pgdata"
 }
 
 @test "uninstall: aborts when operator declines confirmation" {

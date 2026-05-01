@@ -741,30 +741,39 @@ lifecycle::_restore_inner() {
 #
 # Mandatory backup-first (--skip-backup overrides for unattended use).
 # Then: stop synapse-managed deployment containers, compose down,
-# strip the host-Caddy managed block if it was a caddy_host install,
-# rm install dir. Volumes are preserved by default (operator can
-# always re-install and --restore the backup); --purge-volumes also
-# wipes synapse-data-* and the pgdata volume.
+# wipe pgdata + synapse-data-* (default — see note), strip the
+# host-Caddy managed block if it was a caddy_host install, rm
+# install dir.
+#
+# Why purge volumes by default: pgdata is encrypted with .env's
+# POSTGRES_PASSWORD; synapse-data-* admin keys are stored in
+# postgres rows. Without the matching .env (which lives in the
+# install dir we're about to nuke), the volumes are unusable —
+# postgres will reject the new install's auth attempts (real-VPS
+# smoke caught this on the v0.6.1 chunk 3 first run). The recovery
+# path is: backup-first (always on) → re-install → --restore.
+# `--keep-volumes` preserves them for advanced operators who saved
+# the .env outside the install dir.
 
 # lifecycle::uninstall <install_dir> [options]
 # Options:
 #   --skip-backup           Skip the mandatory pre-uninstall backup
 #   --backup-out=<path>     Where to write the backup (default:
 #                           /tmp/synapse-uninstall-backup-<ts>.tar.gz)
-#   --purge-volumes         Also remove synapse-data-* volumes and
-#                           the metadata pgdata volume
+#   --keep-volumes          Preserve synapse-data-* + pgdata volumes
+#                           (default is to wipe — see contract above)
 #   --non-interactive       Skip the confirmation prompt
 lifecycle::uninstall() {
     local install_dir="$1"
     shift
-    local skip_backup=0 purge_volumes=0 non_interactive=0
+    local skip_backup=0 keep_volumes=0 non_interactive=0
     local backup_out=""
     while (( $# > 0 )); do
         case "$1" in
             --skip-backup)        skip_backup=1 ;;
             --backup-out=*)       backup_out="${1#*=}" ;;
             --backup-out)         backup_out="${2:-}"; shift ;;
-            --purge-volumes)      purge_volumes=1 ;;
+            --keep-volumes)       keep_volumes=1 ;;
             --non-interactive)    non_interactive=1 ;;
         esac
         shift
@@ -790,10 +799,10 @@ lifecycle::uninstall() {
         fi
         ui::info "Pre-uninstall backup: $backup_out"
     fi
-    if (( purge_volumes )); then
-        ui::warn "Will wipe per-deployment volumes AND pgdata (--purge-volumes)"
+    if (( keep_volumes )); then
+        ui::warn "Volumes preserved (--keep-volumes) — only useful if you saved .env"
     else
-        ui::info "Volumes preserved (re-install + --restore to recover)"
+        ui::info "Volumes will be wiped (recovery via re-install + --restore=<backup>)"
     fi
 
     if (( ! non_interactive )); then
@@ -820,32 +829,40 @@ lifecycle::uninstall() {
     local docker_cmd="${COMPOSE_CMD:-docker}"
 
     # 2. Force-stop synapse-managed deployment containers. They mount
-    #    synapse-data-* volumes; if --purge-volumes is set we need
-    #    those locks released before docker volume rm.
+    #    synapse-data-* volumes; we need those locks released before
+    #    docker volume rm (which is the default below).
     ui::spin "Stopping synapse-managed deployment containers" \
         bash -c "ids=\$('$docker_cmd' ps -aq --filter label=synapse.managed=true 2>/dev/null); if [[ -n \"\$ids\" ]]; then '$docker_cmd' rm -f \$ids >/dev/null 2>&1; fi; true"
 
-    # 3. compose down. We deliberately do NOT pass --volumes here even
-    #    when --purge-volumes is set — compose only knows about the
-    #    pgdata volume, not the synapse-managed ones, so we wipe
-    #    everything by hand below. Same code path either way keeps
+    # 3. compose down. We deliberately do NOT pass --volumes here —
+    #    compose only knows about the pgdata volume, not the
+    #    synapse-managed ones, so we wipe everything by hand below
+    #    (when not --keep-volumes). Same code path either way keeps
     #    the flow predictable.
     ui::spin "Stopping compose stack" \
         "$docker_cmd" compose -f "$compose_file" down
 
-    # 4. If --purge-volumes, also wipe synapse-data-* + pgdata.
-    if (( purge_volumes )); then
+    # 4. Wipe synapse-data-* + pgdata (default; --keep-volumes opts out).
+    if (( ! keep_volumes )); then
         local vol
         while IFS= read -r vol; do
             [[ -n "$vol" ]] || continue
             "$docker_cmd" volume rm "$vol" >/dev/null 2>&1 || true
         done < <("$docker_cmd" volume ls -q 2>/dev/null | grep -E '^synapse-data-' || true)
 
-        local project_name pgdata_vol
+        # pgdata volume name follows compose's <project>_<volume>
+        # rule. Compose's project name defaults to the basename of
+        # the dir CONTAINING the compose file, not the install dir
+        # itself when it differs. We try both common candidates so
+        # we don't leave a stale volume behind.
+        local project_name candidate pgdata_candidates=()
         project_name="$(basename "$install_dir")"
-        pgdata_vol="${project_name}_synapse-pgdata"
-        "$docker_cmd" volume rm "$pgdata_vol" >/dev/null 2>&1 || true
-        ui::success "Volumes purged"
+        pgdata_candidates+=("${project_name}_synapse-pgdata")
+        pgdata_candidates+=("synapse_synapse-pgdata")
+        for candidate in "${pgdata_candidates[@]}"; do
+            "$docker_cmd" volume rm "$candidate" >/dev/null 2>&1 || true
+        done
+        ui::success "Volumes wiped"
     fi
 
     # 5. Strip the host-Caddy managed block if present. caddy_host

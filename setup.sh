@@ -112,11 +112,15 @@ Options:
                              existing install; no mutations.
     --uninstall              Remove the install + containers. Takes a
                              pre-uninstall backup unless --skip-backup;
-                             preserves volumes unless --purge-volumes.
+                             wipes volumes unless --keep-volumes (a
+                             volume without its matching .env can't
+                             be reused — recover via re-install +
+                             --restore=<backup>).
     --skip-backup            Skip the pre-uninstall backup (use only
                              when you're sure you don't need rollback).
-    --purge-volumes          Also wipe per-deployment data volumes +
-                             metadata pgdata. Implies data loss.
+    --keep-volumes           Preserve synapse-data-* + pgdata. Only
+                             useful if you saved .env outside the
+                             install dir.
     --install-dir=<path>     Override $INSTALL_DIR_DEFAULT.
     --version                Print installer version and exit.
     --help                   This message.
@@ -146,7 +150,7 @@ parse_flags() {
     KEEP_ENV=0
     UNINSTALL=0
     SKIP_BACKUP=0
-    PURGE_VOLUMES=0
+    KEEP_VOLUMES=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     while (( $# > 0 )); do
         case "$1" in
@@ -167,7 +171,7 @@ parse_flags() {
             --doctor)          DOCTOR=1 ;;
             --uninstall)       UNINSTALL=1 ;;
             --skip-backup)     SKIP_BACKUP=1 ;;
-            --purge-volumes)   PURGE_VOLUMES=1 ;;
+            --keep-volumes)    KEEP_VOLUMES=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
@@ -641,8 +645,8 @@ main() {
         if (( SKIP_BACKUP )); then
             un_args+=(--skip-backup)
         fi
-        if (( PURGE_VOLUMES )); then
-            un_args+=(--purge-volumes)
+        if (( KEEP_VOLUMES )); then
+            un_args+=(--keep-volumes)
         fi
         if [[ -n "${SYNAPSE_NON_INTERACTIVE:-}" ]]; then
             un_args+=(--non-interactive)
