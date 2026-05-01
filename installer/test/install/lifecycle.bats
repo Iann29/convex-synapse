@@ -228,6 +228,34 @@ EOF
     assert_output --partial "Already on 0.6.1"
 }
 
+@test "upgrade: NEVER short-circuits when target is a feat/* branch" {
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=feat/installer-upgrade
+EOF
+    cat >"$SYN_MOCK_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/jq"
+    LIFECYCLE_GIT="$SYN_MOCK_BIN/git" COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=feat/installer-upgrade
+    assert_failure 2
+    refute_output --partial "Already on"
+    assert_output --partial "git clone failed"
+}
+
 @test "upgrade: NEVER short-circuits when target is main (moving target)" {
     # Rig `git clone` to fail so we fast-fail at step 5 — proves we
     # got past the short-circuit. We only care that we don't bail at

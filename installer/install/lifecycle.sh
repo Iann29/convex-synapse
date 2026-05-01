@@ -226,13 +226,14 @@ lifecycle::_upgrade_inner() {
 
     # --- 3. skip if already on latest ------------------------------
     # Strip leading "v" so "v0.6.1" matches the bare "0.6.1" we stamp
-    # in .env. Branch refs (main, develop) are moving targets, never
-    # short-circuit those — operator chasing main shouldn't need
-    # --force every run.
+    # in .env. Branch refs are moving targets — never short-circuit
+    # those, operator chasing main shouldn't need --force every run.
+    # Heuristic: anything matching v?X.Y.Z is a tag (semver), anything
+    # else (main, develop, feat/foo, fix/bar, ...) is a branch.
     local stamp_target="${target#v}"
-    local is_branch=0
-    if [[ "$target" == "main" || "$target" == "develop" ]]; then
-        is_branch=1
+    local is_branch=1
+    if [[ "$target" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        is_branch=0
     fi
     if (( ! is_branch )) && [[ "$stamp_target" == "$current" ]] && (( ! force )); then
         ui::success "Already on $current — pass --force to re-run anyway"
