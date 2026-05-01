@@ -1175,3 +1175,93 @@ EOF
     assert_output --partial "wrong.example.com -> 9.9.9.9"
     assert_output --partial "DEGRADED"
 }
+
+@test "status: shows custom-domains row when SYNAPSE_BASE_DOMAIN is set" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=1.0.0
+SYNAPSE_PUBLIC_URL=https://synapse.example.com
+SYNAPSE_BASE_DOMAIN=synapse.example.com
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    compose) printf 'synapse-api\tlocal/synapse:latest\trunning\tUp 1 minute\n' ;;
+    ps) ;;
+    volume) ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "1.2.3.4"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "s_client" ]] && { echo "(fake)"; exit 0; }
+[[ "$1" == "x509" ]] && { echo "notAfter=2099-12-31 23:59:59"; exit 0; }
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem Size Used Avail Use% Mounted on"
+echo "/dev/x 100G 20G 80G 20% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DIG="$SYN_MOCK_BIN/dig" \
+        LIFECYCLE_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        DETECT_PUBLIC_IP_OVERRIDE="1.2.3.4" \
+        run lifecycle::status "$INSTALL_DIR"
+    assert_success
+    assert_output --partial "Custom domains"
+    assert_output --partial "*.synapse.example.com"
+}
+
+@test "status: omits custom-domains row when SYNAPSE_BASE_DOMAIN is unset" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=0.6.3
+SYNAPSE_PUBLIC_URL=https://synapse.example.com
+EOF
+    : >"$COMPOSE_FILE"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    compose) printf 'synapse-api\tlocal/synapse:latest\trunning\tUp 1 minute\n' ;;
+    ps) ;;
+    volume) ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/dig" <<'EOF'
+#!/usr/bin/env bash
+echo "1.2.3.4"
+EOF
+    chmod +x "$SYN_MOCK_BIN/dig"
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "s_client" ]] && { echo "(fake)"; exit 0; }
+[[ "$1" == "x509" ]] && { echo "notAfter=2099-12-31 23:59:59"; exit 0; }
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+echo "Filesystem Size Used Avail Use% Mounted on"
+echo "/dev/x 100G 20G 80G 20% /"
+EOF
+    chmod +x "$SYN_MOCK_BIN/df"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_DIG="$SYN_MOCK_BIN/dig" \
+        LIFECYCLE_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_DF="$SYN_MOCK_BIN/df" \
+        DETECT_PUBLIC_IP_OVERRIDE="1.2.3.4" \
+        run lifecycle::status "$INSTALL_DIR"
+    assert_success
+    refute_output --partial "Custom domains"
+}
