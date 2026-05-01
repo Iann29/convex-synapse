@@ -114,6 +114,9 @@ func NewRouter(d RouterDeps) http.Handler {
 
 		// Public.
 		r.Mount("/auth", authH.Routes())
+		// install_status is also public — the dashboard hits it pre-auth
+		// to decide whether to redirect /login → /setup (first-run wizard).
+		r.Method(http.MethodGet, "/install_status", &InstallStatusHandler{DB: d.DB, Version: d.Version})
 
 		// Authenticated.
 		r.Group(func(r chi.Router) {

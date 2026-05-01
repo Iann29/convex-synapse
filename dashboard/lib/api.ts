@@ -423,6 +423,15 @@ export const api = {
     },
   },
 
+  // First-run wizard probe. Public — no auth, hit pre-login. firstRun
+  // is true iff the users table is empty (operator just bootstrapped
+  // Synapse). Drives /login → /setup redirects.
+  installStatus(): Promise<{ firstRun: boolean; version: string }> {
+    return request<{ firstRun: boolean; version: string }>("/v1/install_status", {
+      auth: false,
+    });
+  },
+
   // Personal access tokens. The plaintext token comes back ONCE in `create()` —
   // callers must surface it to the user immediately and stash it; the server
   // only stores a SHA-256 hash and can never recover the original.
