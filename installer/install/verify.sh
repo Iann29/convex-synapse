@@ -182,9 +182,37 @@ verify::run() {
     fi
 
     if (( keep == 0 )); then
+        # Full teardown: deployment first (Docker container + volume),
+        # then the team (CASCADEs project + invites + members). The
+        # self-test admin user is left dangling but harmless on its
+        # own. Critically, we wipe the team so the user is no longer
+        # a team-creator (FK ON DELETE RESTRICT on teams.creator),
+        # then wipe the user via direct postgres-delete so the dashboard
+        # at /v1/install_status reports firstRun=true on next paint —
+        # the v0.6.3 wizard depends on that.
         ui::info "Self-test: tearing down demo deployment"
         verify::_curl DELETE "$url/v1/deployments/$dep" >/dev/null || \
             ui::warn "Self-test: demo cleanup returned non-zero (operator can delete via dashboard)"
+
+        ui::info "Self-test: tearing down demo team"
+        verify::_curl DELETE "$url/v1/teams/$team" >/dev/null || \
+            ui::warn "Self-test: team cleanup returned non-zero"
+
+        # The auth API has no /delete_self today (v1.0+); delete via
+        # postgres directly. Best-effort — if the docker exec fails
+        # the operator's first-run wizard simply doesn't appear (they
+        # can still log in with the printed VERIFY_EMAIL / VERIFY_PASSWORD,
+        # or wipe with `setup.sh --uninstall`).
+        local pg_user pg_db
+        pg_user="${POSTGRES_USER:-synapse}"
+        pg_db="${POSTGRES_DB:-synapse}"
+        local docker_cmd="${VERIFY_DOCKER:-docker}"
+        ui::info "Self-test: removing one-shot admin user ($email)"
+        if ! "$docker_cmd" exec synapse-postgres \
+                psql -U "$pg_user" -d "$pg_db" -tAc \
+                "DELETE FROM users WHERE email = '$email';" >/dev/null 2>&1; then
+            ui::warn "Self-test: could not delete self-test user — first-run wizard may not show"
+        fi
     fi
     return 0
 }
