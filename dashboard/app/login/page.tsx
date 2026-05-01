@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ApiError, api } from "@/lib/api";
@@ -13,6 +13,27 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+
+  // First-run redirect: when no admin exists yet, push the operator
+  // through /setup instead of asking them to log in to nothing. The
+  // probe is unauthenticated; failures (network, DB hiccup) are
+  // ignored so the login form remains accessible as a fallback.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .installStatus()
+      .then((s) => {
+        if (!cancelled && s.firstRun) {
+          router.replace("/setup");
+        }
+      })
+      .catch(() => {
+        /* fall through to the normal login form */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
