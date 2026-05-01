@@ -127,7 +127,14 @@ func NewRouter(d RouterDeps) http.Handler {
 		// Caddy hits it from inside the docker network without a JWT.
 		// The handler rejects any host outside `<sub>.<BaseDomain>`,
 		// so an unconfigured cluster (BaseDomain empty) always 404s.
-		r.Method(http.MethodGet, "/internal/tls_ask", &TLSAskHandler{DB: d.DB, BaseDomain: d.BaseDomain})
+		//
+		// Wrapped in r.Route("/internal", ...) because chi's r.Method
+		// on a multi-segment pattern silently fails to register —
+		// real-VPS smoke caught a 404 on every request despite the
+		// handler compiling and the path looking right.
+		r.Route("/internal", func(r chi.Router) {
+			r.Method(http.MethodGet, "/tls_ask", &TLSAskHandler{DB: d.DB, BaseDomain: d.BaseDomain})
+		})
 
 		// Authenticated.
 		r.Group(func(r chi.Router) {
