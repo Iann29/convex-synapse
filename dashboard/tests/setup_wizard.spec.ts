@@ -42,8 +42,12 @@ test("wizard end-to-end: admin → demo team + project + deployment", async ({ p
 
   // The project page renders the freshly-provisioned deployment row.
   await expect(page).toHaveURL(/\/teams\/[^/]+\/[^/]+\b/);
-  // CLI credentials block is the give-away that a deployment is on the page.
-  await expect(page.getByText(/CONVEX_SELF_HOSTED_URL/i)).toBeVisible({ timeout: 30_000 });
+  // The "Show CLI credentials" button proves the deployment row
+  // rendered. The credentials values themselves are reveal-on-click —
+  // cli_credentials.spec.ts covers that flow separately.
+  await expect(
+    page.getByRole("button", { name: /Show CLI credentials/i }).first()
+  ).toBeVisible({ timeout: 30_000 });
 });
 
 test("/setup redirects to /login when an admin already exists", async ({ page }) => {
