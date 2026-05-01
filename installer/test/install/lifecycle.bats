@@ -606,6 +606,120 @@ EOF
     assert_output --partial "pg_dump failed"
 }
 
+# ---- backup: --to-s3 -----------------------------------------------
+
+@test "backup: --to-s3 without AWS_ACCESS_KEY_ID -> exit 2 (fail fast, no tar)" {
+    _setup_install_fixture
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    # Source s3.sh too — backup calls into it.
+    source "$INSTALLER_DIR/install/s3.sh"
+    run lifecycle::backup "$INSTALL_DIR" --to-s3=s3://bucket/key.tar.gz
+    assert_failure 2
+    assert_output --partial "AWS_ACCESS_KEY_ID"
+}
+
+@test "backup: --to-s3 rejects non-s3:// URIs" {
+    _setup_install_fixture
+    AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s
+    source "$INSTALLER_DIR/install/s3.sh"
+    run lifecycle::backup "$INSTALL_DIR" --to-s3=https://bucket.example.com/key.tar.gz
+    assert_failure 2
+    assert_output --partial "must be an s3:// URI"
+}
+
+@test "backup: --to-s3 uploads after local bundle (curl mocked)" {
+    _setup_install_fixture
+    AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s
+    AWS_REGION=us-east-1
+    source "$INSTALLER_DIR/install/s3.sh"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)   [[ "$3" == "pg_dump" ]] && echo "-- dump --" ;;
+    volume) [[ "$2" == "ls" ]] && true ;;
+    run)    : ;;
+esac
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >"$BATS_TEST_TMPDIR/s3-curl.args"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    local out_path="$BATS_TEST_TMPDIR/local-backup.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" S3_CURL="$SYN_MOCK_BIN/curl" \
+        run lifecycle::backup "$INSTALL_DIR" \
+            --out="$out_path" \
+            --to-s3=s3://my-bucket/path/archive.tar.gz
+    assert_success
+    [ -f "$out_path" ]
+    # curl was called with the right URL
+    run cat "$BATS_TEST_TMPDIR/s3-curl.args"
+    assert_output --partial "https://my-bucket.s3.us-east-1.amazonaws.com/path/archive.tar.gz"
+    assert_output --partial "-T $out_path"
+}
+
+@test "backup: --to-s3 with trailing slash auto-suffixes archive name" {
+    _setup_install_fixture
+    AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s
+    AWS_REGION=us-east-1
+    source "$INSTALLER_DIR/install/s3.sh"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)   [[ "$3" == "pg_dump" ]] && echo "-- dump --" ;;
+    volume) [[ "$2" == "ls" ]] && true ;;
+    run)    : ;;
+esac
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >"$BATS_TEST_TMPDIR/s3-curl.args"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    local out_path="$BATS_TEST_TMPDIR/named.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" S3_CURL="$SYN_MOCK_BIN/curl" \
+        run lifecycle::backup "$INSTALL_DIR" \
+            --out="$out_path" \
+            --to-s3=s3://my-bucket/backups/
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/s3-curl.args"
+    # Trailing slash → uploaded URL ends in /backups/named.tar.gz
+    assert_output --partial "https://my-bucket.s3.us-east-1.amazonaws.com/backups/named.tar.gz"
+}
+
+@test "backup: --to-s3 upload failure surfaces (local tarball still on disk)" {
+    _setup_install_fixture
+    AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s
+    source "$INSTALLER_DIR/install/s3.sh"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    exec)   [[ "$3" == "pg_dump" ]] && echo "-- dump --" ;;
+    volume) [[ "$2" == "ls" ]] && true ;;
+    run)    : ;;
+esac
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 22
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+    local out_path="$BATS_TEST_TMPDIR/local-backup-fail.tar.gz"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" S3_CURL="$SYN_MOCK_BIN/curl" \
+        run lifecycle::backup "$INSTALL_DIR" \
+            --out="$out_path" \
+            --to-s3=s3://my-bucket/x.tar.gz
+    assert_failure 2
+    # local tarball is intact (operator can re-upload manually)
+    [ -f "$out_path" ]
+    assert_output --partial "local backup at"
+}
+
 # ---- restore: validation ------------------------------------------
 
 @test "restore: aborts when archive is missing" {
@@ -747,6 +861,84 @@ EOF
     assert_success
     run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
     assert_output "after-restore"
+}
+
+# ---- restore: --restore=s3:// (download + restore) -----------------
+
+@test "restore: s3:// without AWS_ACCESS_KEY_ID -> exit 2" {
+    _setup_install_fixture
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    source "$INSTALLER_DIR/install/s3.sh"
+    run lifecycle::restore "$INSTALL_DIR" "s3://bucket/key.tar.gz" --non-interactive
+    assert_failure 2
+    assert_output --partial "AWS_ACCESS_KEY_ID"
+}
+
+@test "restore: s3:// downloads then extracts via the same path as a local archive" {
+    _setup_install_fixture
+    AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s
+    AWS_REGION=us-east-1
+    source "$INSTALLER_DIR/install/s3.sh"
+
+    # Build a real archive so the tar xzf step succeeds.
+    local archive="$BATS_TEST_TMPDIR/synth.tar.gz"
+    local archive_stage="$BATS_TEST_TMPDIR/synth-stage"
+    mkdir -p "$archive_stage/volumes"
+    cat >"$archive_stage/manifest.txt" <<EOF
+format=synapse-backup-v1
+timestamp=20260501-120000
+version=0.6.1
+env_included=1
+volume_count=0
+EOF
+    cat >"$archive_stage/.env" <<EOF
+SYNAPSE_JWT_SECRET=from-s3-archive
+EOF
+    : >"$archive_stage/docker-compose.yml"
+    printf 'SELECT 1;\n' | gzip >"$archive_stage/synapse.sql.gz"
+    tar czf "$archive" -C "$archive_stage" .
+
+    # curl mock: s3::download passes -o <out_file>; we just copy our
+    # synthesized archive to that path.
+    cat >"$SYN_MOCK_BIN/curl" <<EOF
+#!/usr/bin/env bash
+out=""
+prev=""
+for a in "\$@"; do
+    if [[ "\$prev" == "-o" ]]; then out="\$a"; break; fi
+    prev="\$a"
+done
+[[ -n "\$out" ]] && cp "$archive" "\$out"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl"
+
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    ps) echo "" ;;
+    *)  : ;;
+esac
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        S3_CURL="$SYN_MOCK_BIN/curl" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::restore "$INSTALL_DIR" \
+            "s3://my-bucket/backup.tar.gz" \
+            --non-interactive
+    assert_success
+    # The .env from the s3-downloaded archive is the one in place now.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
+    assert_output "from-s3-archive"
 }
 
 # ====================================================================

@@ -133,7 +133,15 @@ Options:
     --out=<path>             Output path for --backup. Default:
                              \$INSTALL_DIR/backups/synapse-backup-<ts>.tar.gz
     --exclude-env            Skip .env in --backup (no secrets in tarball).
-    --restore=<archive>      Wipe + restore from a backup tarball.
+    --to-s3=<s3-uri>         With --backup, also upload to s3://bucket/key
+                             after the local bundle. Trailing slash =
+                             treat as directory (auto-suffix archive name).
+                             Requires AWS_ACCESS_KEY_ID +
+                             AWS_SECRET_ACCESS_KEY in env. For S3-
+                             compatible (Backblaze, R2, Wasabi, MinIO):
+                             also set SYNAPSE_BACKUP_S3_ENDPOINT.
+    --restore=<archive>      Wipe + restore from a backup tarball. Local
+                             path or s3://bucket/key URI (auto-downloaded).
     --keep-env               During --restore, keep the current .env
                              instead of replacing it from the archive.
     --doctor                 Run preflight + status checks against an
@@ -194,6 +202,7 @@ parse_flags() {
     FORCE=0
     BACKUP=0
     BACKUP_OUT=""
+    BACKUP_TO_S3=""
     EXCLUDE_ENV=0
     RESTORE_ARCHIVE=""
     KEEP_ENV=0
@@ -220,6 +229,7 @@ parse_flags() {
             --force)           FORCE=1 ;;
             --backup)          BACKUP=1 ;;
             --out=*)           BACKUP_OUT="${1#*=}" ;;
+            --to-s3=*)         BACKUP_TO_S3="${1#*=}" ;;
             --exclude-env)     EXCLUDE_ENV=1 ;;
             --restore=*)       RESTORE_ARCHIVE="${1#*=}" ;;
             --keep-env)        KEEP_ENV=1 ;;
@@ -378,6 +388,8 @@ source_libs() {
     . "$HERE/installer/install/compose.sh"
     # shellcheck source=installer/install/verify.sh
     . "$HERE/installer/install/verify.sh"
+    # shellcheck source=installer/install/s3.sh
+    . "$HERE/installer/install/s3.sh"
     # shellcheck source=installer/install/lifecycle.sh
     . "$HERE/installer/install/lifecycle.sh"
 }
@@ -835,6 +847,9 @@ main() {
         fi
         if (( EXCLUDE_ENV )); then
             bk_args+=(--exclude-env)
+        fi
+        if [[ -n "$BACKUP_TO_S3" ]]; then
+            bk_args+=(--to-s3="$BACKUP_TO_S3")
         fi
         lifecycle::backup "$INSTALL_DIR" "${bk_args[@]}"
         exit $?

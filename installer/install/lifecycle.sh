@@ -413,16 +413,35 @@ lifecycle::backup() {
 lifecycle::_backup_inner() {
     local install_dir="$1"
     shift
-    local out_path="" exclude_env=0 stage_var=""
+    local out_path="" exclude_env=0 stage_var="" to_s3=""
     while (( $# > 0 )); do
         case "$1" in
             --out=*)        out_path="${1#*=}" ;;
             --out)          out_path="${2:-}"; shift ;;
             --exclude-env)  exclude_env=1 ;;
+            --to-s3=*)      to_s3="${1#*=}" ;;
+            --to-s3)        to_s3="${2:-}"; shift ;;
             stage_var=*)    stage_var="${1#*=}" ;;
         esac
         shift
     done
+
+    # Validate creds + URI BEFORE we spend ~30s bundling a tarball
+    # that we won't be able to upload. Failing fast here saves the
+    # operator a wasted disk write.
+    if [[ -n "$to_s3" ]]; then
+        if ! s3::is_s3_uri "$to_s3"; then
+            ui::fail "--to-s3 must be an s3:// URI (got: $to_s3)"
+            return 2
+        fi
+        if ! s3::check_creds 2>/dev/null; then
+            ui::fail "--to-s3 requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY in env"
+            ui::info "  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1"
+            ui::info "  for S3-compatible (Backblaze, R2, Wasabi, MinIO):"
+            ui::info "    export SYNAPSE_BACKUP_S3_ENDPOINT=https://<endpoint>"
+            return 2
+        fi
+    fi
 
     local env_file="$install_dir/.env"
     local compose_file="$install_dir/docker-compose.yml"
@@ -530,6 +549,29 @@ lifecycle::_backup_inner() {
     size="$(du -h "$out_path" 2>/dev/null | awk '{print $1}')"
     lifecycle::log "$backup_log" "backup created: $out_path ($size)"
 
+    # 6. Off-host: upload to S3 if --to-s3 was passed. Local tarball
+    #    stays in place — operator can prune by hand. The s3 URI
+    #    in the audit log is the canonical recovery target; the
+    #    local copy is the safety net.
+    if [[ -n "$to_s3" ]]; then
+        # If --to-s3 ends with /, treat it as a directory and append
+        # the basename of the local tarball. Otherwise use the URI
+        # verbatim.
+        local s3_target="$to_s3"
+        if [[ "$s3_target" == */ ]]; then
+            s3_target="${s3_target}$(basename "$out_path")"
+        fi
+        if ! ui::spin "Uploading to $s3_target" \
+                s3::upload "$out_path" "$s3_target"; then
+            ui::fail "S3 upload failed — local backup at $out_path is intact"
+            lifecycle::log "$backup_log" "backup upload failed: $s3_target"
+            return 2
+        fi
+        lifecycle::log "$backup_log" "backup uploaded: $s3_target"
+        ui::success "Backup ready: $out_path → $s3_target ($size, ${#volumes[@]} volume(s))"
+        return 0
+    fi
+
     ui::success "Backup ready: $out_path ($size, ${#volumes[@]} volume(s))"
     return 0
 }
@@ -570,14 +612,38 @@ lifecycle::_restore_inner() {
         ui::fail "no Synapse install at $install_dir"
         return 2
     fi
-    if [[ ! -f "$archive_path" ]]; then
-        ui::fail "archive not found: $archive_path"
-        return 2
-    fi
 
+    # If the operator passed an s3:// URI, download to a temp file
+    # FIRST then point archive_path at it. The download lives in
+    # /tmp and gets cleaned up via the same trap as the rest of the
+    # restore staging.
     ui::step "Synapse restore"
     ui::info "Install dir: $install_dir"
     ui::info "Archive: $archive_path"
+
+    local downloaded_archive=""
+    if s3::is_s3_uri "$archive_path"; then
+        if ! s3::check_creds 2>/dev/null; then
+            ui::fail "s3:// archive requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY in env"
+            ui::info "  for S3-compatible: also export SYNAPSE_BACKUP_S3_ENDPOINT"
+            return 2
+        fi
+        downloaded_archive="$(mktemp 2>/dev/null || mktemp -t synapse)"
+        # Rename to .tar.gz so any tooling that sniffs by extension
+        # works (best-effort — failure here is non-fatal).
+        mv "$downloaded_archive" "$downloaded_archive.tar.gz" 2>/dev/null \
+            && downloaded_archive="$downloaded_archive.tar.gz"
+        if ! ui::spin "Downloading from $archive_path" \
+                s3::download "$archive_path" "$downloaded_archive"; then
+            ui::fail "S3 download failed — check credentials, bucket, and key"
+            rm -f "$downloaded_archive"
+            return 2
+        fi
+        archive_path="$downloaded_archive"
+    elif [[ ! -f "$archive_path" ]]; then
+        ui::fail "archive not found: $archive_path"
+        return 2
+    fi
 
     # 1. Stage the archive contents.
     local stage
@@ -588,7 +654,14 @@ lifecycle::_restore_inner() {
 
     if ! tar xzf "$archive_path" -C "$stage" 2>/dev/null; then
         ui::fail "archive could not be extracted (corrupt or wrong format?)"
+        rm -f "$downloaded_archive"
         return 2
+    fi
+    # Clean up the downloaded tarball as soon as we've staged it; the
+    # contents live in $stage now and the s3 copy is the canonical
+    # backup. Skip when the archive is operator-supplied (local path).
+    if [[ -n "$downloaded_archive" ]]; then
+        rm -f "$downloaded_archive"
     fi
     if [[ ! -f "$stage/manifest.txt" ]]; then
         ui::fail "archive missing manifest.txt — not a Synapse backup"
