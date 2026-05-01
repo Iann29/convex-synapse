@@ -694,12 +694,17 @@ lifecycle::_restore_inner() {
         ui::fail "compose up postgres failed"
         return 2
     fi
-    # pg_isready loop with a 60s budget. The `docker exec` returns
-    # non-zero when not ready, which we soak via the until.
+    # Postgres on first-init runs an internal-then-real lifecycle:
+    # boots, creates the user, SHUTS DOWN, restarts for real. Plain
+    # `pg_isready` returns 0 during the internal boot, then connections
+    # fail during the shutdown window with "the database system is
+    # shutting down". We need a stronger gate: actually run a trivial
+    # query and retry until it succeeds. 90s budget covers slow VPSes.
     local pg_ready=0
     local elapsed=0
-    while (( elapsed < 60 )); do
-        if "$docker_cmd" exec synapse-postgres pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+    while (( elapsed < 90 )); do
+        if "$docker_cmd" exec synapse-postgres \
+                psql -U "$pg_user" -d "$pg_db" -tAc 'SELECT 1' >/dev/null 2>&1; then
             pg_ready=1
             break
         fi
@@ -707,7 +712,7 @@ lifecycle::_restore_inner() {
         elapsed=$(( elapsed + 1 ))
     done
     if (( ! pg_ready )); then
-        ui::fail "postgres didn't become ready in 60s"
+        ui::fail "postgres didn't accept queries in 90s"
         return 2
     fi
 
