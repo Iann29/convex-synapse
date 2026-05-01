@@ -275,6 +275,11 @@ CI runs both. Keep fixtures lean — they should boot in <5s each.
 
 ## Common gotchas
 
+These are general bash/shell pitfalls. The next section
+("Real-world bugs caught on the synapse-test VPS") has the
+**v0.6.0-specific bug list** from the chunk-7 → fix-up chain — read
+both before adding a new chunk.
+
 - **`/bin/sh` is not bash on Debian.** Curl-pipe-shell installers
   often hit this. Always `#!/usr/bin/env bash` at the top of every
   file, and run via `bash setup.sh` not `sh setup.sh`.
@@ -296,6 +301,61 @@ CI runs both. Keep fixtures lean — they should boot in <5s each.
 - **Color codes break in CI logs.** Wrap them in a `[[ -t 1 ]]`
   check — only emit ANSI when stdout is a TTY.
 
+## Real-world bugs caught on the synapse-test VPS
+
+Eight runs of `setup.sh` on a fresh Hetzner CPX22 (Ubuntu 24.04)
+during chunk 7 + fix-ups #23/#24/#25 surfaced bugs that the bats
+suite did not. Each one is now a regression test; read this list
+before adding a chunk so the lessons don't have to be relearned:
+
+1. **`[[ -n "$X" ]] && cmd` at the end of a function** — when the
+   test is false, the function returns 1 and `set -e` aborts the
+   whole script. Use explicit `if`/`fi` for any top-level
+   conditional. Fixed in `setup.sh::phase_banner`,
+   `secrets.sh::ensure_env`, and `caddy.sh::_render`.
+2. **`docker compose pull` on services with `build:`** — synapse
+   and dashboard have no published image, so pull returns "pull
+   access denied" and aborts. Use `up -d --build` (which builds
+   local services and pulls the rest) instead of pull-then-up.
+3. **Missing `jq` and `dig` on a fresh Ubuntu** — the installer
+   shells out to both. `phase_install_deps` in setup.sh apt-get-installs
+   them as part of the flow; preflight checks are insufficient
+   because they don't auto-install.
+4. **camelCase API responses, not snake_case** — Synapse follows the
+   Convex Cloud OpenAPI shape. `accessToken`, `projectId`, `convexUrl`,
+   NOT `access_token`/`project_id`/`convex_url`. `verify.sh` extracts
+   with both as fallback.
+5. **Convex backend image needs pre-pull** — Synapse calls `docker
+   run` against `ghcr.io/get-convex/convex-backend:latest` directly
+   when provisioning the first deployment; without the image already
+   pulled it 500s. `phase_compose_up` runs `docker pull` after
+   `compose up`.
+6. **`--no-tls` + `verify::check_cli_creds` is incompatible by design**
+   — without a domain, `SYNAPSE_PUBLIC_URL` is empty and CLI URLs
+   fall back to loopback. `verify::run --skip-cli-url-check` opts
+   out. setup.sh passes the flag automatically when `NO_TLS=1` or
+   `DOMAIN==""`.
+7. **`SYNAPSE_PUBLIC_URL` empty on `--no-tls` blanks the dashboard**
+   from a remote browser — Next.js bakes the URL at build time, so
+   the JS bundle hard-coded `localhost:8080`. `setup.sh` now calls
+   `detect::public_ip` (api.ipify.org → ifconfig.me) when DOMAIN is
+   empty and uses `http://<ip>:<port>` as the public URL.
+8. **`NEXT_PUBLIC_*` is a build-time arg, not runtime env** — even
+   after passing the right `PUBLIC_SYNAPSE_URL` value to
+   docker-compose, the dashboard image still had `localhost:8080`
+   baked in because the Dockerfile uses `ARG NEXT_PUBLIC_*` with a
+   default. docker-compose.yml now passes it as `build.args`, not
+   just `environment:`.
+9. **`SYNAPSE_PUBLIC_URL` lived in `.env` but never reached the
+   synapse-api container** — `.env` was used for compose variable
+   expansion only. The synapse service's `environment:` block didn't
+   reference it. Container env was empty; `config.PublicURL` parsed
+   to ""; rewrite was a no-op. Fixed in `docker-compose.yml`.
+
+These are the bug classes a bats suite alone CANNOT catch. Real-VPS
+validation is part of "done" for any change that touches setup.sh,
+docker-compose.yml, or a backend handler that emits a URL.
+
 ## Don't add (anti-features from the plan)
 
 - 20-question wizard. Default-everything-except-domain.
@@ -307,6 +367,39 @@ CI runs both. Keep fixtures lean — they should boot in <5s each.
 - Telemetry that sends customer data. Anonymous-only, opt-in,
   source-visible.
 
+## Real-VPS smoke test workflow
+
+The operator provisioned a Hetzner CPX22 dedicated to integration
+testing. SSH alias `synapse-vps` (defined in `~/.ssh/config`,
+backed by `~/.ssh/synapse-test-vps`). Credentials in `/.vps/`
+(gitignored). Reset is free — operator clicks one button on the
+Hetzner Cloud Console.
+
+For any change that touches `setup.sh`, `installer/`, `docker-compose.yml`,
+or a backend handler that emits a URL:
+
+```bash
+# 1. Push your branch
+git push -u origin <branch>
+
+# 2. Tear down the previous test install (preserves nothing)
+ssh synapse-vps 'docker compose -f /opt/synapse-test/docker-compose.yml down -v 2>/dev/null
+                 docker rm -f $(docker ps -aq --filter label=synapse.managed=true) 2>/dev/null
+                 rm -rf /tmp/convex-synapse /opt/synapse-test'
+
+# 3. Clone the branch and run setup.sh end-to-end
+ssh synapse-vps 'cd /tmp && git clone -b <branch> https://github.com/Iann29/convex-synapse.git
+                 cd convex-synapse && bash setup.sh --no-tls --skip-dns-check --non-interactive --install-dir=/opt/synapse-test'
+
+# 4. Validate from outside (your dev machine, NOT the VPS)
+curl -sf http://178.105.62.81:8080/health   # synapse healthy?
+curl -sf -o /dev/null -w "%{http_code}\n" http://178.105.62.81:6790/register   # dashboard renders?
+```
+
+If something needs a clean OS image (kernel state, package cache),
+ask the operator to reset via the Hetzner console — they offered
+free resets for exactly this reason.
+
 ## When you're stuck
 
 1. Read `docs/V0_6_INSTALLER_PLAN.md` again — most "where do I put X?"
@@ -317,6 +410,8 @@ CI runs both. Keep fixtures lean — they should boot in <5s each.
    they hit a test.
 4. Test on a fixture first, real VPS second. The fixture catches
    "works on my Linux but not Debian" failures cheaply.
+5. If a remote browser sees something different from what curl shows,
+   it's a build-time vs runtime config gap (see bug #8 above).
 
 ## What "done" looks like (per ticket)
 
@@ -326,6 +421,7 @@ A v0.6 ticket is done when:
 - [ ] `shellcheck` clean
 - [ ] bats tests cover the new logic
 - [ ] CI's installer job is green (lint + bats)
+- [ ] **Real-VPS smoke** passes for any setup.sh / compose / handler-URL change (`ssh synapse-vps` workflow above)
 - [ ] `docs/V0_6_INSTALLER_PLAN.md` updated if the design changed
 - [ ] README's Quickstart still reflects reality after each phase
 - [ ] Commit message body lists the test fixture(s) you ran against

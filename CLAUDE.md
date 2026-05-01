@@ -35,9 +35,15 @@ talks to Synapse with the same shape Cloud uses.
 | `synapse/internal/db/migrations/` | `go:embed`'d SQL migrations applied at startup. Currently 6 migrations (init, jobs, adopted, replicas, replica_id on jobs, upgrade_to_ha kind) |
 | `dashboard/` | Next.js 16 + Tailwind 4 dashboard. Real pages, not a placeholder. HA toggle + `HA ×N` badge on deployments since v0.5 |
 | `dashboard/tests/` | Playwright e2e (20 specs) — runs against live compose stack |
-| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, HA_TESTING |
-| `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile adds backend-postgres + minio for HA testing |
+| `setup.sh` | v0.6 auto-installer entry point. `main()` wrapper for curl-pipe-shell safety, ERR/EXIT traps, flock single-instance, full CLI flag surface |
+| `installer/lib/` | Pure-bash detection helpers (detect:: namespace) — OS, arch, pkg manager, sudo, has_*, disk/RAM, public_ip |
+| `installer/install/` | Phase scripts the orchestrator composes (preflight, secrets, caddy, compose, verify, ui) |
+| `installer/templates/` | env.tmpl + caddy.fragment + caddy.standalone — rendered with `{{KEY}}` substitution from exported env vars |
+| `installer/test/` | bats unit tests (~211 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
+| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION |
+| `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile (backend-postgres + minio) and `caddy` profile (TLS reverse proxy) |
 | `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |
+| `.vps/` | **gitignored** — synapse-test VPS credentials + private SSH key. NEVER commit |
 
 ## Common commands
 
@@ -59,8 +65,16 @@ docker rm -f $(docker ps -aq --filter label=synapse.managed=true)
 docker volume ls -q --filter name=synapse-data- | xargs -r docker volume rm
 
 # Tests
-cd synapse && go test ./... -count=1            # ~10s, integration
+cd synapse && go test ./... -count=1            # ~18s, integration (136 tests)
 cd dashboard && npx playwright test             # ~1.5min, against live stack
+docker run --rm -v "$PWD:/code" -w /code synapse-bats -r installer/test/   # bats (211)
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -x setup.sh installer/lib/*.sh installer/install/*.sh
+
+# Real-VPS smoke test (when changes affect setup.sh / compose / Go API surface)
+ssh synapse-vps      # Hetzner CPX22, Ubuntu 24.04, IP in /.vps/credentials.md
+# inside the VPS:
+cd /tmp && rm -rf convex-synapse && git clone -b <branch> https://github.com/Iann29/convex-synapse.git
+cd convex-synapse && bash setup.sh --no-tls --skip-dns-check --non-interactive --install-dir=/opt/synapse-test
 ```
 
 ## Code conventions
@@ -184,7 +198,27 @@ If you're tempted to add one, move it to the roadmap and discuss first.
 | Audit log (Cloud-vocabulary actions) | `internal/audit/`, `internal/api/audit_log.go` |
 | Multi-node hygiene (retry / advisory lock / queue) | `internal/db/`, `internal/provisioner/` |
 | **HA-per-deployment (v0.5)**: 2 replicas + Postgres + S3 backed, encrypted secrets, proxy failover, `upgrade_to_ha` endpoint reserved | `internal/crypto/`, `internal/db/migrations/000004-000006`, `internal/api/deployments.go::createDeployment ha:true`, `upgradeToHA` |
+| **Auto-installer (v0.6)**: `./setup.sh --domain=<host>` brings up the stack on a fresh VPS in ~3 min. Preflight + idempotent secrets + Caddy auto-detection + compose up --build + post-install self-test. Real-VPS validated against Hetzner CPX22 | `setup.sh`, `installer/` |
+| **Public URL rewrite (PR #10 + #23/#24/#25)**: `/auth`, `/cli_credentials`, `getDeployment`, `getProjectDeployment`, both `listDeployments`, `createDeployment`, `adoptDeployment` all return rewritten URLs (`<PublicURL>/d/<name>` or `<PublicURL>:<port>`) so remote browsers/CLIs reach a working address | `internal/api/deployments.go::publicDeploymentURL` |
 | Dashboard (20 e2e tests, real pages, HA toggle + badge) | `dashboard/` |
+
+## Real-VPS validation
+
+Bats + Go tests run in CI. Neither catches certain bug classes:
+
+- **bash `set -e` footguns** (e.g. `[[ -n "$X" ]] && cmd` aborting when test is false at end of function) — bats doesn't run with set -e inherited from a caller
+- **`docker compose pull` on `build:` services** — bats mocks docker
+- **camelCase vs snake_case API shapes** — bats stubs return whatever the test author thought was true
+- **`NEXT_PUBLIC_*` build-arg vs runtime env** — Next.js inlines at build time; mocked tests don't notice
+- **Missing host tools** (`jq`, `dig`, `dnsutils`) — base test image bundles them
+- **Public-IP / DNS / TLS / Let's Encrypt** flows — only real with a real domain
+
+For changes that touch `setup.sh`, `installer/`, `docker-compose.yml`, or any
+backend handler that emits a URL, run `./setup.sh` end-to-end on `synapse-vps`
+before declaring done. The chunk-7-of-v0.6.0 PR (#19) caught 6 such bugs that
+all had green bats CI. Each one is now in regression tests; the lesson
+generalizes: real-VPS validation is part of "done" for any change that crosses
+the bats / Go-test boundary.
 
 ## Pointers
 

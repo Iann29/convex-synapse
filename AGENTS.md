@@ -87,6 +87,44 @@ unaffected — but every NEW code path should:
   names unchanged for non-HA — don't break existing operator scripts
   that filter `convex-{name}` containers.
 
+## v0.6 ground rules (installer)
+
+The auto-installer (`setup.sh` + `installer/`) is pure bash. The
+`synapse-installer` skill captures the bash conventions in detail.
+Cross-reference rules:
+
+- **Real-VPS validation** is part of "done" for installer/compose
+  changes. The bats suite runs ~211 unit tests but doesn't see real
+  Docker, real Caddy, real DNS, or a real Next.js build. Chunk 7 of
+  v0.6.0 (PR #19) caught 6 bugs in a single real-VPS run that ALL
+  had green bats CI. Subsequent fix-ups (PR #23/#24/#25) added
+  three more. The lesson: smoke against `synapse-vps` after any
+  setup.sh / docker-compose.yml / handler-URL change.
+- **`[[ ]] && cmd` is a set-e footgun** when it's the last expression
+  in a function. Use explicit `if`/`fi` for top-level conditionals.
+- **`NEXT_PUBLIC_*` is build-time** in Next.js — pass via
+  `build.args` in docker-compose, not just `environment:`.
+- **API responses are camelCase** (Convex Cloud OpenAPI shape) —
+  `accessToken`, `projectId`, `convexUrl`, NOT `access_token`.
+- **`docker compose pull` fails on services with `build:`** — use
+  `up -d --build` instead.
+- **The Convex backend image must be pre-pulled** before the first
+  `create_deployment` — Synapse calls `docker run` against it
+  directly and 500s with "no such image" otherwise.
+
+## URL rewrite contract (PR #10 + #24)
+
+Every endpoint that returns a `models.Deployment` (raw or wrapped)
+MUST apply `publicDeploymentURL(&d)` before `writeJSON`. Currently
+six handlers do (createDeployment, adoptDeployment, getDeployment,
+getProjectDeployment, two listDeployments). New handlers that
+return a deployment shape must follow the same pattern — otherwise
+remote callers get the loopback URL the provisioner stored.
+
+`TeamsHandler` and `ProjectsHandler` carry a `Deployments
+*DeploymentsHandler` field for this; new handlers in other files
+should too.
+
 ## What "done" looks like
 
 A feature is done when:
@@ -98,7 +136,10 @@ A feature is done when:
 - [ ] **Integration test** added in `synapse/internal/test/<resource>_test.go`
 - [ ] **Playwright spec** added in `dashboard/tests/` if user-facing
 - [ ] **Audit hook** added (`audit.Record(...)`) on every mutating success path
+- [ ] **Bats test** added in `installer/test/` if you touched `setup.sh` / `installer/`
+- [ ] **Real-VPS smoke test** passes if you touched setup.sh, docker-compose.yml, or any handler that emits a URL — `ssh synapse-vps` and run end-to-end
 - [ ] `docs/API.md` updated for any new/changed endpoint
+- [ ] If you added a deployment-returning endpoint: applied `publicDeploymentURL(&d)` rewrite (otherwise remote callers see loopback URLs)
 - [ ] Commit message body lists the curl flow you actually ran
 - [ ] `docs/ROADMAP.md` ticked if you crossed a phase boundary
 
