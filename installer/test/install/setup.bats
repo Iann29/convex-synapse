@@ -44,6 +44,7 @@ setup() {
     assert_output --partial "--doctor"
     assert_output --partial "--upgrade"
     assert_output --partial "--uninstall"
+    assert_output --partial "--no-bootstrap"
 }
 
 @test "setup.sh unknown flag -> exit 2 + usage on stderr" {
@@ -165,6 +166,109 @@ setup() {
     "
     assert_success
     assert_output --partial "DIR=/srv/synapse"
+}
+
+@test "parse_flags: --no-bootstrap sets NO_BOOTSTRAP=1" {
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        parse_flags --no-bootstrap
+        echo \"NB=\$NO_BOOTSTRAP\"
+    "
+    assert_success
+    assert_output --partial "NB=1"
+}
+
+@test "parse_flags: NO_BOOTSTRAP defaults to 0" {
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        parse_flags
+        echo \"NB=\$NO_BOOTSTRAP\"
+    "
+    assert_success
+    assert_output --partial "NB=0"
+}
+
+# ---- bootstrap detection -------------------------------------------
+#
+# Tests setup::needs_bootstrap. The function returns 0 (true) when no
+# installer/ tree is reachable from the supplied dir, 1 (false)
+# otherwise. This is the gate that decides whether to clone-and-re-exec
+# under curl|bash.
+
+@test "setup::needs_bootstrap: false when installer/ exists alongside" {
+    # The repo checkout itself is the canonical "installer/ is here" case.
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        if setup::needs_bootstrap '$REPO_ROOT'; then
+            echo BOOTSTRAP_NEEDED
+        else
+            echo BOOTSTRAP_SKIPPED
+        fi
+    "
+    assert_success
+    assert_output --partial "BOOTSTRAP_SKIPPED"
+}
+
+@test "setup::needs_bootstrap: true when installer/ is missing" {
+    local empty_dir="$BATS_TEST_TMPDIR/no-installer"
+    mkdir -p "$empty_dir"
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        if setup::needs_bootstrap '$empty_dir'; then
+            echo BOOTSTRAP_NEEDED
+        else
+            echo BOOTSTRAP_SKIPPED
+        fi
+    "
+    assert_success
+    assert_output --partial "BOOTSTRAP_NEEDED"
+}
+
+@test "setup::needs_bootstrap: true when dir is empty string (curl|bash case)" {
+    # When BASH_SOURCE[0] resolves to nothing, HERE is "" — that's the
+    # signal that we were piped into bash and have no installer/ on disk.
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        if setup::needs_bootstrap ''; then
+            echo BOOTSTRAP_NEEDED
+        else
+            echo BOOTSTRAP_SKIPPED
+        fi
+    "
+    assert_success
+    assert_output --partial "BOOTSTRAP_NEEDED"
+}
+
+@test "setup::bootstrap_target_dir: returns /tmp path with pid suffix" {
+    run bash -c "
+        __SETUP_NO_MAIN=1 source '$SETUP'
+        setup::bootstrap_target_dir
+    "
+    assert_success
+    assert_output --regexp '^/tmp/convex-synapse-bootstrap-[0-9]+$'
+}
+
+# ---- bootstrap is skipped when libs are present --------------------
+#
+# Sanity check: invoking setup.sh from the real repo (where installer/
+# is right there) must NOT trigger a clone. Easy to assert by running
+# --version, which exits in parse_flags before bootstrap is consulted
+# but ALSO setting --no-bootstrap to belt-and-suspenders the test.
+
+@test "setup.sh --version: does not bootstrap when installer/ exists" {
+    # If the script tried to clone, it would print "Bootstrapping ..."
+    # to stderr. --version exits before main() reaches the bootstrap
+    # gate anyway, but assert no stderr noise either way.
+    run --separate-stderr "$SETUP" --version
+    assert_success
+    assert_output --partial "synapse-installer"
+    [[ "$stderr" != *"Bootstrapping"* ]]
+}
+
+@test "setup.sh --no-bootstrap --version: short-circuits cleanly" {
+    run "$SETUP" --no-bootstrap --version
+    assert_success
+    assert_output --partial "synapse-installer"
 }
 
 # ---- bash -n (parse-only) ------------------------------------------

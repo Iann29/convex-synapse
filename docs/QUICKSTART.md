@@ -5,9 +5,37 @@ Get a Synapse stack running in about three minutes.
 ## Prerequisites
 
 - Docker + Docker Compose v2
+- `git` (the auto-installer git-clones itself when piped via curl)
 - (Optional, for development) Go 1.22+ and Node 20+
 
-## Five-minute path: Docker Compose
+## One-liner: hosted `curl | bash`
+
+For a single-VPS install with TLS:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --domain=synapse.yourdomain.com
+```
+
+Or local-only, no TLS:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --no-tls --skip-dns-check --non-interactive
+```
+
+`bash -s -- <flags>` is how you forward arguments through a pipe. The
+script auto-detects the curl|bash invocation, clones the repo into
+`/tmp/convex-synapse-bootstrap-<pid>`, and re-execs from there — every
+flag you passed is preserved.
+
+That's it for production-style installs. Read on for the dev-loop
+flows.
+
+## Five-minute path: Docker Compose (manual)
+
+If you'd rather inspect the script before running it, or you want
+a hackable checkout next to your editor:
 
 ```bash
 git clone https://github.com/Iann29/convex-synapse.git
