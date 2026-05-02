@@ -27,7 +27,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="0.6.2"
+readonly INSTALLER_VERSION="1.0.0"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"
@@ -215,6 +215,12 @@ parse_flags() {
     STATUS=0
     NO_BOOTSTRAP=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
+    # INSTALL_DIR_FROM_FLAG = 1 means the operator passed --install-dir=
+    # explicitly. The wizard reads this to know whether to ask the
+    # install-dir question (no flag = ask; flag = respect operator's
+    # choice). Without this we'd skip Step 3 silently because the
+    # default value is always non-empty.
+    INSTALL_DIR_FROM_FLAG=0
     while (( $# > 0 )); do
         case "$1" in
             --domain=*)        DOMAIN="${1#*=}" ;;
@@ -243,7 +249,7 @@ parse_flags() {
             --tail=*)          LOGS_TAIL="${1#*=}" ;;
             --tail)            LOGS_TAIL="${2:-}"; shift ;;
             --status)          STATUS=1 ;;
-            --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
+            --install-dir=*)   INSTALL_DIR="${1#*=}"; INSTALL_DIR_FROM_FLAG=1 ;;
             --no-bootstrap)    NO_BOOTSTRAP=1 ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
@@ -378,6 +384,8 @@ source_libs() {
     . "$HERE/installer/lib/port.sh"
     # shellcheck source=installer/install/ui.sh
     . "$HERE/installer/install/ui.sh"
+    # shellcheck source=installer/install/wizard.sh
+    . "$HERE/installer/install/wizard.sh"
     # shellcheck source=installer/install/preflight.sh
     . "$HERE/installer/install/preflight.sh"
     # shellcheck source=installer/install/secrets.sh
@@ -392,6 +400,50 @@ source_libs() {
     . "$HERE/installer/install/s3.sh"
     # shellcheck source=installer/install/lifecycle.sh
     . "$HERE/installer/install/lifecycle.sh"
+}
+
+# phase_wizard — interactive Q&A when `curl | bash` runs without
+# mode-defining flags. Sets DOMAIN / NO_TLS / BASE_DOMAIN / ENABLE_HA /
+# INSTALL_DIR + SYNAPSE_AUTO_INSTALL_DOCKER from the operator's
+# answers. Bails the install with exit 130 if they decline at the
+# summary confirm. No-ops in --non-interactive mode and when the
+# operator already answered everything via flags.
+phase_wizard() {
+    CURRENT_STEP="wizard"
+    if ! wizard::should_run; then
+        return 0
+    fi
+    wizard::run
+}
+
+# phase_autoinstall_docker — when the wizard agreed to fix missing
+# dependencies, install Docker via the official one-liner BEFORE
+# the preflight runs. preflight then sees a working Docker and
+# moves on instead of failing the whole script. Idempotent: the
+# get.docker.com script no-ops when docker is already present.
+phase_autoinstall_docker() {
+    CURRENT_STEP="autoinstall_docker"
+    # Interactive path: operator already said yes via the wizard.
+    # Non-interactive root path: we treat "auto-install when missing"
+    # as the sensible default, since the alternative is "fail with a
+    # one-line cure right next to the abort message", which is the
+    # frustration the wizard was built to avoid.
+    if (( ${SYNAPSE_AUTO_INSTALL_DOCKER:-0} == 0 )) \
+            && (( ${NON_INTERACTIVE:-0} == 0 )); then
+        return 0
+    fi
+    if detect::has_docker; then
+        return 0
+    fi
+    if [[ "$EUID" -ne 0 ]] && ! detect::has_cmd sudo; then
+        ui::fail "Docker missing and we don't have root/sudo to install it"
+        return 2
+    fi
+    ui::step "Installing Docker (one-time, ~1 min)"
+    if ! wizard::install_docker; then
+        ui::fail "Docker auto-install failed — see $LOG_FILE"
+        return 2
+    fi
 }
 
 # Phases -------------------------------------------------------------
@@ -748,28 +800,67 @@ phase_verify() {
 
 phase_success_screen() {
     CURRENT_STEP="success"
-    local public_url="${DOMAIN:+https://$DOMAIN}"
-    public_url="${public_url:-http://localhost:${SYNAPSE_PORT:-8080}}"
+    # Resolve the URL the operator should actually open in a browser:
+    #   - HTTPS via Caddy when --domain is set
+    #   - HTTP on the dashboard port (6790) otherwise — NOT the API
+    #     port (8080); the dashboard is what humans interact with.
+    # When neither domain nor public IP is detected, fall back to a
+    # localhost URL with a hint (dev-mode only).
+    local public_url
+    if [[ -n "${DOMAIN:-}" ]]; then
+        public_url="https://${DOMAIN}"
+    elif [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
+        public_url="http://${SYNAPSE_DETECTED_PUBLIC_IP}:6790"
+    else
+        public_url="http://localhost:6790"
+    fi
+
+    # Build a coloured success banner that visually mirrors the wizard
+    # banner. Colours render iff stdout is a TTY (or being teed through
+    # one — UI_FORCE_COLOR=1 covers that case if the operator wants).
+    # Going straight to stdout (no /dev/tty redirect) keeps it simple:
+    # the install log captures the same content with ANSI escapes
+    # baked in, which is what brew / k3s / devcontainer-cli all do
+    # — `less -R` and `cat` render it fine, and operators almost
+    # never grep the log with bare eyes.
+    local C_GREEN="" C_BOLD="" C_DIM="" C_CYAN="" C_RESET=""
+    if [[ -z "${UI_NO_COLOR:-}" ]] && [[ -z "${NO_COLOR:-}" ]] \
+            && { [[ -t 1 ]] || [[ "${UI_FORCE_COLOR:-0}" == "1" ]] || { : >/dev/tty; } 2>/dev/null; }; then
+        C_GREEN=$'\033[32m'
+        C_BOLD=$'\033[1m'
+        C_DIM=$'\033[2m'
+        C_CYAN=$'\033[36m'
+        C_RESET=$'\033[0m'
+    fi
+
     cat <<EOF
 
-✓ Synapse is ready.
+  ${C_GREEN}╭─────────────────────────────────────────────────────────╮${C_RESET}
+  ${C_GREEN}│${C_RESET}                                                         ${C_GREEN}│${C_RESET}
+  ${C_GREEN}│${C_RESET}    ${C_GREEN}✓${C_RESET}  ${C_BOLD}Synapse is ready${C_RESET}                                  ${C_GREEN}│${C_RESET}
+  ${C_GREEN}│${C_RESET}                                                         ${C_GREEN}│${C_RESET}
+  ${C_GREEN}╰─────────────────────────────────────────────────────────╯${C_RESET}
 
-  URL: $public_url
-  Install dir: $INSTALL_DIR
-  Log: $LOG_FILE
+  ${C_BOLD}Open in your browser:${C_RESET}
+      ${C_CYAN}${public_url}${C_RESET}
 
-Next steps:
-  1. Open the URL above and register your admin user
-  2. Create a team → project → deployment
-  3. Use the CLI snippet from the deployment row to run \`npx convex deploy\`
+  ${C_DIM}Install dir:${C_RESET}  ${INSTALL_DIR}
+  ${C_DIM}Log:${C_RESET}          ${LOG_FILE}
 
-Useful commands:
-  $INSTALL_DIR/setup.sh --doctor       — re-run health checks
-  $INSTALL_DIR/setup.sh --upgrade      — pull the latest release + restart
-  $INSTALL_DIR/setup.sh --status       — diagnostic snapshot
-  docker compose -f $INSTALL_DIR/docker-compose.yml logs -f synapse
+  ${C_BOLD}Next steps${C_RESET}
+    ${C_GREEN}1.${C_RESET} Open the URL above and register your admin user
+    ${C_GREEN}2.${C_RESET} Create a team → project → deployment
+    ${C_GREEN}3.${C_RESET} Use the CLI snippet from the deployment row to run \`npx convex deploy\`
+
+  ${C_BOLD}Useful commands${C_RESET}
+    ${C_DIM}${INSTALL_DIR}/setup.sh --doctor${C_RESET}    re-run health checks
+    ${C_DIM}${INSTALL_DIR}/setup.sh --upgrade${C_RESET}   pull the latest release + restart
+    ${C_DIM}${INSTALL_DIR}/setup.sh --status${C_RESET}    diagnostic snapshot
+    ${C_DIM}${INSTALL_DIR}/setup.sh --backup${C_RESET}    snapshot the install (use --to-s3=... for S3)
+    ${C_DIM}docker compose -f ${INSTALL_DIR}/docker-compose.yml logs -f synapse${C_RESET}
 
 EOF
+
     # When custom domains are enabled, the operator MUST have wildcard
     # DNS pointed at this VPS for Caddy on-demand TLS to issue certs.
     # The DNS preflight already warned them if the wildcard isn't
@@ -779,14 +870,13 @@ EOF
     if [[ -n "${BASE_DOMAIN:-}" ]]; then
         local stripped="${BASE_DOMAIN#.}"
         cat <<EOF
-Custom domains enabled (v1.0):
-  Each provisioned deployment becomes a dedicated subdomain:
-    https://<deployment-name>.${stripped}
+  ${C_BOLD}Custom domains enabled (v1.0)${C_RESET}
+    Each provisioned deployment becomes a dedicated subdomain:
+        ${C_CYAN}https://<deployment-name>.${stripped}${C_RESET}
 
-  ⚠ DNS:  *.${stripped} A record must point at this VPS
-          (Caddy can't issue Let's Encrypt certs until it resolves)
-  Probe:  dig +short probe-test.${stripped}
-          # should return this VPS's public IP
+    ${C_DIM}⚠ DNS: *.${stripped} A record must point at this VPS${C_RESET}
+    ${C_DIM}  (Caddy can't issue Let's Encrypt certs until it resolves)${C_RESET}
+    ${C_DIM}  Probe: dig +short probe-test.${stripped}${C_RESET}
 
 EOF
     fi
@@ -919,6 +1009,8 @@ main() {
     source_libs
     acquire_lock
     phase_banner
+    phase_wizard
+    phase_autoinstall_docker
     phase_preflight
     phase_install_deps
     phase_install_dir
