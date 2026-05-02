@@ -15,6 +15,7 @@ import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ProjectMembersPanel } from "@/components/ProjectMembersPanel";
 import { TokensPanel } from "@/components/TokensPanel";
 import { ApiError, api, type Deployment, type Project, type Team } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 
 type Params = { team: string; project: string };
 
@@ -169,18 +170,16 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   );
 
   const copyUrl = async (name: string, url: string) => {
-    try {
-      await navigator.clipboard.writeText(url);
+    const ok = await copyToClipboard(url);
+    if (ok) {
       setCopiedName(name);
       // Clear the "Copied!" label after a beat — long enough to be noticed,
       // short enough that re-clicking feels responsive.
       setTimeout(() => {
         setCopiedName((current) => (current === name ? null : current));
       }, 1500);
-    } catch {
-      // Clipboard write can fail on insecure origins or denied permissions;
-      // surface it through the existing action error banner.
-      setActionError("Could not copy URL to clipboard");
+    } else {
+      setActionError("Could not copy URL — select it manually and Ctrl+C");
     }
   };
 
