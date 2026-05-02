@@ -114,6 +114,16 @@ type SetupOpts struct {
 	// non-empty, deployment URLs get rewritten to
 	// "https://<name>.<BaseDomain>" — wins over PublicURL+ProxyEnabled.
 	BaseDomain string
+	// UpdaterSocket mirrors api.RouterDeps.UpdaterSocket — tests that
+	// exercise /v1/admin/upgrade either point this at a real-on-disk
+	// mock socket (see admin_test.go) or leave it empty to drive the
+	// "updater not configured" path.
+	UpdaterSocket string
+	// GitHubRepo + GitHubAPIBase let admin tests redirect the
+	// /version_check fetch at an httptest.Server that pretends to be
+	// GitHub. Production wiring leaves both empty (defaults apply).
+	GitHubRepo    string
+	GitHubAPIBase string
 }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
@@ -191,6 +201,9 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		PublicURL:             opts.PublicURL,
 		ProxyEnabled:          opts.ProxyEnabled,
 		BaseDomain:            opts.BaseDomain,
+		UpdaterSocket:         opts.UpdaterSocket,
+		GitHubRepo:            opts.GitHubRepo,
+		GitHubAPIBase:         opts.GitHubAPIBase,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a

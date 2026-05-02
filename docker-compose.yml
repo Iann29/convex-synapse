@@ -91,6 +91,14 @@ services:
       # This mount is unavoidable for the v0 architecture; the alternative is
       # rootless docker-in-docker, which is out of scope.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Self-update daemon socket. /run/synapse on the host is created
+      # by the synapse-updater systemd unit (RuntimeDirectory=synapse).
+      # The container reads/writes the unix socket inside that dir to
+      # invoke /v1/admin/upgrade without ever talking TCP. Bind is
+      # tolerant — when the daemon isn't installed (non-systemd hosts,
+      # CI, dev machines), the dir-mount creates an empty directory and
+      # the admin endpoint returns 503.
+      - /run/synapse:/run/synapse
     ports:
       - "${SYNAPSE_PORT:-8080}:8080"
     networks:

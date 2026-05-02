@@ -55,6 +55,22 @@ type RouterDeps struct {
 	// ha:true requests with ha_misconfigured when HA is on but Crypto
 	// is unset.
 	Crypto SecretEncrypter
+
+	// UpdaterSocket is the unix socket path of the synapse-updater
+	// systemd daemon. Empty (or unreachable) → /v1/admin/upgrade
+	// degrades to "Run setup.sh --upgrade via SSH" via 503. Default
+	// in compose: /run/synapse/updater.sock (bind-mounted from host).
+	UpdaterSocket string
+
+	// GitHubRepo is "<owner>/<name>" used by /v1/admin/version_check.
+	// Default "Iann29/convex-synapse"; overridable so a hard fork can
+	// point its dashboard at its own release stream.
+	GitHubRepo string
+
+	// GitHubAPIBase is a test seam — defaults to https://api.github.com.
+	// Setting it (httptest.Server URL) lets integration tests stub the
+	// GitHub fetch without network.
+	GitHubAPIBase string
 }
 
 // HAConfig carries cluster-wide defaults for the per-deployment Postgres
@@ -163,6 +179,18 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/projects", projectsH.Routes())
 			r.Mount("/deployments", deploymentsH.Routes())
 			r.Mount("/team_invites", invitesH.Routes())
+			// /v1/admin — instance-level operations (version check + auto-
+			// upgrade). The handler's own middleware gates each route to
+			// "any team admin"; we mount inside the authenticated group
+			// so unauthenticated probes still hit the auth 401 path.
+			adminH := &AdminHandler{
+				DB:            d.DB,
+				Version:       d.Version,
+				UpdaterSocket: d.UpdaterSocket,
+				GitHubRepo:    d.GitHubRepo,
+				GitHubAPIBase: d.GitHubAPIBase,
+			}
+			r.Mount("/admin", adminH.Routes())
 			// Personal access tokens — flat verb-suffixed endpoints under /v1.
 			// Registered directly (not via Mount) because chi's Mount("/", ...)
 			// collides with the existing GET /v1/ index handler above.

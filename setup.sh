@@ -400,6 +400,8 @@ source_libs() {
     . "$HERE/installer/install/s3.sh"
     # shellcheck source=installer/install/lifecycle.sh
     . "$HERE/installer/install/lifecycle.sh"
+    # shellcheck source=installer/install/updater.sh
+    . "$HERE/installer/install/updater.sh"
 }
 
 # phase_wizard — interactive Q&A when `curl | bash` runs without
@@ -1015,6 +1017,7 @@ main() {
     phase_install_deps
     phase_install_dir
     phase_secrets
+    phase_install_updater
     phase_caddy
     phase_compose_up
     phase_verify

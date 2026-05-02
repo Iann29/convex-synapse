@@ -80,6 +80,10 @@ const (
 	// Convex Cloud's /api/dashboard/team/<id>/deploy_keys vocabulary.
 	ActionCreateDeployKey = "createDeployKey"
 	ActionRevokeDeployKey = "revokeDeployKey"
+
+	// Instance-level upgrade flow (v1.1.0+). Synapse-original — Cloud has
+	// no per-customer upgrade because Cloud is the platform.
+	ActionUpgradeStarted = "upgradeStarted"
 )
 
 // Target type names.
@@ -91,6 +95,8 @@ const (
 	TargetAccessToken = "accessToken"
 	TargetUser        = "user"
 	TargetDeployKey   = "deployKey"
+	// TargetSynapse is the instance itself — used by upgrade events.
+	TargetSynapse = "synapse"
 )
 
 // Options collects the optional fields of an audit event. Empty strings are

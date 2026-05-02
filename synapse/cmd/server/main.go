@@ -114,7 +114,9 @@ func run() error {
 			BackendS3SecretKey:  cfg.BackendS3SecretKey,
 			BackendBucketPrefix: cfg.BackendS3BucketPrefix,
 		},
-		Crypto: secretBox,
+		Crypto:        secretBox,
+		UpdaterSocket: cfg.UpdaterSocket,
+		GitHubRepo:    cfg.GitHubRepo,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the

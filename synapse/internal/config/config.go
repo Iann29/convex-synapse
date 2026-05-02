@@ -109,6 +109,16 @@ type Config struct {
 	BackendS3AccessKey    string
 	BackendS3SecretKey    string
 	BackendS3BucketPrefix string
+
+	// Self-update daemon (v1.1.0+).
+	// UpdaterSocket: unix socket path the synapse-updater systemd
+	// daemon listens on. Default mounted at /run/synapse/updater.sock.
+	// Empty (or unreachable) → /v1/admin/upgrade returns 503 with a
+	// "run setup.sh --upgrade via SSH" hint.
+	UpdaterSocket string
+	// GitHubRepo points /v1/admin/version_check at the right release
+	// stream. Default Iann29/convex-synapse; overridable for forks.
+	GitHubRepo string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -178,6 +188,9 @@ func Load() (*Config, error) {
 		BackendS3AccessKey:    os.Getenv("SYNAPSE_BACKEND_S3_ACCESS_KEY"),
 		BackendS3SecretKey:    os.Getenv("SYNAPSE_BACKEND_S3_SECRET_KEY"),
 		BackendS3BucketPrefix: getEnvDefault("SYNAPSE_BACKEND_S3_BUCKET_PREFIX", "convex"),
+
+		UpdaterSocket: getEnvDefault("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"),
+		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),
 	}, nil
 }
 

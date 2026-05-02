@@ -118,6 +118,47 @@ export type DeployKey = {
   revokedAt?: string;
 };
 
+// Returned by GET /v1/admin/version_check. `current` is always populated.
+// `latest` and the surrounding fields are filled when we successfully
+// reached the GitHub release stream (cached up to 15min); on failure
+// `error` carries a short reason and the dashboard renders a degraded
+// banner instead of suggesting the operator upgrade.
+export type VersionCheck = {
+  current: string;
+  latest?: string;
+  updateAvailable: boolean;
+  releaseUrl?: string;
+  releaseNotes?: string;
+  publishedAt?: string;
+  fetchedAt?: string;
+  error?: string;
+};
+
+// POST /v1/admin/upgrade kicks off the host-side daemon. The real action
+// is async — the response just confirms the daemon accepted the request;
+// poll /v1/admin/upgrade/status for the actual progress.
+export type UpgradeResponse = {
+  started: boolean;
+  ref: string;
+};
+
+// GET /v1/admin/upgrade/status. State transitions:
+//   idle    → no upgrade has run since the daemon started
+//   running → setup.sh --upgrade is executing right now
+//   success → last run finished with exit 0
+//   failed  → last run exited non-zero
+//   unavailable → daemon socket missing (non-systemd host or not yet installed)
+export type UpgradeStatus = {
+  state: "idle" | "running" | "success" | "failed" | "unavailable";
+  ref?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number;
+  logTail?: string[];
+  logPath?: string;
+  error?: string;
+};
+
 // Returned once at create time. `adminKey` is the freshly-minted value;
 // `envSnippet` and `exportSnippet` are paste-ready for `.env.local` and
 // shell respectively. The dashboard MUST surface this immediately and
@@ -760,6 +801,23 @@ export const api = {
         method: "POST",
         body: { id },
       });
+    },
+  },
+
+  // Instance-level admin operations: version_check + auto-upgrade.
+  // Gated to "any team admin" — see synapse/internal/api/admin.go.
+  admin: {
+    versionCheck(): Promise<VersionCheck> {
+      return request<VersionCheck>("/v1/admin/version_check");
+    },
+    upgrade(ref?: string): Promise<UpgradeResponse> {
+      return request<UpgradeResponse>("/v1/admin/upgrade", {
+        method: "POST",
+        body: ref ? { ref } : {},
+      });
+    },
+    upgradeStatus(): Promise<UpgradeStatus> {
+      return request<UpgradeStatus>("/v1/admin/upgrade/status");
     },
   },
 };
