@@ -16,16 +16,21 @@ RestartSec=5
 # down to a dedicated user would just bloat the install with sudoers config
 # while not actually narrowing privilege (setup.sh ITSELF is root-equivalent).
 
-# Defense-in-depth — the daemon process itself doesn't need most of these,
-# but no reason to let a hypothetical RCE roam.
-ProtectHome=true
+# Defense-in-depth on the daemon itself. Notably absent: ProtectHome=true.
+# It looks like a slam-dunk hardening — the daemon never reads /root or
+# /home — but the daemon FORKS setup.sh which forks `docker compose up
+# --build`, which calls `docker buildx` which insists on creating
+# /root/.docker/ for its own config. With ProtectHome=true the unit's
+# /root is read-only and buildx fails with "mkdir /root/.docker:
+# read-only file system", killing every dashboard-driven upgrade.
+# Operators ssh-ing in and running setup.sh manually don't see this
+# because they're outside the systemd sandbox; only daemon-launched
+# upgrades hit it. Real-VPS smoke caught the bug post-v1.1.0.
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
 SystemCallArchitectures=native
 
 # RuntimeDirectory creates /run/synapse on each start (cleaned on stop).
