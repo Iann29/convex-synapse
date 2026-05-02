@@ -831,9 +831,15 @@ phase_success_screen() {
     # stays free of ANSI escapes. Falls back to stdout when
     # /dev/tty isn't writable (CI / scripted runs that captured
     # output via tee — same place the wizard skipped prompts).
-    local sink="/dev/tty"
-    if ! [[ -w /dev/tty ]]; then
-        sink="/dev/stdout"
+    #
+    # `[[ -w /dev/tty ]]` looks correct but lies: /dev/tty often
+    # exists as a device node with rw bits set, yet opening it for
+    # write returns ENXIO ("No such device or address") when the
+    # process has no controlling terminal. Probe by attempting an
+    # actual zero-byte write and falling back on failure.
+    local sink="/dev/stdout"
+    if { : >/dev/tty; } 2>/dev/null; then
+        sink="/dev/tty"
     fi
 
     cat >"$sink" <<EOF
@@ -856,11 +862,11 @@ phase_success_screen() {
     ${C_GREEN}3.${C_RESET} Use the CLI snippet from the deployment row to run \`npx convex deploy\`
 
   ${C_BOLD}Useful commands${C_RESET}
-    ${C_DIM}$${INSTALL_DIR}/setup.sh --doctor${C_RESET}    re-run health checks
-    ${C_DIM}$${INSTALL_DIR}/setup.sh --upgrade${C_RESET}   pull the latest release + restart
-    ${C_DIM}$${INSTALL_DIR}/setup.sh --status${C_RESET}    diagnostic snapshot
-    ${C_DIM}$${INSTALL_DIR}/setup.sh --backup${C_RESET}    snapshot the install (use --to-s3=... for S3)
-    ${C_DIM}docker compose -f $${INSTALL_DIR}/docker-compose.yml logs -f synapse${C_RESET}
+    ${C_DIM}${INSTALL_DIR}/setup.sh --doctor${C_RESET}    re-run health checks
+    ${C_DIM}${INSTALL_DIR}/setup.sh --upgrade${C_RESET}   pull the latest release + restart
+    ${C_DIM}${INSTALL_DIR}/setup.sh --status${C_RESET}    diagnostic snapshot
+    ${C_DIM}${INSTALL_DIR}/setup.sh --backup${C_RESET}    snapshot the install (use --to-s3=... for S3)
+    ${C_DIM}docker compose -f ${INSTALL_DIR}/docker-compose.yml logs -f synapse${C_RESET}
 
 EOF
     # Strip the ANSI escapes when echoing to /dev/tty AND the operator
