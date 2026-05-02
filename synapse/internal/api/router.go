@@ -150,6 +150,11 @@ func NewRouter(d RouterDeps) http.Handler {
 			// Registered directly (not via Mount) because chi's Mount("/", ...)
 			// collides with the existing GET /v1/ index handler above.
 			tokensH.Register(r)
+			// Profile-level cloud-spec endpoints — mounted flat the same way
+			// as access tokens (Mount("/", ...) collides with the index
+			// handler). See MeHandler.RegisterTopLevel for the per-route
+			// rationale.
+			meH.RegisterTopLevel(r)
 		})
 	})
 
