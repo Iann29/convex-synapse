@@ -58,17 +58,59 @@ wizard::should_run() {
 
 # wizard::_color — duplicate the ui:: colour init so this file works
 # even if sourced before ui.sh (the bats tests sometimes do that).
+#
+# We force colours ON whenever /dev/tty is readable, even if our own
+# stdout has been redirected to a `tee` log (which setup.sh does).
+# Without that override the wizard would render plain-text on the
+# operator's terminal — visually flat. The escapes still go to /dev/tty
+# only via the prompt helpers, so the log file stays clean.
 wizard::_color() {
-    if [[ "${UI_NO_COLOR:-0}" == "1" ]] || [[ -n "${NO_COLOR:-}" ]] || ! [[ -t 1 ]]; then
-        WIZ_BOLD="" WIZ_DIM="" WIZ_GREEN="" WIZ_BLUE="" WIZ_YELLOW="" WIZ_RESET=""
-    else
+    if [[ "${UI_NO_COLOR:-0}" == "1" ]] || [[ -n "${NO_COLOR:-}" ]]; then
+        WIZ_BOLD="" WIZ_DIM="" WIZ_GREEN="" WIZ_BLUE="" WIZ_YELLOW="" WIZ_CYAN="" WIZ_RESET=""
+    elif [[ -r /dev/tty ]]; then
         WIZ_BOLD=$'\033[1m'
         WIZ_DIM=$'\033[2m'
         WIZ_GREEN=$'\033[32m'
         WIZ_BLUE=$'\033[34m'
         WIZ_YELLOW=$'\033[33m'
+        WIZ_CYAN=$'\033[36m'
         WIZ_RESET=$'\033[0m'
+    else
+        WIZ_BOLD="" WIZ_DIM="" WIZ_GREEN="" WIZ_BLUE="" WIZ_YELLOW="" WIZ_CYAN="" WIZ_RESET=""
     fi
+}
+
+# wizard::_banner — ASCII title card. Printed at the very top of the
+# wizard so the operator knows they're in the friendly path (not the
+# scary scripted-install path). Colours render via /dev/tty when the
+# terminal supports them; falls through to plain text otherwise.
+wizard::_banner() {
+    wizard::_color
+    cat >/dev/tty <<EOF
+
+  ${WIZ_CYAN}╭─────────────────────────────────────────────────────────╮${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}                                                         ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_BOLD}Synapse${WIZ_RESET} ${WIZ_DIM}— open-source Convex control plane${WIZ_RESET}      ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_DIM}installer v${INSTALLER_VERSION}${WIZ_RESET}                                  ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}                                                         ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}╰─────────────────────────────────────────────────────────╯${WIZ_RESET}
+
+  ${WIZ_DIM}I'll ask a few questions, then handle the rest.${WIZ_RESET}
+  ${WIZ_DIM}Press Enter to accept the highlighted default at any prompt.${WIZ_RESET}
+
+EOF
+}
+
+# wizard::_step <index> <total> <title>
+# Prints a step header so the operator can see how far along they are.
+wizard::_step() {
+    local idx="$1" total="$2" title="$3"
+    wizard::_color
+    printf '\n  %s┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' \
+        "$WIZ_DIM" "$WIZ_RESET" >/dev/tty
+    printf '  %sStep %d/%d%s  %s%s%s\n' \
+        "$WIZ_DIM" "$idx" "$total" "$WIZ_RESET" \
+        "$WIZ_BOLD" "$title" "$WIZ_RESET" >/dev/tty
 }
 
 # wizard::ask_yn <prompt> [default=Y]
@@ -231,21 +273,14 @@ wizard::install_docker() {
 # flag covering it). The wizard only fills gaps.
 wizard::run() {
     wizard::_color
-
-    # Welcome banner — distinct from setup.sh's phase_banner so the
-    # wizard's friendly tone is signalled early.
-    cat >/dev/tty <<EOF
-
-  ${WIZ_BOLD}Synapse${WIZ_RESET} ${WIZ_DIM}— open-source Convex control plane${WIZ_RESET}
-  ${WIZ_DIM}I'll ask a few questions, then set everything up.${WIZ_RESET}
-
-EOF
+    wizard::_banner
 
     # 1. Domain question — three branches:
     #    a) "Yes, I have a domain"  → ask for the host, run --domain= flow
     #    b) "No, just test on this IP" → --no-tls flow
     #    c) "Not sure" → auto-detect public IP, suggest no-tls
     if [[ -z "${DOMAIN:-}" ]] && (( ${NO_TLS:-0} == 0 )); then
+        wizard::_step 1 4 "Domain & TLS"
         local domain_choice
         domain_choice="$(wizard::ask_choice \
             "Do you have a domain pointing at this server?" 2 \
@@ -268,6 +303,10 @@ EOF
                 ;;
             No*)
                 NO_TLS=1
+                # Even on the explicit "No" branch we still want to
+                # detect the public IP so the summary can show a
+                # ready-to-paste URL instead of "<this-server>".
+                wizard::_detect_public_ip
                 ;;
         esac
     fi
@@ -287,8 +326,9 @@ EOF
     #    provisioned, which a fresh-install operator usually doesn't
     #    have ready.
     if (( ${ENABLE_HA:-0} == 0 )); then
+        wizard::_step 2 4 "Deployment mode"
         if wizard::ask_yn \
-                "HA mode? (advanced — 2 replicas + external Postgres + S3 per deployment)" N; then
+                "Enable HA mode? (advanced — 2 replicas + external Postgres + S3)" N; then
             ENABLE_HA=1
         fi
     fi
@@ -297,6 +337,7 @@ EOF
     #    keeps it there; the prompt is mainly so the small minority
     #    with a different convention can override without flag-spelunking.
     if [[ -z "${INSTALL_DIR:-}" ]]; then
+        wizard::_step 3 4 "Install location"
         INSTALL_DIR="$(wizard::ask_text \
             "Install directory" "/opt/synapse" wizard::valid_path)"
     fi
@@ -305,7 +346,8 @@ EOF
     #    that actually installs Docker checks this and the preflight
     #    output. Default Y means "yes, fix what's missing."
     if [[ -z "${SYNAPSE_AUTO_INSTALL_DOCKER:-}" ]]; then
-        if wizard::ask_yn "Auto-install missing dependencies (Docker etc) when needed?" Y; then
+        wizard::_step 4 4 "Dependencies"
+        if wizard::ask_yn "Auto-install missing dependencies (Docker etc)?" Y; then
             SYNAPSE_AUTO_INSTALL_DOCKER=1
         else
             SYNAPSE_AUTO_INSTALL_DOCKER=0
@@ -322,63 +364,89 @@ EOF
     fi
 }
 
+# wizard::_detect_public_ip — best-effort IP probe via api.ipify.org.
+# Stamps SYNAPSE_DETECTED_PUBLIC_IP for the summary. Silent on failure
+# (the summary falls back to a placeholder URL, which is fine).
+wizard::_detect_public_ip() {
+    if [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+    SYNAPSE_DETECTED_PUBLIC_IP="$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "")"
+    export SYNAPSE_DETECTED_PUBLIC_IP
+}
+
 # wizard::_dont_know_domain_path — the "not sure" branch of the
 # domain question. We probe public IP, tell the operator what we
 # found, and default them onto the no-tls path (the safest landing).
 wizard::_dont_know_domain_path() {
     wizard::_color
-    local public_ip=""
-    if command -v curl >/dev/null 2>&1; then
-        public_ip="$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "")"
-    fi
-    if [[ -n "$public_ip" ]]; then
+    wizard::_detect_public_ip
+    if [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
         cat >/dev/tty <<EOF
-  ${WIZ_GREEN}✓${WIZ_RESET} This server's public IP: ${WIZ_BOLD}${public_ip}${WIZ_RESET}
-    Without a domain, Synapse will be reachable at:
-        ${WIZ_BOLD}http://${public_ip}:6790${WIZ_RESET}  (dashboard)
-        ${WIZ_BOLD}http://${public_ip}:8080${WIZ_RESET}  (API)
-    No HTTPS in this mode. Fine for testing; rerun with --domain= for production.
+    ${WIZ_GREEN}✓${WIZ_RESET} This server's public IP: ${WIZ_BOLD}${SYNAPSE_DETECTED_PUBLIC_IP}${WIZ_RESET}
+      Without a domain, Synapse will be reachable at:
+        ${WIZ_BOLD}http://${SYNAPSE_DETECTED_PUBLIC_IP}:6790${WIZ_RESET}  ${WIZ_DIM}(dashboard)${WIZ_RESET}
+        ${WIZ_BOLD}http://${SYNAPSE_DETECTED_PUBLIC_IP}:8080${WIZ_RESET}  ${WIZ_DIM}(API)${WIZ_RESET}
+      ${WIZ_DIM}No HTTPS in this mode. Rerun with a domain later for production.${WIZ_RESET}
 EOF
     else
         cat >/dev/tty <<EOF
-  ${WIZ_YELLOW}!${WIZ_RESET} Couldn't reach api.ipify.org to detect this server's public IP.
-    Going with plain-HTTP mode — Synapse will bind on :6790 and :8080.
+    ${WIZ_YELLOW}!${WIZ_RESET} Couldn't reach api.ipify.org to detect public IP.
+      Going with plain-HTTP mode on :6790 and :8080.
 EOF
     fi
     NO_TLS=1
-    SYNAPSE_DETECTED_PUBLIC_IP="$public_ip"
-    export SYNAPSE_DETECTED_PUBLIC_IP
 }
 
 # wizard::_summary — recap what we've decided so the operator can
-# bail if they spot something wrong.
+# bail if they spot something wrong. Uses a coloured box so it's
+# distinct from the question prompts above.
 wizard::_summary() {
     wizard::_color
     local mode_line url
     if (( ${NO_TLS:-0} )); then
-        mode_line="${WIZ_DIM}plain HTTP${WIZ_RESET}"
+        mode_line="${WIZ_YELLOW}plain HTTP${WIZ_RESET} ${WIZ_DIM}(no TLS)${WIZ_RESET}"
         if [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
-            url="http://${SYNAPSE_DETECTED_PUBLIC_IP}:6790"
+            url="${WIZ_BOLD}http://${SYNAPSE_DETECTED_PUBLIC_IP}:6790${WIZ_RESET}"
         else
-            url="http://<this-server>:6790"
+            url="${WIZ_DIM}http://<this-server>:6790${WIZ_RESET}"
         fi
     else
-        mode_line="${WIZ_GREEN}HTTPS via Caddy + Let's Encrypt${WIZ_RESET}"
-        url="https://${DOMAIN}"
+        mode_line="${WIZ_GREEN}HTTPS${WIZ_RESET} ${WIZ_DIM}via Caddy + Let's Encrypt${WIZ_RESET}"
+        url="${WIZ_BOLD}https://${DOMAIN}${WIZ_RESET}"
+    fi
+    local ha_state ha_dim
+    if (( ${ENABLE_HA:-0} )); then
+        ha_state="${WIZ_GREEN}on${WIZ_RESET}"
+        ha_dim="${WIZ_DIM}(2 replicas + external Postgres + S3 per deployment)${WIZ_RESET}"
+    else
+        ha_state="${WIZ_DIM}off${WIZ_RESET}"
+        ha_dim="${WIZ_DIM}(single replica per deployment — common path)${WIZ_RESET}"
+    fi
+    local deps_state
+    if (( ${SYNAPSE_AUTO_INSTALL_DOCKER:-1} )); then
+        deps_state="${WIZ_GREEN}auto${WIZ_RESET} ${WIZ_DIM}(install Docker if missing)${WIZ_RESET}"
+    else
+        deps_state="${WIZ_DIM}manual${WIZ_RESET}"
     fi
     cat >/dev/tty <<EOF
 
-  ${WIZ_BOLD}Summary${WIZ_RESET}
-  ${WIZ_DIM}────────────────────────────────────${WIZ_RESET}
-    Mode:        ${mode_line}
-    URL:         ${url}
-    Install:     ${INSTALL_DIR}
-    HA:          $(( ${ENABLE_HA:-0} )) ${WIZ_DIM}(0 = single replica)${WIZ_RESET}
-    Auto-deps:   $(( ${SYNAPSE_AUTO_INSTALL_DOCKER:-1} )) ${WIZ_DIM}(install Docker if missing)${WIZ_RESET}
+  ${WIZ_CYAN}╭── Summary ──────────────────────────────────────────────╮${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}  Mode         ${mode_line}
+  ${WIZ_CYAN}│${WIZ_RESET}  URL          ${url}
+  ${WIZ_CYAN}│${WIZ_RESET}  Install dir  ${WIZ_BOLD}${INSTALL_DIR}${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}  HA mode      ${ha_state}  ${ha_dim}
+  ${WIZ_CYAN}│${WIZ_RESET}  Dependencies ${deps_state}
 EOF
     if [[ -n "${BASE_DOMAIN:-}" ]]; then
-        printf '    Base domain: %s %s(wildcard)%s\n' \
-            "$BASE_DOMAIN" "$WIZ_DIM" "$WIZ_RESET" >/dev/tty
+        printf '  %s│%s  Base domain  %s%s%s %s(wildcard *.%s)%s\n' \
+            "$WIZ_CYAN" "$WIZ_RESET" \
+            "$WIZ_BOLD" "$BASE_DOMAIN" "$WIZ_RESET" \
+            "$WIZ_DIM" "$BASE_DOMAIN" "$WIZ_RESET" >/dev/tty
     fi
-    printf '\n' >/dev/tty
+    printf '  %s╰─────────────────────────────────────────────────────────╯%s\n' \
+        "$WIZ_CYAN" "$WIZ_RESET" >/dev/tty
 }
