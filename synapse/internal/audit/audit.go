@@ -75,6 +75,11 @@ const (
 	// "<verb><Noun>" convention.
 	ActionCreatePersonalAccessToken = "createPersonalAccessToken"
 	ActionDeletePersonalAccessToken = "deletePersonalAccessToken"
+
+	// Deploy keys (per-deployment, named, used by CI). The names mirror
+	// Convex Cloud's /api/dashboard/team/<id>/deploy_keys vocabulary.
+	ActionCreateDeployKey = "createDeployKey"
+	ActionRevokeDeployKey = "revokeDeployKey"
 )
 
 // Target type names.
@@ -85,6 +90,7 @@ const (
 	TargetInvite      = "invite"
 	TargetAccessToken = "accessToken"
 	TargetUser        = "user"
+	TargetDeployKey   = "deployKey"
 )
 
 // Options collects the optional fields of an audit event. Empty strings are

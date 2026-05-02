@@ -11,6 +11,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
+import { DeployKeysPanel } from "@/components/DeployKeysPanel";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ProjectMembersPanel } from "@/components/ProjectMembersPanel";
 import { TokensPanel } from "@/components/TokensPanel";
@@ -466,8 +467,9 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                     </Button>
                   </div>
                 </CardBody>
-                <div className="border-t border-neutral-900 px-5 py-3">
+                <div className="space-y-2 border-t border-neutral-900 px-5 py-3">
                   <CliCredentialsPanel deploymentName={d.name} />
+                  <DeployKeysPanel deploymentName={d.name} />
                 </div>
               </Card>
             );

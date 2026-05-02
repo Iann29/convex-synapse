@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -183,13 +185,20 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/delete", h.deleteDeployment)
 		r.Get("/auth", h.deploymentAuth)
 		r.Get("/cli_credentials", h.deploymentCLICredentials)
-		r.Post("/create_deploy_key", h.createDeployKey)
 		r.Post("/upgrade_to_ha", h.upgradeToHA)
 		// Scoped access tokens (v1.0+). Created tokens carry
 		// scope=deployment + scope_id=<this deployment>; the auth
 		// middleware enforces the scope at every subsequent request.
 		r.Post("/access_tokens", h.createDeploymentAccessToken)
 		r.Get("/access_tokens", h.listDeploymentAccessTokens)
+		// Deploy keys (v1.0.3+). Named per-CI admin keys mirroring
+		// Convex Cloud's "Personal Deployment Settings → Deploy Keys".
+		// The `create_deploy_key` endpoint moved from the orphaned v0
+		// shape (opaque Synapse tokens that nothing read) to the new
+		// admin-key-emitting flow under /deploy_keys.
+		r.Post("/deploy_keys", h.createDeployKey)
+		r.Get("/deploy_keys", h.listDeployKeys)
+		r.Post("/deploy_keys/{id}/revoke", h.revokeDeployKey)
 	})
 	return r
 }
@@ -1479,25 +1488,68 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// ---------- POST /v1/deployments/{name}/create_deploy_key ----------
+// ---------- Deploy keys ----------------------------------------------
+//
+// Per-deployment named admin keys, used by CI integrations (Vercel,
+// GitHub Actions, etc) so each credential has a clean audit trail.
+// Mirrors Convex Cloud's "Personal Deployment Settings → Deploy Keys"
+// UX. v1.0.3+.
+//
+// IMPORTANT — revoke is best-effort: the Convex backend authenticates
+// admin keys by signature against INSTANCE_SECRET (stateless), so we
+// cannot per-key revoke without rotating the deployment's instance
+// secret. revoked_at hides the row from the dashboard list; real
+// invalidation requires a deployment-wide rotation. The dashboard
+// surfaces that gotcha. A future "tier 2" with Synapse in the request
+// path would close the gap. See migration 000009 for the design note.
 
 type createDeployKeyReq struct {
-	Name string `json:"name,omitempty"`
+	Name string `json:"name"`
 }
 
 type createDeployKeyResp struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Token string `json:"token"`
+	models.DeployKey
+	// EnvSnippet + ExportSnippet mirror the cli_credentials shape so the
+	// dashboard can show the operator a paste-ready block immediately.
+	// AdminKey is also embedded via models.DeployKey so callers that
+	// want just the bare value have it.
+	EnvSnippet    string `json:"envSnippet"`
+	ExportSnippet string `json:"exportSnippet"`
+}
+
+// deployKeyPrefix returns a short identifier for the dashboard chip.
+// Convex admin keys have the shape "<deployment>|<hex>"; we surface the
+// first 8 hex chars after the pipe so two keys for the same deployment
+// are visually distinguishable without leaking the secret. Keys that
+// don't carry the pipe (synthetic test keys) fall back to the first
+// 8 chars of the whole string.
+func deployKeyPrefix(adminKey string) string {
+	if i := strings.Index(adminKey, "|"); i >= 0 && i+1 < len(adminKey) {
+		rest := adminKey[i+1:]
+		if len(rest) > 8 {
+			return rest[:8]
+		}
+		return rest
+	}
+	if len(adminKey) > 8 {
+		return adminKey[:8]
+	}
+	return adminKey
+}
+
+func deployKeyHash(adminKey string) string {
+	sum := sha256.Sum256([]byte(adminKey))
+	return hex.EncodeToString(sum[:])
 }
 
 func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Request) {
-	d, _, _, role, ok := h.loadDeploymentForRequest(w, r)
+	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
 	if !ok {
 		return
 	}
 	if !canAdminProject(role) {
-		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can create deploy keys")
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only project admins can create deploy keys")
 		return
 	}
 	var req createDeployKeyReq
@@ -1505,29 +1557,194 @@ func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "missing_name",
+			"name is required")
+		return
+	}
+	if len(name) > 64 {
+		writeError(w, http.StatusBadRequest, "name_too_long",
+			"name must be 64 characters or fewer")
+		return
+	}
 	uid, _ := auth.UserID(r.Context())
 
-	plain, hash, err := auth.GenerateToken()
+	// Generate a fresh admin key signed by the deployment's instance
+	// secret. Each generate_key invocation produces a new value, so
+	// every deploy key is independently identifiable on the wire.
+	adminKey, err := h.Docker.GenerateAdminKey(r.Context(), d.Name, d.InstanceSecret)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate token")
+		logErr("generate admin key for deploy key", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to mint admin key")
 		return
 	}
+
+	prefix := deployKeyPrefix(adminKey)
+	hash := deployKeyHash(adminKey)
 
 	var id string
+	var createdAt time.Time
 	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO deploy_keys (deployment_id, name, token_hash, created_by)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id
-	`, d.ID, req.Name, hash, uid).Scan(&id)
+		INSERT INTO deploy_keys (deployment_id, name, admin_key_prefix, admin_key_hash, created_by)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at
+	`, d.ID, name, prefix, hash, uid).Scan(&id, &createdAt)
 	if err != nil {
+		if synapsedb.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "name_in_use",
+				"A deploy key with that name is already active on this deployment")
+			return
+		}
 		logErr("insert deploy key", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to create deploy key")
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to create deploy key")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, createDeployKeyResp{
-		ID:    id,
-		Name:  req.Name,
-		Token: plain,
+	cliURL := h.cliDeploymentURL(d)
+	envSnippet := "CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
+		"CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(adminKey)
+	exportSnippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
+		"export CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(adminKey)
+
+	uidPtr := &uid
+	if uid == "" {
+		uidPtr = nil
+	}
+	resp := createDeployKeyResp{
+		DeployKey: models.DeployKey{
+			ID:           id,
+			DeploymentID: d.ID,
+			Name:         name,
+			AdminKey:     adminKey,
+			Prefix:       prefix,
+			CreatedBy:    uidPtr,
+			CreatedAt:    createdAt,
+		},
+		EnvSnippet:    envSnippet,
+		ExportSnippet: exportSnippet,
+	}
+
+	teamID := ""
+	if t != nil {
+		teamID = t.ID
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateDeployKey,
+		TargetType: audit.TargetDeployKey,
+		TargetID:   id,
+		Metadata: map[string]any{
+			"deploymentId":   d.ID,
+			"deploymentName": d.Name,
+			"name":           name,
+			"prefix":         prefix,
+		},
 	})
+
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (h *DeploymentsHandler) listDeployKeys(w http.ResponseWriter, r *http.Request) {
+	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT k.id, k.deployment_id, k.name, k.admin_key_prefix,
+		       k.created_by, COALESCE(u.name, ''), k.created_at, k.last_used_at
+		FROM deploy_keys k
+		LEFT JOIN users u ON u.id = k.created_by
+		WHERE k.deployment_id = $1 AND k.revoked_at IS NULL
+		ORDER BY k.created_at DESC
+	`, d.ID)
+	if err != nil {
+		logErr("list deploy keys", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to list deploy keys")
+		return
+	}
+	defer rows.Close()
+	out := make([]models.DeployKey, 0, 8)
+	for rows.Next() {
+		var k models.DeployKey
+		var createdBy *string
+		var createdByName string
+		var lastUsed *time.Time
+		if err := rows.Scan(&k.ID, &k.DeploymentID, &k.Name, &k.Prefix,
+			&createdBy, &createdByName, &k.CreatedAt, &lastUsed); err != nil {
+			logErr("scan deploy key", err)
+			writeError(w, http.StatusInternalServerError, "internal",
+				"Failed to read deploy keys")
+			return
+		}
+		k.CreatedBy = createdBy
+		k.CreatedByName = createdByName
+		k.LastUsedAt = lastUsed
+		out = append(out, k)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployKeys": out})
+}
+
+func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Request) {
+	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only project admins can revoke deploy keys")
+		return
+	}
+	keyID := chi.URLParam(r, "id")
+	if keyID == "" {
+		writeError(w, http.StatusBadRequest, "missing_id", "key id is required")
+		return
+	}
+
+	// UPDATE … RETURNING gives us the row to audit AND tells us 404 vs
+	// already-revoked vs success in one round trip. The deployment_id
+	// guard stops cross-deployment revoke attempts (defense-in-depth on
+	// top of the loadDeploymentForRequest scope check).
+	var name, prefix string
+	err := h.DB.QueryRow(r.Context(), `
+		UPDATE deploy_keys
+		SET revoked_at = now()
+		WHERE id = $1 AND deployment_id = $2 AND revoked_at IS NULL
+		RETURNING name, admin_key_prefix
+	`, keyID, d.ID).Scan(&name, &prefix)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found",
+				"Deploy key not found, already revoked, or belongs to a different deployment")
+			return
+		}
+		logErr("revoke deploy key", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to revoke deploy key")
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	teamID := ""
+	if t != nil {
+		teamID = t.ID
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionRevokeDeployKey,
+		TargetType: audit.TargetDeployKey,
+		TargetID:   keyID,
+		Metadata: map[string]any{
+			"deploymentId":   d.ID,
+			"deploymentName": d.Name,
+			"name":           name,
+			"prefix":         prefix,
+		},
+	})
+	w.WriteHeader(http.StatusNoContent)
 }

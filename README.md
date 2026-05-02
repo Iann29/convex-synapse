@@ -107,6 +107,7 @@ without one, Synapse exposes plain HTTP on `:6790` (dashboard) and
 | Convex Dashboard | hosted alongside Synapse, auto-logged via postMessage handshake |
 | HA-per-deployment | opt-in: 2 replicas + external Postgres + S3, AES-GCM encrypted creds |
 | Scoped access tokens (v1.0+) | user / team / project / app / deployment scope; bearer enforced at every load*ForRequest |
+| Deploy keys (v1.0.3+) | named per-deployment admin keys for CI integrations (Vercel, GitHub Actions, etc) — create from the deployment row, revoke from the dashboard, audit trail per credential |
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
 | Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
