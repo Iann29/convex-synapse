@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -121,6 +122,53 @@ func (h *DeploymentsHandler) publicDeploymentURL(d *models.Deployment) string {
 		return d.DeploymentURL
 	}
 	return fmt.Sprintf("%s:%d", h.PublicURL, d.HostPort)
+}
+
+// cliDeploymentURL returns a URL the official `npx convex` CLI can hit
+// directly. The CLI builds API requests via `new URL("/api/...", baseUrl)`,
+// which is host-anchored and *drops* any path component on the base URL.
+// That means our /d/{name}/* path-proxy URL — fine for browsers — breaks
+// the CLI: it'd hit `<host>:8080/api/...` (which is the Synapse API,
+// returning 404) instead of the Convex backend container.
+//
+// To work around it, the CLI snippet bypasses the path proxy entirely
+// and points at the deployment's own host port, which is published on
+// 0.0.0.0:<HostPort> by the provisioner. The Convex backend serves
+// `/api/...` at root there, so `new URL("/api/x", baseUrl)` resolves
+// correctly.
+//
+// Decision matrix mirrors publicDeploymentURL but never falls through
+// to the path-proxy form:
+//   - Adopted                    → d.DeploymentURL (operator-supplied)
+//   - BaseDomain set             → "https://<name>.<BaseDomain>" (CLI-OK)
+//   - PublicURL set + HostPort>0 → "<PublicURL_host>:<HostPort>" (CLI-OK)
+//   - everything else            → d.DeploymentURL fallback
+//
+// When BaseDomain is the active mode the host port doesn't even need
+// to be reachable from outside — Caddy is the only public endpoint.
+// When PublicURL+HostPort is the active mode the operator's firewall
+// MUST allow inbound on the dynamic host port (Hetzner default-deny
+// would block it). The dashboard surfaces the URL as-is so a failing
+// CLI is the only signal — there is no preflight here.
+func (h *DeploymentsHandler) cliDeploymentURL(d *models.Deployment) string {
+	if d.Adopted {
+		return d.DeploymentURL
+	}
+	if h.BaseDomain != "" {
+		return "https://" + d.Name + "." + h.BaseDomain
+	}
+	if h.PublicURL == "" || d.HostPort == 0 {
+		return d.DeploymentURL
+	}
+	// Strip the synapse-api port (8080) from PublicURL and slap on the
+	// deployment's own host port. PublicURL parsing falls back to the
+	// raw deployment URL if it's malformed (shouldn't happen — the
+	// installer validates it — but better than emitting a broken URL).
+	u, err := url.Parse(h.PublicURL)
+	if err != nil || u.Hostname() == "" {
+		return d.DeploymentURL
+	}
+	return fmt.Sprintf("%s://%s:%d", u.Scheme, u.Hostname(), d.HostPort)
 }
 
 // SecretEncrypter is the *crypto.SecretBox subset the handler needs.
@@ -1386,11 +1434,14 @@ type cliCredentialsResp struct {
 	DeploymentName string `json:"deploymentName"`
 	ConvexURL      string `json:"convexUrl"`
 	AdminKey       string `json:"adminKey"`
-	// ExportSnippet is a shell-pasteable string that sets both env vars at
-	// once. Built server-side so the dashboard doesn't have to hand-roll the
-	// formatting (and so any future change to the env-var names is owned by
-	// one file).
+	// ExportSnippet sets both env vars in a POSIX shell. Built server-side
+	// so the dashboard doesn't have to hand-roll the formatting (and so any
+	// future change to the env-var names is owned by one file).
 	ExportSnippet string `json:"exportSnippet"`
+	// EnvSnippet is the same two values without the `export` prefix —
+	// drop-in for `.env.local` (the file `npx convex dev` auto-loads via
+	// dotenv). Most operators want this format, not the shell one.
+	EnvSnippet string `json:"envSnippet"`
 }
 
 func (h *DeploymentsHandler) deploymentCLICredentials(w http.ResponseWriter, r *http.Request) {
@@ -1398,14 +1449,20 @@ func (h *DeploymentsHandler) deploymentCLICredentials(w http.ResponseWriter, r *
 	if !ok {
 		return
 	}
-	publicURL := h.publicDeploymentURL(d)
-	snippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(publicURL) + "\n" +
+	// CLI gets the root-URL form (no /d/<name> path proxy), since the
+	// Convex CLI's `new URL("/api/...", baseUrl)` host-anchors and
+	// would otherwise drop the path prefix.
+	cliURL := h.cliDeploymentURL(d)
+	exportSnippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
 		"export CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(d.AdminKey)
+	envSnippet := "CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
+		"CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(d.AdminKey)
 	writeJSON(w, http.StatusOK, cliCredentialsResp{
 		DeploymentName: d.Name,
-		ConvexURL:      publicURL,
+		ConvexURL:      cliURL,
 		AdminKey:       d.AdminKey,
-		ExportSnippet:  snippet,
+		ExportSnippet:  exportSnippet,
+		EnvSnippet:     envSnippet,
 	})
 }
 

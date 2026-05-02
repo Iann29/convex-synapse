@@ -157,6 +157,7 @@ type cliCredentialsResp struct {
 	ConvexURL      string `json:"convexUrl"`
 	AdminKey       string `json:"adminKey"`
 	ExportSnippet  string `json:"exportSnippet"`
+	EnvSnippet     string `json:"envSnippet"`
 }
 
 func TestDeployments_CLICredentialsReturnsExportSnippet(t *testing.T) {
@@ -180,20 +181,91 @@ func TestDeployments_CLICredentialsReturnsExportSnippet(t *testing.T) {
 		t.Errorf("expected convex URL")
 	}
 
-	// Snippet must contain BOTH env-var names so a copy-paste sets the
-	// CLI up correctly. We don't pin the exact line ordering, but both
-	// must appear and must reference the actual values.
-	if !strings.Contains(got.ExportSnippet, "CONVEX_SELF_HOSTED_URL") {
-		t.Errorf("snippet missing CONVEX_SELF_HOSTED_URL: %q", got.ExportSnippet)
+	// Both snippets must contain BOTH env-var names so either copy-paste
+	// path sets the CLI up correctly. We don't pin the exact line
+	// ordering, but the values must match the structured fields.
+	for _, tc := range []struct {
+		name    string
+		snippet string
+		prefix  string // "export " for shell, "" for .env
+	}{
+		{"export", got.ExportSnippet, "export "},
+		{"env", got.EnvSnippet, ""},
+	} {
+		if !strings.Contains(tc.snippet, tc.prefix+"CONVEX_SELF_HOSTED_URL") {
+			t.Errorf("%s snippet missing %sCONVEX_SELF_HOSTED_URL: %q", tc.name, tc.prefix, tc.snippet)
+		}
+		if !strings.Contains(tc.snippet, tc.prefix+"CONVEX_SELF_HOSTED_ADMIN_KEY") {
+			t.Errorf("%s snippet missing %sCONVEX_SELF_HOSTED_ADMIN_KEY: %q", tc.name, tc.prefix, tc.snippet)
+		}
+		if !strings.Contains(tc.snippet, "admin-key-abc") {
+			t.Errorf("%s snippet missing admin key value: %q", tc.name, tc.snippet)
+		}
+		if !strings.Contains(tc.snippet, got.ConvexURL) {
+			t.Errorf("%s snippet missing convex URL %q: %q", tc.name, got.ConvexURL, tc.snippet)
+		}
 	}
-	if !strings.Contains(got.ExportSnippet, "CONVEX_SELF_HOSTED_ADMIN_KEY") {
-		t.Errorf("snippet missing CONVEX_SELF_HOSTED_ADMIN_KEY: %q", got.ExportSnippet)
+	// Belt-and-suspenders: the .env snippet must NOT carry `export `
+	// (otherwise dotenv parsers choke).
+	if strings.Contains(got.EnvSnippet, "export ") {
+		t.Errorf("env snippet should not contain `export `: %q", got.EnvSnippet)
 	}
-	if !strings.Contains(got.ExportSnippet, "admin-key-abc") {
-		t.Errorf("snippet missing admin key value: %q", got.ExportSnippet)
+}
+
+// CLI URL must be a *root* URL the official `npx convex` CLI can hit
+// directly. The CLI builds API requests via `new URL("/api/...", baseUrl)`,
+// which is host-anchored — a baseUrl like `<host>:8080/d/<name>` would
+// resolve to `<host>:8080/api/...` (Synapse 404), not the deployment.
+// So the snippet must point at the per-deployment host port instead of
+// the path-proxy form, even when ProxyEnabled is on for browsers.
+func TestDeployments_CLICredentialsURLBypassesPathProxy(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIProxy Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	h.SeedDeployment(proj.ID, "cli-fox-9999", "dev", "running", false, owner.ID, 3290, "key-xyz")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-fox-9999/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	// CLI-facing URL strips the synapse-api port and appends the
+	// deployment's own host_port, giving the CLI a root URL.
+	wantURL := "http://synapse.example.com:3290"
+	if got.ConvexURL != wantURL {
+		t.Errorf("convexUrl: got %q want %q", got.ConvexURL, wantURL)
 	}
-	if !strings.Contains(got.ExportSnippet, got.ConvexURL) {
-		t.Errorf("snippet missing convex URL %q: %q", got.ConvexURL, got.ExportSnippet)
+	// The /d/<name> path-proxy form must NOT leak into the CLI snippet —
+	// it'd silently break `npx convex dev`.
+	if strings.Contains(got.ConvexURL, "/d/") {
+		t.Errorf("CLI URL must not use /d/<name> proxy form: %q", got.ConvexURL)
+	}
+}
+
+// When BaseDomain is set, every deployment gets its own subdomain — that
+// is already a root URL, no port-strip needed. Verifies CLI snippet uses
+// the wildcard form instead of falling back.
+func TestDeployments_CLICredentialsBaseDomainURL(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+		BaseDomain:   "convex.example.com",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIWild Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	h.SeedDeployment(proj.ID, "cli-bee-4242", "prod", "running", true, owner.ID, 3300, "key-bd")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-bee-4242/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	wantURL := "https://cli-bee-4242.convex.example.com"
+	if got.ConvexURL != wantURL {
+		t.Errorf("convexUrl: got %q want %q", got.ConvexURL, wantURL)
 	}
 }
 
