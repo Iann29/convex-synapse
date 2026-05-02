@@ -558,6 +558,14 @@ export const api = {
   },
 
   deployments: {
+    // Returns the full Deployment row (projectId, type, status, etc).
+    // Used by the /embed/<name> picker to discover the project a
+    // deployment belongs to before listing its siblings.
+    get(name: string): Promise<Deployment> {
+      return request<Deployment>(
+        `/v1/deployments/${encodeURIComponent(name)}`
+      );
+    },
     // Returns deploymentUrl + adminKey for talking to the backend directly.
     // Mirrors Convex Cloud's /api/dashboard/instances/{name}/auth.
     auth(name: string): Promise<DeploymentAuth> {
