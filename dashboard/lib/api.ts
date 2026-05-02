@@ -27,6 +27,20 @@ export type TeamMember = {
   createTime: string;
 };
 
+// Project-level RBAC member view. role widens to include "viewer"
+// (project-only). source records whether the role came from the
+// project_members override or fell through to the team_members table.
+// Lets the dashboard show "team admin (project viewer)" without a
+// second roundtrip.
+export type ProjectMember = {
+  id: string;
+  email: string;
+  name: string;
+  role: "admin" | "member" | "viewer";
+  source: "project" | "team";
+  createTime: string;
+};
+
 export type Project = {
   id: string;
   teamId: string;
@@ -490,6 +504,53 @@ export const api = {
         method: "POST",
         body: { destinationTeamId },
       });
+    },
+    // ---------- Project members (v1.0+ RBAC) ----------
+    // Lists everyone with access to the project — team members merged
+    // with project_members overrides. The role on each row is the
+    // EFFECTIVE role (override > team fallback); the `source` field
+    // says which side it came from.
+    listMembers(id: string): Promise<ProjectMember[]> {
+      return request<ProjectMember[]>(
+        `/v1/projects/${encodeURIComponent(id)}/list_members`,
+      );
+    },
+    // Admin-only. Target user must already be a member of the
+    // project's team — the team is the trust boundary, projects are
+    // partitions of it. role accepts admin / member / viewer.
+    addMember(
+      id: string,
+      userId: string,
+      role: "admin" | "member" | "viewer",
+    ): Promise<{ projectId: string; userId: string; role: string }> {
+      return request(`/v1/projects/${encodeURIComponent(id)}/add_member`, {
+        method: "POST",
+        body: { userId, role },
+      });
+    },
+    // Admin-only. Upserts the project_members row — same effect as
+    // add_member when there's no override yet.
+    updateMemberRole(
+      id: string,
+      memberId: string,
+      role: "admin" | "member" | "viewer",
+    ): Promise<{ memberId: string; role: string }> {
+      return request(
+        `/v1/projects/${encodeURIComponent(id)}/update_member_role`,
+        { method: "POST", body: { memberId, role } },
+      );
+    },
+    // Admin OR self. Removes the override row; the user falls back to
+    // their team_members role for this project. Returns 404
+    // no_override when nothing was there.
+    removeMember(
+      id: string,
+      memberId: string,
+    ): Promise<{ memberId: string; status: string }> {
+      return request(
+        `/v1/projects/${encodeURIComponent(id)}/remove_member`,
+        { method: "POST", body: { memberId } },
+      );
     },
     // Project-scoped tokens (scope=project). Issued tokens can act on this
     // project + its deployments; team-level operations 403.

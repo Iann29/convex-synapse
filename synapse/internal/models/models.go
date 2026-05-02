@@ -156,7 +156,30 @@ type DeploymentStorage struct {
 const (
 	RoleAdmin  = "admin"
 	RoleMember = "member"
+	// RoleViewer is project-scoped only — there is no team-level
+	// viewer. A `project_members` row with role="viewer" downgrades a
+	// team admin/member to read-only access on that one project.
+	// v1.0+ via migration 000008.
+	RoleViewer = "viewer"
 )
+
+// ProjectMember is a (project_id, user_id, role) override on top of
+// team_members. When a row exists for (project, user), its role wins
+// over the user's team-level role for that project. See migration
+// 000008 for the rationale + resolution rules.
+type ProjectMember struct {
+	ProjectID string    `json:"projectId"`
+	UserID    string    `json:"id"`
+	Role      string    `json:"role"`
+	Email     string    `json:"email,omitempty"`
+	Name      string    `json:"name,omitempty"`
+	CreatedAt time.Time `json:"createTime"`
+	// Source records where the effective role came from. "project" =
+	// row in project_members; "team" = fell through to team_members.
+	// Useful for the dashboard members panel: "team admin (project
+	// viewer)" lets operators reason about overrides at a glance.
+	Source string `json:"source,omitempty"`
+}
 
 const (
 	TokenScopeUser       = "user"
