@@ -215,6 +215,12 @@ parse_flags() {
     STATUS=0
     NO_BOOTSTRAP=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
+    # INSTALL_DIR_FROM_FLAG = 1 means the operator passed --install-dir=
+    # explicitly. The wizard reads this to know whether to ask the
+    # install-dir question (no flag = ask; flag = respect operator's
+    # choice). Without this we'd skip Step 3 silently because the
+    # default value is always non-empty.
+    INSTALL_DIR_FROM_FLAG=0
     while (( $# > 0 )); do
         case "$1" in
             --domain=*)        DOMAIN="${1#*=}" ;;
@@ -243,7 +249,7 @@ parse_flags() {
             --tail=*)          LOGS_TAIL="${1#*=}" ;;
             --tail)            LOGS_TAIL="${2:-}"; shift ;;
             --status)          STATUS=1 ;;
-            --install-dir=*)   INSTALL_DIR="${1#*=}" ;;
+            --install-dir=*)   INSTALL_DIR="${1#*=}"; INSTALL_DIR_FROM_FLAG=1 ;;
             --no-bootstrap)    NO_BOOTSTRAP=1 ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
             --help|-h)         usage; exit 0 ;;
@@ -794,9 +800,74 @@ phase_verify() {
 
 phase_success_screen() {
     CURRENT_STEP="success"
-    local public_url="${DOMAIN:+https://$DOMAIN}"
-    public_url="${public_url:-http://localhost:${SYNAPSE_PORT:-8080}}"
-    cat <<EOF
+    # Resolve the URL the operator should actually open in a browser:
+    #   - HTTPS via Caddy when --domain is set
+    #   - HTTP on the dashboard port (6790) otherwise — NOT the API
+    #     port (8080); the dashboard is what humans interact with.
+    # When neither domain nor public IP is detected, fall back to a
+    # localhost URL with a hint (dev-mode only).
+    local public_url
+    if [[ -n "${DOMAIN:-}" ]]; then
+        public_url="https://${DOMAIN}"
+    elif [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
+        public_url="http://${SYNAPSE_DETECTED_PUBLIC_IP}:6790"
+    else
+        public_url="http://localhost:6790"
+    fi
+
+    # Build a coloured success banner that visually mirrors the wizard
+    # banner. Same `[[ -r /dev/tty ]]` colour gate so the install log
+    # stays plain-text.
+    local C_GREEN="" C_BOLD="" C_DIM="" C_CYAN="" C_RESET=""
+    if [[ -z "${UI_NO_COLOR:-}" ]] && [[ -z "${NO_COLOR:-}" ]] && [[ -r /dev/tty ]]; then
+        C_GREEN=$'\033[32m'
+        C_BOLD=$'\033[1m'
+        C_DIM=$'\033[2m'
+        C_CYAN=$'\033[36m'
+        C_RESET=$'\033[0m'
+    fi
+
+    # The whole banner goes to /dev/tty so the install log file
+    # stays free of ANSI escapes. Falls back to stdout when
+    # /dev/tty isn't writable (CI / scripted runs that captured
+    # output via tee — same place the wizard skipped prompts).
+    local sink="/dev/tty"
+    if ! [[ -w /dev/tty ]]; then
+        sink="/dev/stdout"
+    fi
+
+    cat >"$sink" <<EOF
+
+  ${C_GREEN}╭─────────────────────────────────────────────────────────╮${C_RESET}
+  ${C_GREEN}│${C_RESET}                                                         ${C_GREEN}│${C_RESET}
+  ${C_GREEN}│${C_RESET}    ${C_GREEN}✓${C_RESET}  ${C_BOLD}Synapse is ready${C_RESET}                                  ${C_GREEN}│${C_RESET}
+  ${C_GREEN}│${C_RESET}                                                         ${C_GREEN}│${C_RESET}
+  ${C_GREEN}╰─────────────────────────────────────────────────────────╯${C_RESET}
+
+  ${C_BOLD}Open in your browser:${C_RESET}
+      ${C_CYAN}${public_url}${C_RESET}
+
+  ${C_DIM}Install dir:${C_RESET}  ${INSTALL_DIR}
+  ${C_DIM}Log:${C_RESET}          ${LOG_FILE}
+
+  ${C_BOLD}Next steps${C_RESET}
+    ${C_GREEN}1.${C_RESET} Open the URL above and register your admin user
+    ${C_GREEN}2.${C_RESET} Create a team → project → deployment
+    ${C_GREEN}3.${C_RESET} Use the CLI snippet from the deployment row to run \`npx convex deploy\`
+
+  ${C_BOLD}Useful commands${C_RESET}
+    ${C_DIM}$${INSTALL_DIR}/setup.sh --doctor${C_RESET}    re-run health checks
+    ${C_DIM}$${INSTALL_DIR}/setup.sh --upgrade${C_RESET}   pull the latest release + restart
+    ${C_DIM}$${INSTALL_DIR}/setup.sh --status${C_RESET}    diagnostic snapshot
+    ${C_DIM}$${INSTALL_DIR}/setup.sh --backup${C_RESET}    snapshot the install (use --to-s3=... for S3)
+    ${C_DIM}docker compose -f $${INSTALL_DIR}/docker-compose.yml logs -f synapse${C_RESET}
+
+EOF
+    # Strip the ANSI escapes when echoing to /dev/tty AND the operator
+    # also has stdout going to a tee-log: same content shows up in
+    # /tmp/synapse-install.log without the colours.
+    if [[ "$sink" != "/dev/stdout" ]]; then
+        cat <<EOF
 
 ✓ Synapse is ready.
 
@@ -804,18 +875,9 @@ phase_success_screen() {
   Install dir: $INSTALL_DIR
   Log: $LOG_FILE
 
-Next steps:
-  1. Open the URL above and register your admin user
-  2. Create a team → project → deployment
-  3. Use the CLI snippet from the deployment row to run \`npx convex deploy\`
-
-Useful commands:
-  $INSTALL_DIR/setup.sh --doctor       — re-run health checks
-  $INSTALL_DIR/setup.sh --upgrade      — pull the latest release + restart
-  $INSTALL_DIR/setup.sh --status       — diagnostic snapshot
-  docker compose -f $INSTALL_DIR/docker-compose.yml logs -f synapse
-
 EOF
+    fi
+
     # When custom domains are enabled, the operator MUST have wildcard
     # DNS pointed at this VPS for Caddy on-demand TLS to issue certs.
     # The DNS preflight already warned them if the wildcard isn't
@@ -824,15 +886,14 @@ EOF
     # "I created a deployment, the URL doesn't load" support tickets.
     if [[ -n "${BASE_DOMAIN:-}" ]]; then
         local stripped="${BASE_DOMAIN#.}"
-        cat <<EOF
-Custom domains enabled (v1.0):
-  Each provisioned deployment becomes a dedicated subdomain:
-    https://<deployment-name>.${stripped}
+        cat >"$sink" <<EOF
+  ${C_BOLD}Custom domains enabled (v1.0)${C_RESET}
+    Each provisioned deployment becomes a dedicated subdomain:
+        ${C_CYAN}https://<deployment-name>.${stripped}${C_RESET}
 
-  ⚠ DNS:  *.${stripped} A record must point at this VPS
-          (Caddy can't issue Let's Encrypt certs until it resolves)
-  Probe:  dig +short probe-test.${stripped}
-          # should return this VPS's public IP
+    ${C_DIM}⚠ DNS: *.${stripped} A record must point at this VPS${C_RESET}
+    ${C_DIM}  (Caddy can't issue Let's Encrypt certs until it resolves)${C_RESET}
+    ${C_DIM}  Probe: dig +short probe-test.${stripped}${C_RESET}
 
 EOF
     fi

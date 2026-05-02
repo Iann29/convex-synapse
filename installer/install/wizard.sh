@@ -336,10 +336,15 @@ wizard::run() {
     # 4. Install directory. Default /opt/synapse — almost everyone
     #    keeps it there; the prompt is mainly so the small minority
     #    with a different convention can override without flag-spelunking.
-    if [[ -z "${INSTALL_DIR:-}" ]]; then
+    # We check INSTALL_DIR_FROM_FLAG (set in parse_flags when the
+    # operator passed --install-dir=) instead of "is the var empty?",
+    # because parse_flags pre-fills INSTALL_DIR with the default —
+    # the var is always non-empty, so a non-empty test would silently
+    # skip this step.
+    if (( ${INSTALL_DIR_FROM_FLAG:-0} == 0 )); then
         wizard::_step 3 4 "Install location"
         INSTALL_DIR="$(wizard::ask_text \
-            "Install directory" "/opt/synapse" wizard::valid_path)"
+            "Install directory" "${INSTALL_DIR:-/opt/synapse}" wizard::valid_path)"
     fi
 
     # 5. Auto-install dependencies — set the flag here; the phase
