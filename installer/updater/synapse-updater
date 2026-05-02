@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+synapse-updater — tiny HTTP daemon that runs setup.sh --upgrade on demand.
+
+Listens on a unix domain socket at /run/synapse/updater.sock. The synapse-api
+container reaches it via a bind-mount of the same path. Unix sockets sidestep
+the TCP-binding dilemma (127.0.0.1 isn't reachable from container userspace;
+0.0.0.0 exposes the daemon to the public internet) and let kernel-level
+DAC handle access control via socket permissions.
+
+Why a host process (not a docker compose service):
+  setup.sh --upgrade runs `docker compose up -d --build`, which would
+  recreate the updater itself if it lived in compose — killing the very
+  process orchestrating the upgrade. Living on the host as a systemd unit
+  means the updater survives the upgrade and can keep updating its
+  status file while every container around it is being recycled.
+
+Endpoints:
+  GET  /healthz              → 200 {"ok": true}
+  GET  /version              → 200 {"version": "1.0.3"}    (reads VERSION file or git)
+  GET  /status               → 200 status JSON              (idle | running | success | failed)
+  POST /upgrade {ref?: str}  → 202 {"started": true}
+                               409 if upgrade already in progress
+
+State files (persisted across daemon restarts):
+  /var/lib/synapse-updater/status.json  — last known state
+  /var/lib/synapse-updater/upgrade.lock — present while a child is running
+  /var/log/synapse-updater/<utc>.log    — full log of the last/current upgrade
+
+Run as root (User=root in the systemd unit) — setup.sh writes to /opt/synapse,
+talks to /var/run/docker.sock, and may call apt-get; sub-rooting that to a
+dedicated user buys ~nothing on a single-tenant VPS.
+"""
+
+import json
+import os
+import shlex
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+
+SOCKET_PATH = Path(os.environ.get("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"))
+INSTALL_DIR = Path(os.environ.get("SYNAPSE_INSTALL_DIR", "/opt/synapse"))
+STATE_DIR = Path(os.environ.get("SYNAPSE_UPDATER_STATE_DIR", "/var/lib/synapse-updater"))
+LOG_DIR = Path(os.environ.get("SYNAPSE_UPDATER_LOG_DIR", "/var/log/synapse-updater"))
+LOG_TAIL_LINES = 200
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+STATUS_FILE = STATE_DIR / "status.json"
+LOCK_FILE = STATE_DIR / "upgrade.lock"
+
+upgrade_lock = threading.Lock()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_status(state: dict) -> None:
+    """Atomic write — readers never see a half-written file."""
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(STATUS_FILE)
+
+
+def read_status() -> dict:
+    if not STATUS_FILE.exists():
+        return {"state": "idle"}
+    try:
+        return json.loads(STATUS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"state": "idle"}
+
+
+def read_version() -> str:
+    """Best-effort current-version detection. VERSION file wins (written by
+    setup.sh on each install/upgrade); falls back to `git describe` from the
+    install dir; finally returns 'unknown'."""
+    vfile = INSTALL_DIR / "VERSION"
+    if vfile.exists():
+        try:
+            v = vfile.read_text().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    git = shutil.which("git")
+    if git and (INSTALL_DIR / ".git").exists():
+        try:
+            out = subprocess.run(
+                [git, "-C", str(INSTALL_DIR), "describe", "--tags", "--always"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().lstrip("v")
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return "unknown"
+
+
+def tail_log(path: Path, n: int = LOG_TAIL_LINES) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        # Read the whole file — these logs are small (a single setup.sh run
+        # is ~few hundred lines max). Splitlines + tail is simpler than a
+        # seek-based reverse read and the size cap means it stays cheap.
+        lines = path.read_text(errors="replace").splitlines()
+        return lines[-n:]
+    except OSError:
+        return []
+
+
+def run_upgrade(ref: str) -> None:
+    """Worker thread: runs setup.sh --upgrade and updates status as it goes."""
+    started_at = utc_now()
+    log_path = LOG_DIR / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.log"
+
+    write_status({
+        "state": "running",
+        "ref": ref,
+        "startedAt": started_at,
+        "logPath": str(log_path),
+    })
+
+    cmd = [str(INSTALL_DIR / "setup.sh"), "--upgrade", "--non-interactive"]
+    if ref:
+        cmd.append(f"--ref={ref}")
+
+    # Inheriting our environment but setting a sentinel so
+    # phase_install_updater inside setup.sh doesn't `systemctl restart
+    # synapse-updater` and kill us mid-upgrade. Operator restarts the
+    # daemon manually after a successful upgrade to pick up daemon-
+    # binary changes (rare; this Python is small and stable).
+    child_env = dict(os.environ)
+    child_env["SYNAPSE_UPDATER_NO_RESTART"] = "1"
+
+    exit_code = 1
+    try:
+        with open(log_path, "wb") as logf:
+            logf.write(f"[synapse-updater] starting: {' '.join(shlex.quote(c) for c in cmd)}\n".encode())
+            logf.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                cwd=str(INSTALL_DIR),
+                env=child_env,
+            )
+            exit_code = proc.wait()
+    except (OSError, subprocess.SubprocessError) as e:
+        # setup.sh missing, permission denied, fork failure, etc.
+        try:
+            with open(log_path, "ab") as logf:
+                logf.write(f"\n[synapse-updater] spawn error: {e}\n".encode())
+        except OSError:
+            pass
+        exit_code = 1
+
+    finished_at = utc_now()
+    final_state = "success" if exit_code == 0 else "failed"
+
+    write_status({
+        "state": final_state,
+        "ref": ref,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "exitCode": exit_code,
+        "logPath": str(log_path),
+        "logTail": tail_log(log_path),
+    })
+
+    try:
+        LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "synapse-updater/1.0"
+    # Quiet the default access log — systemd journal already captures stderr.
+    def log_message(self, *_args, **_kwargs):  # noqa: N802
+        pass
+
+    # The default address_string() expects (host, port) tuple. Unix-socket
+    # peers come back as "" (or the abstract socket name) — short-circuit
+    # to avoid IndexError logging.
+    def address_string(self) -> str:
+        return "unix"
+
+    def _json(self, status: int, body: dict) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/healthz":
+            return self._json(200, {"ok": True})
+        if self.path == "/version":
+            return self._json(200, {"version": read_version()})
+        if self.path == "/status":
+            status = read_status()
+            # If running, refresh the log tail at request time so the
+            # dashboard sees streaming output without us having to push.
+            if status.get("state") == "running":
+                lp = status.get("logPath")
+                if lp:
+                    status["logTail"] = tail_log(Path(lp))
+            return self._json(200, status)
+        return self._json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/upgrade":
+            return self._json(404, {"error": "not_found"})
+
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        body = {}
+        if length > 0:
+            try:
+                body = json.loads(self.rfile.read(length).decode())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return self._json(400, {"error": "invalid_json"})
+
+        ref = (body.get("ref") or "").strip()
+        # ref must be a tag/branch — block shell metachars defensively.
+        # setup.sh already validates, but a 400 here gives a clearer error
+        # than waiting for setup.sh to refuse it.
+        if ref and not all(c.isalnum() or c in "._-/+" for c in ref):
+            return self._json(400, {"error": "invalid_ref"})
+
+        # Single-flight: lock file is the source of truth so an old run
+        # surviving a daemon restart still blocks new ones.
+        if not upgrade_lock.acquire(blocking=False):
+            return self._json(409, {"error": "upgrade_in_progress"})
+        try:
+            if LOCK_FILE.exists():
+                return self._json(409, {"error": "upgrade_in_progress"})
+            LOCK_FILE.write_text(f"{os.getpid()} {ref or 'latest'} {utc_now()}\n")
+        finally:
+            upgrade_lock.release()
+
+        threading.Thread(target=run_upgrade, args=(ref,), daemon=True).start()
+        return self._json(202, {"started": True, "ref": ref or "latest"})
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """Unix-socket variant of HTTPServer. ThreadingMixIn lets a long /status
+    poll not block a concurrent /upgrade. allow_reuse_address is meaningless
+    for AF_UNIX, but daemon_threads ensures we exit cleanly on SIGTERM."""
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        # Pre-clean any stale socket file from a crashed previous run.
+        # systemd's Type=simple already restarts us, so this is the
+        # defensive belt to socketserver's suspenders.
+        try:
+            os.unlink(self.server_address)
+        except FileNotFoundError:
+            pass
+        super().server_bind()
+        # 0660 + group=root means: only root can write; reading/writing
+        # from a container requires the container to run as UID 0 inside
+        # (which our synapse-api distroless static does).
+        os.chmod(self.server_address, 0o660)
+
+
+def main() -> int:
+    sys.stderr.write(f"[synapse-updater] listening on unix:{SOCKET_PATH}\n")
+    sys.stderr.flush()
+    server = ThreadingUnixHTTPServer(str(SOCKET_PATH), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

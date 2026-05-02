@@ -1,0 +1,42 @@
+[Unit]
+Description=Synapse self-update daemon
+Documentation=https://github.com/Iann29/convex-synapse
+After=network.target docker.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/synapse-updater
+Restart=on-failure
+RestartSec=5
+
+# Updater needs full root because setup.sh --upgrade writes to /opt/synapse,
+# uses /var/run/docker.sock, and may invoke the package manager. Locking it
+# down to a dedicated user would just bloat the install with sudoers config
+# while not actually narrowing privilege (setup.sh ITSELF is root-equivalent).
+
+# Defense-in-depth — the daemon process itself doesn't need most of these,
+# but no reason to let a hypothetical RCE roam.
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# RuntimeDirectory creates /run/synapse on each start (cleaned on stop).
+# The daemon binds its unix socket inside that path; the synapse-api
+# container bind-mounts the same path so it can talk to the socket
+# without any TCP exposure.
+RuntimeDirectory=synapse
+RuntimeDirectoryMode=0755
+
+Environment=SYNAPSE_UPDATER_SOCKET=/run/synapse/updater.sock
+Environment=SYNAPSE_INSTALL_DIR=/opt/synapse
+
+[Install]
+WantedBy=multi-user.target

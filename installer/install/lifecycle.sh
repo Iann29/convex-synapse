@@ -292,6 +292,19 @@ lifecycle::_upgrade_inner() {
         $prefix cp -a "$tmp_clone/." "$install_dir/"
     fi
 
+    # --- 6.5. refresh self-update daemon ---------------------------
+    # The new tree on disk includes a possibly-newer synapse-updater
+    # binary + systemd unit. We call phase_install_updater so the on-
+    # disk copies are refreshed; the function detects
+    # SYNAPSE_UPDATER_NO_RESTART (which the daemon sets when it forks
+    # this very script) and skips the restart so we don't kill the
+    # /status-reporting parent. Best-effort — bare `|| true` because a
+    # missing systemd or python on weird hosts shouldn't fail the
+    # upgrade itself.
+    if declare -F phase_install_updater >/dev/null; then
+        phase_install_updater || true
+    fi
+
     # --- 7. pre-pull external images -------------------------------
     # Same logic as phase_compose_up: ensure the convex-backend +
     # convex-dashboard images exist locally before compose up tries
