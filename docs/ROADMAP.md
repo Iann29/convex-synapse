@@ -155,6 +155,17 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 ### ✅ Shipped this milestone
 
+- [x] **Phase 3 polish on the in-iframe deployment picker.** Same
+  overlay (Strategy E), more ergonomics. Five UX wins, zero new
+  dependencies: keyboard navigation in the dropdown (↑↓ Enter
+  Escape), "/" hotkey opens + focuses search, search filter at 6+
+  deployments (matches name / type / reference), status indicator
+  dot on the pill (running / provisioning / failed / stopped),
+  last-viewed timestamp under each item ("visited 5m ago") read
+  from localStorage stamped by the embed shell on mount. As-built
+  + cross-origin walls (the two ideas that hit them) documented in
+  [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md)
+  §Phase 3. Tests: +5 Playwright (46).
 - [x] **Project-level RBAC (admin / member / viewer).** `project_members`
   table layered on top of `team_members` — overrides win, team is the
   fallback. Solves "I can't safely invite my team without per-project
@@ -215,7 +226,9 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 Effort scale: **S** ≈ 1 session · **M** ≈ 2-3 sessions · **L** ≈ multi-week.
 
-- [ ] **Phase 3 polish on the Convex Dashboard picker (S-M)**. Last-viewed-deployment memory in localStorage, sync between picker and iframe route (`/embed/<name>/<page>` reflecting the upstream's current view), optional CSS overlay to hide the upstream's own header for a one-stack look. Strategy E v2 — same overlay path, just smoothed. See [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md) §12 for the open ideas.
+_v1.0 milestone is empty — every item the operator picked up has
+shipped. Next milestone (`v1.1+` / cut-driven follow-ups) lands
+when the deferred items below get unblocked or new asks come in._
 
 ### 🦴 Deferred / out of scope this milestone
 

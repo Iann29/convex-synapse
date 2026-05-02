@@ -123,6 +123,20 @@ export default function EmbedDashboardPage({
     };
   }, [name]);
 
+  // Stamp the localStorage "last viewed at" for this (project,
+  // deployment) so the picker dropdown can render "visited 5m ago"
+  // hints. Picker reads the same keys; we don't share them through
+  // React state because they're cross-tab + cross-page state, not a
+  // render-driven concern.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!deployment?.projectId || !deployment?.name) return;
+    window.localStorage.setItem(
+      `synapse.lastViewedAt.${deployment.projectId}.${deployment.name}`,
+      String(Date.now()),
+    );
+  }, [deployment?.projectId, deployment?.name]);
+
   // Reply to the dashboard's handshake. The iframe sends the request
   // on mount, possibly multiple times until it hears back; we stay
   // subscribed for the lifetime of the page.
