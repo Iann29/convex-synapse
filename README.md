@@ -76,7 +76,7 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 | OpenAPI parity | 100% of self-hosted-relevant subset; ~60 cloud-only paths return structured `404 not_supported_in_self_hosted` |
 | API stability | semver on the `/v1/...` surface; deprecation policy + change log in [`docs/API.md`](docs/API.md) |
 
-**Tests:** 238 Go integration tests + 41 Playwright e2e + 305 bats unit
+**Tests:** 238 Go integration tests + 46 Playwright e2e + 305 bats unit
 tests, all green in CI on every push.
 
 For roadmap, design notes, and what's deliberately out of scope, see
