@@ -17,14 +17,26 @@ backups, audit log, `npx convex` auth, and an embedded Convex
 Dashboard with an **in-iframe deployment picker** — all behind a
 one-line installer.
 
+**With a domain** — production setup with HTTPS:
+
 ```bash
 curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
   | bash -s -- --domain=synapse.yourdomain.com
 ```
 
-Three minutes later: stack up on your VPS, TLS via Caddy + Let's
-Encrypt, admin user registered, demo Convex deployment provisioned and
-self-tested. Validated end-to-end against a real Hetzner CPX22.
+**No domain yet?** Same script, just disable TLS — works on a fresh
+VPS or a laptop:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --no-tls --skip-dns-check --non-interactive
+```
+
+Three minutes later: stack up on your VPS, admin user registered, demo
+Convex deployment provisioned and self-tested. With a domain you also
+get TLS via Caddy + Let's Encrypt automatically; without one, Synapse
+exposes plain HTTP on `:6790` (dashboard) and `:8080` (API). Validated
+end-to-end against a real Hetzner CPX22.
 
 ![Project page with a deployment provisioned](docs/screenshots/04-project-deployment.png)
 
