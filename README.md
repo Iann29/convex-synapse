@@ -17,26 +17,35 @@ backups, audit log, `npx convex` auth, and an embedded Convex
 Dashboard with an **in-iframe deployment picker** — all behind a
 one-line installer.
 
-**With a domain** — production setup with HTTPS:
+**No flags, no docs, no idea what you're doing — just run:**
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
-  | bash -s -- --domain=synapse.yourdomain.com
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh | bash
 ```
 
-**No domain yet?** Same script, just disable TLS — works on a fresh
-VPS or a laptop:
+A small interactive wizard asks four questions (domain or plain HTTP,
+HA mode, install location, auto-install missing deps), shows a summary
+box, then handles everything else — Docker auto-installed if absent,
+stack built and brought up, admin path tested end-to-end. Three
+minutes later you open `https://<your-domain>` (or `http://<vps-ip>:6790`
+if you skipped TLS) and register your admin user.
+
+**Already know what you want?** Skip the wizard and pass flags
+directly:
 
 ```bash
+# Production with HTTPS
+curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
+  | bash -s -- --domain=synapse.yourdomain.com
+
+# Local dev / no domain
 curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
   | bash -s -- --no-tls --skip-dns-check --non-interactive
 ```
 
-Three minutes later: stack up on your VPS, admin user registered, demo
-Convex deployment provisioned and self-tested. With a domain you also
-get TLS via Caddy + Let's Encrypt automatically; without one, Synapse
-exposes plain HTTP on `:6790` (dashboard) and `:8080` (API). Validated
-end-to-end against a real Hetzner CPX22.
+With a domain you get TLS via Caddy + Let's Encrypt automatically;
+without one, Synapse exposes plain HTTP on `:6790` (dashboard) and
+`:8080` (API). Validated end-to-end against a real Hetzner CPX22.
 
 ![Project page with a deployment provisioned](docs/screenshots/04-project-deployment.png)
 
@@ -101,6 +110,7 @@ end-to-end against a real Hetzner CPX22.
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
 | Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
+| Interactive installer wizard (v1.0+) | zero-flag `curl \| bash` triggers a Q&A walkthrough (domain, HA, install dir) with auto-Docker-install — no docs needed |
 | Lifecycle commands | `--upgrade` (auto-detect via GitHub Releases, snapshot rollback), `--backup` / `--restore` (with optional S3), `--uninstall`, `--logs`, `--status` |
 | First-run wizard | dashboard `/login` → `/setup` on a fresh install: admin → demo team/project/deployment in three clicks |
 | Pagination | `?limit&?cursor` + `X-Next-Cursor` on every list endpoint |

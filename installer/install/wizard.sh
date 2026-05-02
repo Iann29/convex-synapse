@@ -90,8 +90,8 @@ wizard::_banner() {
 
   ${WIZ_CYAN}╭─────────────────────────────────────────────────────────╮${WIZ_RESET}
   ${WIZ_CYAN}│${WIZ_RESET}                                                         ${WIZ_CYAN}│${WIZ_RESET}
-  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_BOLD}Synapse${WIZ_RESET} ${WIZ_DIM}— open-source Convex control plane${WIZ_RESET}      ${WIZ_CYAN}│${WIZ_RESET}
-  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_DIM}installer v${INSTALLER_VERSION}${WIZ_RESET}                                  ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_BOLD}Synapse${WIZ_RESET} ${WIZ_DIM}— open-source Convex control plane${WIZ_RESET}           ${WIZ_CYAN}│${WIZ_RESET}
+  ${WIZ_CYAN}│${WIZ_RESET}    ${WIZ_DIM}installer v${INSTALLER_VERSION}${WIZ_RESET}                                     ${WIZ_CYAN}│${WIZ_RESET}
   ${WIZ_CYAN}│${WIZ_RESET}                                                         ${WIZ_CYAN}│${WIZ_RESET}
   ${WIZ_CYAN}╰─────────────────────────────────────────────────────────╯${WIZ_RESET}
 
