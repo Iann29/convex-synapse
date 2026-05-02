@@ -816,10 +816,16 @@ phase_success_screen() {
     fi
 
     # Build a coloured success banner that visually mirrors the wizard
-    # banner. Same `[[ -r /dev/tty ]]` colour gate so the install log
-    # stays plain-text.
+    # banner. Colours render iff stdout is a TTY (or being teed through
+    # one — UI_FORCE_COLOR=1 covers that case if the operator wants).
+    # Going straight to stdout (no /dev/tty redirect) keeps it simple:
+    # the install log captures the same content with ANSI escapes
+    # baked in, which is what brew / k3s / devcontainer-cli all do
+    # — `less -R` and `cat` render it fine, and operators almost
+    # never grep the log with bare eyes.
     local C_GREEN="" C_BOLD="" C_DIM="" C_CYAN="" C_RESET=""
-    if [[ -z "${UI_NO_COLOR:-}" ]] && [[ -z "${NO_COLOR:-}" ]] && [[ -r /dev/tty ]]; then
+    if [[ -z "${UI_NO_COLOR:-}" ]] && [[ -z "${NO_COLOR:-}" ]] \
+            && { [[ -t 1 ]] || [[ "${UI_FORCE_COLOR:-0}" == "1" ]] || { : >/dev/tty; } 2>/dev/null; }; then
         C_GREEN=$'\033[32m'
         C_BOLD=$'\033[1m'
         C_DIM=$'\033[2m'
@@ -827,22 +833,7 @@ phase_success_screen() {
         C_RESET=$'\033[0m'
     fi
 
-    # The whole banner goes to /dev/tty so the install log file
-    # stays free of ANSI escapes. Falls back to stdout when
-    # /dev/tty isn't writable (CI / scripted runs that captured
-    # output via tee — same place the wizard skipped prompts).
-    #
-    # `[[ -w /dev/tty ]]` looks correct but lies: /dev/tty often
-    # exists as a device node with rw bits set, yet opening it for
-    # write returns ENXIO ("No such device or address") when the
-    # process has no controlling terminal. Probe by attempting an
-    # actual zero-byte write and falling back on failure.
-    local sink="/dev/stdout"
-    if { : >/dev/tty; } 2>/dev/null; then
-        sink="/dev/tty"
-    fi
-
-    cat >"$sink" <<EOF
+    cat <<EOF
 
   ${C_GREEN}╭─────────────────────────────────────────────────────────╮${C_RESET}
   ${C_GREEN}│${C_RESET}                                                         ${C_GREEN}│${C_RESET}
@@ -869,20 +860,6 @@ phase_success_screen() {
     ${C_DIM}docker compose -f ${INSTALL_DIR}/docker-compose.yml logs -f synapse${C_RESET}
 
 EOF
-    # Strip the ANSI escapes when echoing to /dev/tty AND the operator
-    # also has stdout going to a tee-log: same content shows up in
-    # /tmp/synapse-install.log without the colours.
-    if [[ "$sink" != "/dev/stdout" ]]; then
-        cat <<EOF
-
-✓ Synapse is ready.
-
-  URL: $public_url
-  Install dir: $INSTALL_DIR
-  Log: $LOG_FILE
-
-EOF
-    fi
 
     # When custom domains are enabled, the operator MUST have wildcard
     # DNS pointed at this VPS for Caddy on-demand TLS to issue certs.
@@ -892,7 +869,7 @@ EOF
     # "I created a deployment, the URL doesn't load" support tickets.
     if [[ -n "${BASE_DOMAIN:-}" ]]; then
         local stripped="${BASE_DOMAIN#.}"
-        cat >"$sink" <<EOF
+        cat <<EOF
   ${C_BOLD}Custom domains enabled (v1.0)${C_RESET}
     Each provisioned deployment becomes a dedicated subdomain:
         ${C_CYAN}https://<deployment-name>.${stripped}${C_RESET}
