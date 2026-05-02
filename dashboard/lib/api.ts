@@ -54,12 +54,16 @@ export type Deployment = {
   name: string;
   projectId?: string;
   type?: "dev" | "prod";
-  deploymentType?: "dev" | "prod";
+  deploymentType?: "dev" | "prod" | "preview" | "custom";
   status?: string;
   url?: string;
   deploymentUrl?: string;
   createdAt?: string;
   isDefault?: boolean;
+  // Operator-supplied label, e.g. a git ref or a CI run id. The
+  // server returns whatever was set on /create_deployment; the
+  // picker indexes it for search.
+  reference?: string;
   // True for deployments registered via /adopt_deployment — Synapse points
   // at an external Convex backend rather than a container it provisioned.
   adopted?: boolean;

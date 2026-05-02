@@ -419,13 +419,52 @@ Ideas that didn't make this round but stay viable on Strategy E:
 - **Hide the iframe's own header** via CSP-permitted CSS in our shell.
   Today the upstream renders [Logo] + Avatar + ToggleTheme inside the
   iframe; trimming those gives single-header look without forking.
+  *(Blocked by cross-origin CSS: a parent page can't style nodes
+  inside an iframe whose origin differs. Stays open as a Strategy B
+  follow-up — once we control the upstream image we can hide the
+  upstream header at the source.)*
 - **Sync route between picker and iframe** — when the operator
   navigates `/data` inside the iframe, reflect that in the parent's
   URL (`/embed/<name>/data`). Today the parent URL is just the
   deployment; the iframe's own router holds the page state.
+  *(Blocked by cross-origin: parent can't read `iframe.contentWindow.
+  location` and the upstream doesn't postMessage navigation events.
+  Same Strategy B hook as above.)*
 - **Remember last viewed deployment per project** in localStorage so
   reopening from the project page lands on the same deployment.
-  (Cloud does this via `useRememberLastViewedDeploymentForProject`.)
+  Partially shipped in Phase 3 (we now stamp the timestamp; the
+  recency badge in the dropdown reads it). The "auto-redirect on
+  project page open" piece is still open — it's a UX call, not a
+  technical one, so deferring until operators ask.
+
+### Phase 3 polish (shipped 2026-05-02)
+
+Same overlay, more ergonomics. Four UX wins, zero new dependencies:
+
+- **Keyboard navigation in the dropdown** — arrow keys traverse
+  items in order (prod → dev → preview → custom), Enter selects,
+  Escape closes. Mirrors the muscle memory operators already have
+  from `<select>`-style pickers without giving up the cloud-style
+  visual layout.
+- **"/" hotkey** opens the dropdown and focuses the search input.
+  Matches GitHub / Linear conventions; ignores when an editable
+  element is already focused so it doesn't fight with form inputs.
+- **Search filter** appears at the top of the menu when there are
+  6+ deployments. Filters by name, type, and reference (case-
+  insensitive). Below the threshold the input is hidden — small
+  projects don't pay for ergonomics they don't need.
+- **Status indicator dot** on the pill (next to the deployment
+  type dot) — running = emerald, provisioning = amber, failed =
+  rose, stopped = neutral. Same colours appear on each dropdown
+  item, so you can see "prod is provisioning" without expanding.
+- **Last-viewed timestamp** ("visited 5m ago") under each dropdown
+  item, pulled from a `localStorage[synapse.lastViewedAt.<projectId>.
+  <deploymentName>]` key the embed shell stamps on mount. Hidden
+  in the first minute so the picker isn't noisy in normal use.
+
+Tests: 5 new Playwright cases on top of the 4 existing picker
+specs (status indicator, keyboard nav arrow + Enter, Escape closes,
+search filter narrows + empty state, "/" hotkey + focus). 41 → 46.
 
 ### Endpoint reservation: `list_deployments_for_dashboard`
 
