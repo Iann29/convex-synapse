@@ -142,6 +142,15 @@ func NewRouter(d RouterDeps) http.Handler {
 		// handler compiling and the path looking right.
 		r.Route("/internal", func(r chi.Router) {
 			r.Method(http.MethodGet, "/tls_ask", &TLSAskHandler{DB: d.DB, BaseDomain: d.BaseDomain})
+			// list_deployments_for_dashboard — cross-origin endpoint
+			// the upstream Convex Dashboard hits from inside the
+			// /embed/<name> iframe. Public route, but the request
+			// must carry a `?token=` query param holding a
+			// project-scoped PAT (minted by the Synapse Dashboard
+			// before the iframe loads, TTL ~15min). See
+			// dashboard_proxy.go for the auth + cors discussion.
+			dashProxy := &DashboardProxyHandler{DB: d.DB, Deployments: deploymentsH}
+			r.Get("/list_deployments_for_dashboard", dashProxy.listDeploymentsForDashboard)
 		})
 
 		// Authenticated.
