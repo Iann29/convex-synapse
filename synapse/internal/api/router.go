@@ -82,6 +82,12 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(middleware.RequestLogger(d.Logger))
 	r.Use(middleware.CORS(d.AllowedOrigins))
 	r.Use(chimw.Recoverer)
+	// Short-circuit OpenAPI paths that Synapse self-hosted intentionally
+	// doesn't implement (Convex Cloud's billing, SSO, Discord/Vercel,
+	// OAuth apps, cloud backups). Returns 404 not_supported_in_self_hosted
+	// before auth so probes reveal the cut without leaking auth state.
+	// Catalog: internal/api/not_supported.go.
+	r.Use(NotSupportedMiddleware)
 	// 30s is plenty now that create_deployment is async — it returns 201 the
 	// moment the row is inserted, and the docker pull/start/healthcheck runs
 	// in a background goroutine. No request handler should hold a connection
