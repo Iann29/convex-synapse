@@ -42,11 +42,15 @@ func (h *TeamsHandler) Routes() chi.Router {
 
 	r.Route("/{teamRef}", func(r chi.Router) {
 		r.Get("/", h.getTeam)
+		r.Post("/", h.updateTeam)
+		r.Post("/delete", h.deleteTeam)
 		r.Get("/list_projects", h.listProjects)
 		r.Get("/list_members", h.listMembers)
 		r.Get("/list_deployments", h.listDeployments)
 		r.Post("/invite_team_member", h.inviteMember)
 		r.Post("/create_project", h.createProject)
+		r.Post("/update_member_role", h.updateMemberRole)
+		r.Post("/remove_member", h.removeMember)
 		r.Get("/invites", h.listInvites)
 		r.Post("/invites/{inviteID}/cancel", h.cancelInvite)
 		r.Get("/audit_log", h.listAuditLog)
@@ -315,6 +319,439 @@ func (h *TeamsHandler) getTeam(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+// ---------- POST /v1/teams/{teamRef} ----------
+//
+// Mirrors update_team from the OpenAPI spec. All three fields (name,
+// slug, defaultRegion) are optional; the cloud uses tri-state semantics
+// (absent / null / value) — Synapse simplifies to absent/value because
+// "name = null" is meaningless in our schema (NOT NULL with a TEXT
+// default). defaultRegion is documented as having no behavioural effect
+// today; we store it for parity so the dashboard can offer the field
+// without losing operator input.
+//
+// Slug uniqueness is global (CITEXT UNIQUE on teams.slug). Conflict →
+// 409 slug_taken; we don't auto-pick a free slug here — a user-supplied
+// slug is authoritative.
+
+type updateTeamReq struct {
+	Name          *string `json:"name,omitempty"`
+	Slug          *string `json:"slug,omitempty"`
+	DefaultRegion *string `json:"defaultRegion,omitempty"`
+}
+
+func (h *TeamsHandler) updateTeam(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can update the team")
+		return
+	}
+	var req updateTeamReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+
+	oldName := t.Name
+	oldSlug := t.Slug
+	oldRegion := t.DefaultRegion
+	var newName, newSlug, newRegion *string
+
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
+			writeError(w, http.StatusBadRequest, "missing_name", "Team name is required")
+			return
+		}
+		newName = &trimmed
+	}
+	if req.Slug != nil {
+		trimmed := strings.TrimSpace(*req.Slug)
+		if trimmed == "" {
+			writeError(w, http.StatusBadRequest, "missing_slug", "Team slug is required")
+			return
+		}
+		if !isValidSlug(trimmed) {
+			writeError(w, http.StatusBadRequest, "invalid_slug",
+				"slug must contain only lowercase letters, digits, and dashes")
+			return
+		}
+		newSlug = &trimmed
+	}
+	if req.DefaultRegion != nil {
+		// Cloud accepts null to clear; we store empty string instead because
+		// the column is NOT NULL DEFAULT 'self-hosted'. Empty payload value
+		// also means clear → fall back to the schema default.
+		trimmed := strings.TrimSpace(*req.DefaultRegion)
+		if trimmed == "" {
+			trimmed = "self-hosted"
+		}
+		newRegion = &trimmed
+	}
+
+	if newName == nil && newSlug == nil && newRegion == nil {
+		writeJSON(w, http.StatusOK, t)
+		return
+	}
+
+	tag, err := h.DB.Exec(r.Context(), `
+		UPDATE teams
+		   SET name           = COALESCE($1, name),
+		       slug           = COALESCE($2, slug),
+		       default_region = COALESCE($3, default_region)
+		 WHERE id = $4
+	`, sqlNullableString(newName), sqlNullableString(newSlug), sqlNullableString(newRegion), t.ID)
+	if err != nil {
+		if synapsedb.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "slug_taken",
+				"A team with this slug already exists")
+			return
+		}
+		logErr("update team", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to update team")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "team_not_found", "Team not found")
+		return
+	}
+	if newName != nil {
+		t.Name = *newName
+	}
+	if newSlug != nil {
+		t.Slug = *newSlug
+	}
+	if newRegion != nil {
+		t.DefaultRegion = *newRegion
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpdateTeam,
+		TargetType: audit.TargetTeam,
+		TargetID:   t.ID,
+		Metadata: map[string]any{
+			"oldName":          oldName,
+			"newName":          t.Name,
+			"oldSlug":          oldSlug,
+			"newSlug":          t.Slug,
+			"oldDefaultRegion": oldRegion,
+			"newDefaultRegion": t.DefaultRegion,
+		},
+	})
+	writeJSON(w, http.StatusOK, t)
+}
+
+// ---------- POST /v1/teams/{teamRef}/delete ----------
+//
+// Mirrors delete_team. Admin-only. Refuses with 409 team_has_deployments
+// when any non-deleted deployment hangs off a project in this team —
+// orphaning Docker containers when their owning team disappears makes
+// for a confusing operator experience. Operators tear down their
+// deployments first; CASCADE on projects/members/invites does the rest.
+//
+// FK note: teams.creator_user_id is ON DELETE RESTRICT (it's the user
+// constraint, not the team one), so deleting a team while its creator
+// still exists is fine — the RESTRICT only fires when the user goes
+// first. deployments.project_id is ON DELETE CASCADE, but since we
+// reject when deployments still exist, that path is dead in practice.
+
+func (h *TeamsHandler) deleteTeam(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can delete the team")
+		return
+	}
+	// Refuse if any non-deleted deployment exists. A live container we'd
+	// orphan is a worse failure mode than asking the operator to clean up
+	// first — they can /v1/deployments/{name}/delete in a loop.
+	var deploymentCount int
+	if err := h.DB.QueryRow(r.Context(), `
+		SELECT COUNT(*)
+		  FROM deployments d
+		  JOIN projects p ON p.id = d.project_id
+		 WHERE p.team_id = $1 AND d.status <> 'deleted'
+	`, t.ID).Scan(&deploymentCount); err != nil {
+		logErr("count team deployments", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to check team deployments")
+		return
+	}
+	if deploymentCount > 0 {
+		writeError(w, http.StatusConflict, "team_has_deployments",
+			"Delete or transfer all deployments before deleting the team")
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	// Audit the row BEFORE deleting it — once `audit_events.team_id` cascades
+	// to NULL the event still records the action via metadata, but a pre-
+	// delete row keeps the team_id index lookup useful for "show me what
+	// happened in this team" queries up through the moment of deletion.
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionDeleteTeam,
+		TargetType: audit.TargetTeam,
+		TargetID:   t.ID,
+		Metadata:   map[string]any{"name": t.Name, "slug": t.Slug},
+	})
+
+	if _, err := h.DB.Exec(r.Context(), `DELETE FROM teams WHERE id = $1`, t.ID); err != nil {
+		logErr("delete team", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to delete team")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"id": t.ID, "status": "deleted"})
+}
+
+// ---------- POST /v1/teams/{teamRef}/update_member_role ----------
+//
+// Mirrors update_member_role. Admin-only. The Cloud spec uses
+// admin/developer; we map developer → member for storage (the schema
+// CHECK accepts only admin/member). Demoting the last admin is refused
+// with 409 last_admin — otherwise the team becomes unrecoverable.
+
+type updateMemberRoleReq struct {
+	MemberID string `json:"memberId"`
+	Role     string `json:"role"`
+}
+
+func (h *TeamsHandler) updateMemberRole(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can change member roles")
+		return
+	}
+	var req updateMemberRoleReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.MemberID = strings.TrimSpace(req.MemberID)
+	if req.MemberID == "" {
+		writeError(w, http.StatusBadRequest, "missing_member", "memberId is required")
+		return
+	}
+	storedRole, err := normaliseRole(req.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_role", err.Error())
+		return
+	}
+
+	// Wrap the admin-count check + UPDATE in a single transaction so two
+	// concurrent demotions can't race past the "last admin" guard. SELECT
+	// FOR UPDATE on team_members locks the relevant rows; the UPDATE then
+	// commits or aborts atomically.
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		logErr("tx begin", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Database error")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var currentRole string
+	err = tx.QueryRow(r.Context(), `
+		SELECT role FROM team_members
+		 WHERE team_id = $1 AND user_id::text = $2
+		 FOR UPDATE
+	`, t.ID, req.MemberID).Scan(&currentRole)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "member_not_found", "Member not found in this team")
+		return
+	}
+	if err != nil {
+		logErr("lookup member", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to load member")
+		return
+	}
+	if currentRole == storedRole {
+		// No-op; return current state.
+		writeJSON(w, http.StatusOK, map[string]string{
+			"memberId": req.MemberID,
+			"role":     storedRole,
+		})
+		return
+	}
+	if currentRole == models.RoleAdmin && storedRole != models.RoleAdmin {
+		// Demoting an admin — make sure another admin remains.
+		var adminCount int
+		if err := tx.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM team_members WHERE team_id = $1 AND role = 'admin'`,
+			t.ID).Scan(&adminCount); err != nil {
+			logErr("count admins", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to count admins")
+			return
+		}
+		if adminCount <= 1 {
+			writeError(w, http.StatusConflict, "last_admin",
+				"Cannot demote the last admin of the team")
+			return
+		}
+	}
+
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id::text = $3`,
+		storedRole, t.ID, req.MemberID); err != nil {
+		logErr("update member role", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to update role")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		logErr("tx commit", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Database error")
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpdateMemberRole,
+		TargetType: audit.TargetUser,
+		TargetID:   req.MemberID,
+		Metadata: map[string]any{
+			"memberId": req.MemberID,
+			"oldRole":  currentRole,
+			"newRole":  storedRole,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"memberId": req.MemberID,
+		"role":     storedRole,
+	})
+}
+
+// normaliseRole maps the Cloud vocabulary (admin/developer) to Synapse's
+// schema (admin/member). Unknown values are rejected with a precise error
+// the caller can show to the operator.
+func normaliseRole(role string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "admin":
+		return models.RoleAdmin, nil
+	case "member", "developer":
+		return models.RoleMember, nil
+	default:
+		return "", errors.New("role must be 'admin' or 'developer' (alias for 'member')")
+	}
+}
+
+// ---------- POST /v1/teams/{teamRef}/remove_member ----------
+//
+// Mirrors remove_member_from_team. Either an admin removes any member
+// or a member removes themselves. Refuses to remove the last admin.
+
+type removeMemberReq struct {
+	MemberID string `json:"memberId"`
+}
+
+func (h *TeamsHandler) removeMember(w http.ResponseWriter, r *http.Request) {
+	t, callerRole, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+
+	var req removeMemberReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.MemberID = strings.TrimSpace(req.MemberID)
+	if req.MemberID == "" {
+		writeError(w, http.StatusBadRequest, "missing_member", "memberId is required")
+		return
+	}
+
+	selfRemoval := req.MemberID == uid
+	if !selfRemoval && callerRole != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only team admins can remove other members")
+		return
+	}
+
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		logErr("tx begin", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Database error")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var targetRole string
+	err = tx.QueryRow(r.Context(), `
+		SELECT role FROM team_members
+		 WHERE team_id = $1 AND user_id::text = $2
+		 FOR UPDATE
+	`, t.ID, req.MemberID).Scan(&targetRole)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "member_not_found", "Member not found in this team")
+		return
+	}
+	if err != nil {
+		logErr("lookup member", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to load member")
+		return
+	}
+
+	if targetRole == models.RoleAdmin {
+		var adminCount int
+		if err := tx.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM team_members WHERE team_id = $1 AND role = 'admin'`,
+			t.ID).Scan(&adminCount); err != nil {
+			logErr("count admins", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to count admins")
+			return
+		}
+		if adminCount <= 1 {
+			writeError(w, http.StatusConflict, "last_admin",
+				"Cannot remove the last admin of the team")
+			return
+		}
+	}
+
+	if _, err := tx.Exec(r.Context(),
+		`DELETE FROM team_members WHERE team_id = $1 AND user_id::text = $2`,
+		t.ID, req.MemberID); err != nil {
+		logErr("remove member", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to remove member")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		logErr("tx commit", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Database error")
+		return
+	}
+
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionRemoveMember,
+		TargetType: audit.TargetUser,
+		TargetID:   req.MemberID,
+		Metadata: map[string]any{
+			"memberId":     req.MemberID,
+			"role":         targetRole,
+			"selfRemoval":  selfRemoval,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"memberId": req.MemberID,
+		"status":   "removed",
+	})
 }
 
 // ---------- GET /v1/teams/{teamRef}/list_projects ----------

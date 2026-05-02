@@ -225,6 +225,351 @@ func TestTeams_InviteValidation(t *testing.T) {
 	}
 }
 
+// ---------- update_team ----------
+
+func TestTeams_Update_NameAndSlug(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "First Co")
+
+	var got teamResp
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug, owner.AccessToken,
+		map[string]any{"name": "Renamed Co", "slug": "renamed-co"},
+		http.StatusOK, &got)
+	if got.Name != "Renamed Co" || got.Slug != "renamed-co" {
+		t.Errorf("got name=%q slug=%q", got.Name, got.Slug)
+	}
+
+	// New slug routes correctly.
+	var fetched teamResp
+	h.DoJSON(http.MethodGet, "/v1/teams/renamed-co", owner.AccessToken, nil,
+		http.StatusOK, &fetched)
+	if fetched.ID != team.ID {
+		t.Errorf("re-fetch by new slug failed")
+	}
+}
+
+func TestTeams_Update_DefaultRegion(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Region Co")
+
+	region := "eu-west-1"
+	var got teamResp
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug, owner.AccessToken,
+		map[string]any{"defaultRegion": region}, http.StatusOK, &got)
+	if got.DefaultRegion != region {
+		t.Errorf("region=%q want %q", got.DefaultRegion, region)
+	}
+}
+
+func TestTeams_Update_NonAdmin403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Locked Co")
+
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug, other.AccessToken,
+		map[string]any{"name": "Hijacked"}, http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("code=%q want forbidden", env.Code)
+	}
+}
+
+func TestTeams_Update_SlugConflict(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	first := createTeam(t, h, owner.AccessToken, "First Co")
+	second := createTeam(t, h, owner.AccessToken, "Second Co")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+second.Slug, owner.AccessToken,
+		map[string]any{"slug": first.Slug}, http.StatusConflict)
+	if env.Code != "slug_taken" {
+		t.Errorf("code=%q want slug_taken", env.Code)
+	}
+}
+
+func TestTeams_Update_InvalidSlug(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Bad Slug Co")
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug, owner.AccessToken,
+		map[string]any{"slug": "Has Spaces"}, http.StatusBadRequest)
+	if env.Code != "invalid_slug" {
+		t.Errorf("code=%q want invalid_slug", env.Code)
+	}
+}
+
+// ---------- delete_team ----------
+
+func TestTeams_Delete_HappyPath(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Doomed Co")
+
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/delete", owner.AccessToken,
+		nil, http.StatusOK, &map[string]string{})
+
+	// Subsequent get → 404.
+	env := h.AssertStatus(http.MethodGet, "/v1/teams/"+team.Slug, owner.AccessToken,
+		nil, http.StatusNotFound)
+	if env.Code != "team_not_found" {
+		t.Errorf("code=%q want team_not_found", env.Code)
+	}
+}
+
+func TestTeams_Delete_NonAdmin403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Defended Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/delete",
+		other.AccessToken, nil, http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("code=%q want forbidden", env.Code)
+	}
+}
+
+func TestTeams_Delete_RefusesWithDeployments(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Loaded Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Has Stuff")
+	// Seed a fake deployment row directly so we don't drag the docker
+	// provisioner into the test.
+	h.SeedDeployment(proj.ID, "", "dev", "running", true, owner.ID, 4001, "")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/delete",
+		owner.AccessToken, nil, http.StatusConflict)
+	if env.Code != "team_has_deployments" {
+		t.Errorf("code=%q want team_has_deployments", env.Code)
+	}
+}
+
+func TestTeams_Delete_AllowsAfterDeploymentsCleared(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Cleanup Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Cleanable")
+	h.SeedDeployment(proj.ID, "", "dev", "deleted", true, owner.ID, 4002, "")
+
+	// 'deleted' status is excluded from the count, so this succeeds.
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/delete", owner.AccessToken,
+		nil, http.StatusOK, &map[string]string{})
+}
+
+// ---------- update_member_role ----------
+
+func TestTeams_UpdateMemberRole_Promote(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Promote Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		owner.AccessToken,
+		map[string]string{"memberId": other.ID, "role": "admin"},
+		http.StatusOK, &map[string]string{})
+
+	var role string
+	if err := h.DB.QueryRow(h.rootCtx,
+		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
+		team.ID, other.ID).Scan(&role); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if role != "admin" {
+		t.Errorf("role=%q want admin", role)
+	}
+}
+
+func TestTeams_UpdateMemberRole_DeveloperAlias(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Alias Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	// Cloud uses 'developer'; we map → member.
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		owner.AccessToken,
+		map[string]string{"memberId": other.ID, "role": "developer"},
+		http.StatusOK, &map[string]string{})
+
+	var role string
+	if err := h.DB.QueryRow(h.rootCtx,
+		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
+		team.ID, other.ID).Scan(&role); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if role != "member" {
+		t.Errorf("developer should map to member, got %q", role)
+	}
+}
+
+func TestTeams_UpdateMemberRole_LastAdmin409(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Solo Admin Co")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		owner.AccessToken,
+		map[string]string{"memberId": owner.ID, "role": "developer"},
+		http.StatusConflict)
+	if env.Code != "last_admin" {
+		t.Errorf("code=%q want last_admin", env.Code)
+	}
+}
+
+func TestTeams_UpdateMemberRole_NonAdmin403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Restrict Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		other.AccessToken,
+		map[string]string{"memberId": owner.ID, "role": "developer"},
+		http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("code=%q want forbidden", env.Code)
+	}
+}
+
+func TestTeams_UpdateMemberRole_UnknownMember404(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Strangers Co")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		owner.AccessToken,
+		map[string]string{
+			"memberId": "00000000-0000-0000-0000-000000000000",
+			"role":     "admin",
+		},
+		http.StatusNotFound)
+	if env.Code != "member_not_found" {
+		t.Errorf("code=%q want member_not_found", env.Code)
+	}
+}
+
+func TestTeams_UpdateMemberRole_InvalidRole(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Bad Role Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/update_member_role",
+		owner.AccessToken,
+		map[string]string{"memberId": other.ID, "role": "owner"},
+		http.StatusBadRequest)
+	if env.Code != "invalid_role" {
+		t.Errorf("code=%q want invalid_role", env.Code)
+	}
+}
+
+// ---------- remove_member ----------
+
+func TestTeams_RemoveMember_AdminRemovesOther(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Boot Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/remove_member", owner.AccessToken,
+		map[string]string{"memberId": other.ID}, http.StatusOK, &map[string]string{})
+
+	var count int
+	if err := h.DB.QueryRow(h.rootCtx,
+		`SELECT COUNT(*) FROM team_members WHERE team_id = $1 AND user_id = $2`,
+		team.ID, other.ID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected member removed, count=%d", count)
+	}
+}
+
+func TestTeams_RemoveMember_SelfRemoval(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Quitter Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	// Self-removal allowed even though caller is non-admin.
+	h.DoJSON(http.MethodPost, "/v1/teams/"+team.Slug+"/remove_member", other.AccessToken,
+		map[string]string{"memberId": other.ID}, http.StatusOK, &map[string]string{})
+}
+
+func TestTeams_RemoveMember_NonAdminTryingOther403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	other := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Strict Co")
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
+		team.ID, other.ID); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/remove_member",
+		other.AccessToken,
+		map[string]string{"memberId": owner.ID}, http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("code=%q want forbidden", env.Code)
+	}
+}
+
+func TestTeams_RemoveMember_LastAdmin409(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Solo Admin Co")
+	env := h.AssertStatus(http.MethodPost, "/v1/teams/"+team.Slug+"/remove_member",
+		owner.AccessToken,
+		map[string]string{"memberId": owner.ID}, http.StatusConflict)
+	if env.Code != "last_admin" {
+		t.Errorf("code=%q want last_admin", env.Code)
+	}
+}
+
 func TestTeams_SlugCollisionAddsSuffix(t *testing.T) {
 	h := Setup(t)
 	u := h.RegisterRandomUser()
