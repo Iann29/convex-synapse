@@ -209,6 +209,42 @@ probe the dashboard uses pre-login to decide between `/login` and
   uses `POST /<resource>/delete` (not HTTP `DELETE`) — verify::_curl
   with `-X DELETE` 4xx's silently because `curl -f` is on.
 
+## v1.0 ground rules (project-level RBAC)
+
+Roles compose: `project_members.role` (override) wins over
+`team_members.role` (fallback). Three roles at the project grain
+(`admin` / `member` / `viewer`); `viewer` is project-only — there's
+no team-level viewer.
+
+- **Always go through `effectiveProjectRole(ctx, db, projectID, teamID, userID)`.**
+  Don't `SELECT role FROM team_members ...` from a new handler — the
+  helper does the COALESCE for you and stays correct when overrides
+  exist. The two `load*ForRequest` helpers (project + deployment)
+  already use it; mirror that pattern in new resource loaders.
+- **Gate writes via `canAdminProject` / `canEditProject` (in projects.go).**
+  Don't compare against a literal `models.RoleAdmin` — it locks out
+  members from edits they're allowed to make and falls apart the
+  moment a fourth role lands.
+- **Permission matrix is the contract.** Reads (GET project /
+  deployments / env vars / members) — any role. Edits (env vars,
+  create deployment) — admin OR member. Destructive (delete
+  deployment, delete/transfer project, adopt, upgrade_to_ha,
+  create deploy key, manage members, project tokens) — admin only.
+  See `docs/API.md` "Project-level RBAC" for the full table.
+- **Team is the trust boundary.** `add_member` and
+  `update_member_role` refuse 400 `not_team_member` when the
+  target isn't on the project's owning team. To onboard someone
+  brand-new to a project, invite them to the team first, then drop
+  the override.
+- **CASCADE goes from team → project_members.** A team_members row
+  going away (user removed from team / user deleted / team deleted)
+  takes their project_members rows with it. No orphan overrides.
+- **last_admin guard NOT enforced on project_members.** Team admins
+  always retain admin access via fallback unless they themselves
+  carry a degrading override; demoting the last project_members
+  admin row is allowed. If you find a real "operator locked themself
+  out" case in the wild, add the guard then.
+
 ## v1.0 ground rules (custom domains)
 
 `SYNAPSE_BASE_DOMAIN=<host>` enables per-deployment subdomains
@@ -271,6 +307,7 @@ A feature is done when:
 - [ ] **Real-VPS smoke test** passes if you touched setup.sh, docker-compose.yml, or any handler that emits a URL — `ssh synapse-vps` and run end-to-end
 - [ ] `docs/API.md` updated for any new/changed endpoint
 - [ ] If you added a deployment-returning endpoint: applied `publicDeploymentURL(&d)` rewrite (otherwise remote callers see loopback URLs)
+- [ ] If you added a project / deployment writer: gated via `canAdminProject` / `canEditProject` (NOT a literal `models.RoleAdmin` check)
 - [ ] Commit message body lists the curl flow you actually ran
 - [ ] `docs/ROADMAP.md` ticked if you crossed a phase boundary
 

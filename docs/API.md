@@ -238,12 +238,67 @@ with the same slug already exists in the destination. Self-transfer
 (destinationTeamId == current team) returns 204 no-op. Audit fires on
 both teams with `direction: in/out` metadata.
 
-### `POST /v1/projects/{id}/delete` ✅ (admins only)
+### `POST /v1/projects/{id}/delete` ✅ (project admins only)
 ### `GET /v1/projects/{id}/list_deployments` ✅
 ### `GET /v1/projects/{id}/list_default_environment_variables` ✅
-### `POST /v1/projects/{id}/update_default_environment_variables` ✅ (admins only)
+### `POST /v1/projects/{id}/update_default_environment_variables` ✅ (project admins or members)
 
 Body: `{changes: [{op:"set"|"delete", name, value?, deploymentTypes?}]}`.
+
+Viewers (project_members.role = "viewer") can list env vars but
+cannot mutate. See "Project-level RBAC" below.
+
+### `GET /v1/projects/{id}/list_members` ✅
+
+Returns the merged member list for the project — every team member of
+the owning team, with the role they actually have on this project
+(project-level override beats team fallback). Each row carries:
+
+```json
+{
+  "id":         "<userId>",
+  "email":      "ian@example.com",
+  "name":       "Ian",
+  "role":       "admin" | "member" | "viewer",
+  "source":     "project" | "team",
+  "createTime": "..."
+}
+```
+
+`source` is `"project"` when a `project_members` override is in
+effect for this user, `"team"` when their `team_members` role is
+shining through. Visible to anyone with project access (viewers
+included).
+
+### `POST /v1/projects/{id}/add_member` ✅ (project admins only)
+
+Body `{userId, role}`. Adds (or upserts) a `project_members` override
+row for a user that's already a `team_members` of the project's team.
+Roles: `admin`, `member`, `viewer`.
+
+- 400 `not_team_member` — target user isn't on the project's team yet
+- 400 `invalid_role` — unrecognised role string
+- 403 `forbidden` — caller isn't a project admin
+
+### `POST /v1/projects/{id}/update_member_role` ✅ (project admins only)
+
+Body `{memberId, role}`. Same shape as team-level update_member_role.
+Upserts the `project_members` row — equivalent to add_member when
+there's no override yet.
+
+### `POST /v1/projects/{id}/remove_member` ✅ (project admins OR self)
+
+Body `{memberId}`. Drops the `project_members` override; the user
+falls back to whatever role they have at the team level.
+
+- 404 `no_override` — user has no project-level override (their team
+  role is in effect; nothing to remove)
+- 403 `forbidden` — caller is not a project admin and the target
+  isn't themselves
+
+To fully kick a user out of a project, remove them from the team
+instead (`POST /v1/teams/{ref}/remove_member`); the project_members
+row CASCADEs away with the user.
 
 ### `POST /v1/projects/{id}/access_tokens` ✅ (admins only)
 
@@ -409,6 +464,45 @@ http://localhost:8080/d/quiet-cat-1234/api/check_admin_key
 No auth check at the proxy layer — deployments enforce admin-key auth
 themselves.
 
+## Project-level RBAC (v1.0+)
+
+Teams have two roles (`admin`, `member`). Projects have three
+(`admin`, `member`, `viewer`). The roles compose via override:
+
+```
+effective_role(project, user) =
+   project_members.role  (if a row exists for this project + user)
+ELSE
+   team_members.role     (the team-wide default)
+```
+
+This lets a team admin be locked down to viewer on a single project,
+or a contractor at team-member level be promoted to admin on the one
+project they own. The team membership is the trust boundary —
+`add_member` / `update_member_role` refuse 400 `not_team_member`
+when the target isn't on the project's team yet.
+
+### Permission matrix
+
+| Action | viewer | member | admin (project) |
+|---|---|---|---|
+| GET project / deployments / env vars / members | ✅ | ✅ | ✅ |
+| POST update env vars | ❌ | ✅ | ✅ |
+| POST create deployment | ❌ | ✅ | ✅ |
+| POST delete deployment | ❌ | ❌ | ✅ |
+| PUT update project (name/slug) | ❌ | ❌ | ✅ |
+| POST delete / transfer project | ❌ | ❌ | ✅ |
+| POST adopt deployment | ❌ | ❌ | ✅ |
+| POST upgrade deployment to HA | ❌ | ❌ | ✅ |
+| POST create deploy key | ❌ | ❌ | ✅ |
+| POST add / update / remove project member | ❌ | ❌ | ✅ |
+| POST issue project / app access tokens | ❌ | ❌ | ✅ |
+| Self-remove project override | ✅ | ✅ | ✅ |
+
+Viewers see everything (read-only). Members can edit env vars and
+spin up deployments but can't tear them down or rename the project.
+Admins do everything else.
+
 ## Token scopes (v1.0+)
 
 Synapse access tokens carry a `scope`: `user`, `team`, `project`,
@@ -553,4 +647,68 @@ messages may evolve.
 | `team_has_deployments` | 409 | delete_team refuses while live deployments exist |
 | `team_creator` | 409 | delete_account refuses for creator of any team |
 | `last_admin` | 409 | role/membership change would orphan a team |
+| `not_team_member` | 400 | project add_member target is not on the team yet |
+| `no_override` | 404 | remove_member found no project_members override |
 | `internal` | 500 | server bug — check logs |
+
+## Stability + versioning (v1.0+)
+
+Synapse follows semver on the API surface documented above. Tags are
+cut on `main` (`vMAJOR.MINOR.PATCH`) and published as
+[GitHub Releases](https://github.com/Iann29/convex-synapse/releases);
+`./setup.sh --upgrade` queries `/repos/.../releases/latest` to
+discover them.
+
+### What semver applies to
+
+The contract below is **stable**. Breaking changes bump the **major**
+version (`v1.0.0` → `v2.0.0`):
+
+- The set of `/v1/...` endpoints documented above (paths, verbs,
+  request body shapes, response top-level keys, success status codes).
+- The list of `code` strings in the error table — values are stable;
+  the `message` string is human-readable and may evolve.
+- The role hierarchy (admin > member > viewer) and the override
+  semantics (project_members beats team_members).
+- Token scopes (`user`, `team`, `project`, `app`, `deployment`) and
+  the access matrix in §"Token scopes".
+- The `not_supported_in_self_hosted` 404 contract for cloud-only
+  paths.
+
+### What's NOT covered by semver
+
+- The exact text of error `message` fields.
+- The `metadata` JSONB shape inside audit events — keys may grow.
+- Internal endpoints under `/v1/internal/...` (today
+  `tls_ask`, `list_deployments_for_dashboard`); these are for the
+  installer / Caddy / iframed dashboard and may change without bumping.
+- The dashboard fork's component API (`@/components/...`).
+- Database migrations (additive — schema is the implementation
+  detail of the API, not the API itself).
+- The `setup.sh` flag set — see `setup.sh --help` for current
+  flags. Lifecycle commands stay backwards compatible across
+  minor releases; flags that change behaviour incompatibly land in
+  a new flag with the old one printing a deprecation warning for
+  one minor cycle.
+
+### Deprecation policy
+
+When an endpoint or field needs to go:
+
+1. Document the replacement in the same minor release.
+2. Mark the old surface as deprecated in this doc with a `🦴
+   deprecated since v1.X` tag and a sentence pointing at the new
+   path.
+3. The old surface keeps working — and stays in the test suite —
+   for at least one minor release after deprecation.
+4. Removal happens in the next major (`v2.0.0`+).
+
+### Endpoint added / removed since v1.0.0
+
+This section starts empty. Every minor release that touches the
+public surface gets a row here so callers know what to expect when
+they bump the `--upgrade` target.
+
+| Version | Change |
+|---|---|
+| v1.0.0 | initial stable surface (this doc) |

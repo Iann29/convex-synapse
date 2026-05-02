@@ -56,21 +56,27 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 |---|---|
 | Auth | email + password, JWT for the dashboard, opaque PATs for CLI / CI |
 | Teams + invites | multi-user via opaque tokens, admin / member roles |
-| Projects | CRUD, rename, delete, default env vars (batch) |
+| Projects | CRUD, rename, delete, transfer between teams, slug change, default env vars (batch) |
+| Project-level RBAC (v1.0+) | admin / member / viewer overrides on top of team roles — lock a contractor to read-only on one project without touching the team |
 | Deployments | one Convex backend container per deployment, ~1 s provisioning |
+| Custom domains (v1.0+) | `SYNAPSE_BASE_DOMAIN=<host>` → deployment URLs become `https://<name>.<host>` with Caddy on-demand TLS |
+| In-iframe deployment picker (v1.0+) | green-pill switcher above the embedded Convex Dashboard, one click to swap between dev / prod / preview |
 | Adopt existing | register an external Convex backend without spinning a new one |
 | `npx convex` CLI | signed admin keys + `cli_credentials` panel, paste-and-go |
 | Reverse proxy | `/d/{name}/*` routing with multi-replica failover for HA |
 | Convex Dashboard | hosted alongside Synapse, auto-logged via postMessage handshake |
 | HA-per-deployment | opt-in: 2 replicas + external Postgres + S3, AES-GCM encrypted creds |
+| Scoped access tokens (v1.0+) | user / team / project / app / deployment scope; bearer enforced at every load*ForRequest |
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
 | Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
-| Lifecycle commands | `--upgrade` (auto-detect via GitHub Releases, snapshot rollback), `--backup` / `--restore`, `--uninstall`, `--logs`, `--status` |
+| Lifecycle commands | `--upgrade` (auto-detect via GitHub Releases, snapshot rollback), `--backup` / `--restore` (with optional S3), `--uninstall`, `--logs`, `--status` |
 | First-run wizard | dashboard `/login` → `/setup` on a fresh install: admin → demo team/project/deployment in three clicks |
 | Pagination | `?limit&?cursor` + `X-Next-Cursor` on every list endpoint |
+| OpenAPI parity | 100% of self-hosted-relevant subset; ~60 cloud-only paths return structured `404 not_supported_in_self_hosted` |
+| API stability | semver on the `/v1/...` surface; deprecation policy + change log in [`docs/API.md`](docs/API.md) |
 
-**Tests:** ~146 Go integration tests + 24 Playwright e2e + 305 bats unit
+**Tests:** 238 Go integration tests + 41 Playwright e2e + 305 bats unit
 tests, all green in CI on every push.
 
 For roadmap, design notes, and what's deliberately out of scope, see

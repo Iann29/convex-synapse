@@ -155,6 +155,25 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 ### ✅ Shipped this milestone
 
+- [x] **Project-level RBAC (admin / member / viewer).** `project_members`
+  table layered on top of `team_members` — overrides win, team is the
+  fallback. Solves "I can't safely invite my team without per-project
+  gates": team admin → viewer on one project, contractor team-member
+  → admin on the project they own. Four endpoints under
+  `/v1/projects/{id}/`: `list_members`, `add_member`,
+  `update_member_role`, `remove_member`. Authz refactored on every
+  project + deployment handler via `canAdminProject` /
+  `canEditProject` helpers; viewers read everything, members edit
+  env vars + create deployments, admins do destructive things.
+  Migration 000008. Dashboard panel
+  (`dashboard/components/ProjectMembersPanel.tsx`) integrated on the
+  project detail page. Tests: +14 Go integration (238), +3 Playwright
+  (41).
+- [x] **API stability + versioning policy** documented in
+  [`docs/API.md`](API.md) "Stability + versioning". Semver on the
+  `/v1` surface, error code stability, deprecation lifecycle, and
+  the "Endpoint added/removed since v1.0.0" change table that grows
+  on every public-surface change.
 - [x] **In-header deployment picker on the Convex Dashboard (Strategy E).**
   The green-pill switcher Convex Cloud ships in its dashboard header —
   but rendered as an overlay above the upstream iframe instead of inside
@@ -196,17 +215,22 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 Effort scale: **S** ≈ 1 session · **M** ≈ 2-3 sessions · **L** ≈ multi-week.
 
-- [ ] **Backup follow-ups (S each)**: cron-style scheduled backups (systemd timer phase that wraps `setup.sh --backup --to-s3=...`); retention policy (auto-delete N-days-old backups, or rely on bucket lifecycle rules). Composable enough that operators can wrap until we ship.
+- [ ] **Phase 3 polish on the Convex Dashboard picker (S-M)**. Last-viewed-deployment memory in localStorage, sync between picker and iframe route (`/embed/<name>/<page>` reflecting the upstream's current view), optional CSS overlay to hide the upstream's own header for a one-stack look. Strategy E v2 — same overlay path, just smoothed. See [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md) §12 for the open ideas.
 
-- [ ] **RBAC: project-level roles (M)**. Today roles are team-scoped (admin / member). Add admin / member / viewer per project so a contractor on team can edit project A but only view project B. Touches: db migration adding `project_members` table, every project handler's authz check, dashboard role-toggle UI in the Members pane. Solves: "I can't safely invite my team without per-project gates."
+### 🦴 Deferred / out of scope this milestone
 
-- [ ] **OAuth / SSO via OIDC (M-L)**. Works with Authentik, Zitadel, Keycloak, Google Workspace, Okta. Auth handler grows an OIDC discovery + callback flow alongside email+password. JWT issuer accepts the OIDC sub claim. Dashboard `/login` adds "Sign in with `<Provider>`" when configured. Touches: `internal/auth/`, `internal/api/auth.go`, dashboard auth, env vars (`SYNAPSE_OIDC_ISSUER`, `SYNAPSE_OIDC_CLIENT_ID`, etc). Solves: "Company won't let me ship without SSO."
+The operator explicitly cut these from the v1.0 push on 2026-05-02 to
+focus on RBAC + API stability + picker polish:
 
-- [ ] **Public API stability guarantees + versioned releases (S)**. Already half-shipped — `v0.6.3` tagged on GitHub Releases, `--upgrade` queries the API. Outstanding: semver discipline on the OpenAPI shape (breaking changes bump major), document the contract in `docs/API.md`, add a deprecation policy. Touches: docs only.
-
-- [ ] **Kubernetes provisioner (L)**. Alternative to Docker. The `Provisioner` interface is already factored (`Provision/Destroy/Restart`). Add `internal/k8sprov/` that creates Deployment + Service + PVC per Synapse deployment. Configured via `SYNAPSE_PROVISIONER=k8s` + kubeconfig. Touches: `cmd/server/main.go` wiring, `internal/health/` (k8s-aware status), Helm chart (depends-on). Solves: "I run K8s, can't introduce Docker."
-
-- [ ] **Helm chart (L)**. Installs Synapse on an existing K8s cluster. Helm umbrella over postgres (CloudNative-PG operator), synapse, dashboard, optional cluster-issuer for cert-manager. Depends on the Kubernetes provisioner above. Touches: new `helm/` dir, GitHub Actions to publish to a chart repo on each tag.
+- **OAuth / SSO via OIDC** (M-L) — was on the list. Picked up in a
+  later milestone. Synapse stays email+password JWT until then;
+  enterprise SSO is the next big request once RBAC lands.
+- **Backup follow-ups** (S each) — cron-style scheduled backups,
+  retention policy. Operators wrap `setup.sh --backup --to-s3=...`
+  in their own cron until then.
+- **Kubernetes provisioner** (L) — alternative to Docker; Helm
+  chart depends on it. Both deferred until there's a documented
+  k8s-only operator asking.
 
 ## Maybe never
 
@@ -229,7 +253,7 @@ ship". Catalogue: `synapse/internal/api/not_supported.go`.
 | Auth | custom (no WorkOS — OIDC tracked separately) |
 | Profile (`/me`) | ✅ get / update_profile_name / delete_account / member_data / optins |
 | Teams | ✅ get / update / delete / list_projects / list_members / list_deployments / invites / accept / update_member_role / remove_member |
-| Projects | ✅ get / update (name+slug) / delete / transfer / env vars / list_deployments |
+| Projects | ✅ get / update (name+slug) / delete / transfer / env vars / list_deployments / **list/add/update_role/remove members (RBAC v1.0+)** |
 | Deployments | ✅ get / create / adopt / delete / auth / cli_credentials / deploy_keys / upgrade_to_ha / custom domains (v1.0) |
 | Personal access tokens | ✅ user / team / project / app / deployment scopes + scope-aware auth middleware |
 | Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |

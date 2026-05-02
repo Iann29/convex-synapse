@@ -52,7 +52,14 @@ Use these utilities:
 - `writeJSON(w, status, body)`, `writeError(w, status, code, msg)` from `httpx.go`
 - `readJSON(r, &dst)` for body parsing (rejects unknown fields, 1MB cap)
 - `auth.UserID(r.Context())` to get the caller
-- `loadTeamForRequest`, `loadProjectForRequest` to resolve + assert membership
+- `loadTeamForRequest`, `loadProjectForRequest`, `loadDeploymentForRequest` to
+  resolve + assert membership. `loadProjectForRequest` and
+  `loadDeploymentForRequest` go through `effectiveProjectRole` so the
+  role they return already honours `project_members` overrides — DON'T
+  re-query `team_members` directly in a new handler.
+- For a fresh project + user pair (e.g. inside a join you're writing
+  yourself), use `effectiveProjectRole(ctx, db, projectID, teamID, userID)`
+  in `projects.go`.
 - `slugify(name)` for slug allocation
 - `db.WithRetryOnUniqueViolation(ctx, n, fn)` — wrap any SELECT-then-INSERT
   resource allocator (port, name, slug). UNIQUE-constraint races retry
@@ -63,6 +70,23 @@ Use these utilities:
   Keys live in `internal/db/advisorylock.go` as constants.
 - `audit.Record(ctx, db, audit.Options{...})` — call on every mutating
   success path. Best-effort, never fails the user request.
+
+#### Project-level RBAC gates (v1.0+)
+
+Don't compare `role != models.RoleAdmin` in a new project / deployment
+handler. Use the helpers:
+
+- `canAdminProject(role)` — destructive writes (delete, transfer,
+  rename, manage members, adopt, upgrade-to-HA, project tokens,
+  create deploy key)
+- `canEditProject(role)` — non-destructive writes (env vars,
+  create deployment)
+- Reads (GET project / deployments / env vars / members) — any
+  role passes; gate is just "load*ForRequest succeeded"
+
+`viewer` is project-only. Team-level helpers (`models.RoleAdmin` /
+`models.RoleMember`) are still right for team-grain code paths
+(`loadTeamForRequest` returns the team role unchanged).
 
 If your feature does long async work, do NOT spawn a per-handler goroutine.
 Enqueue a row in a job table and run a `Worker` with
