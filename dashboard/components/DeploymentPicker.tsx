@@ -409,7 +409,13 @@ export function DeploymentPicker({
           ref={menuRef}
           role="menu"
           data-testid="deployment-picker-menu"
-          className="absolute left-0 top-full z-50 mt-2 w-80 overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950 shadow-xl"
+          // Anchor to the RIGHT edge of the pill, not the left —
+          // the pill itself sits in the right side of the embed
+          // header, so left-anchoring made the 320-px-wide menu
+          // overflow the viewport. max-w guard covers narrow
+          // viewports where 80*4=320 still wouldn't fit on the
+          // left side either.
+          className="absolute right-0 top-full z-50 mt-2 w-80 max-w-[calc(100vw-1rem)] overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950 shadow-xl"
         >
           {showSearch && (
             <div className="border-b border-neutral-800 p-2">
