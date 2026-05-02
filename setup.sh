@@ -378,6 +378,8 @@ source_libs() {
     . "$HERE/installer/lib/port.sh"
     # shellcheck source=installer/install/ui.sh
     . "$HERE/installer/install/ui.sh"
+    # shellcheck source=installer/install/wizard.sh
+    . "$HERE/installer/install/wizard.sh"
     # shellcheck source=installer/install/preflight.sh
     . "$HERE/installer/install/preflight.sh"
     # shellcheck source=installer/install/secrets.sh
@@ -392,6 +394,50 @@ source_libs() {
     . "$HERE/installer/install/s3.sh"
     # shellcheck source=installer/install/lifecycle.sh
     . "$HERE/installer/install/lifecycle.sh"
+}
+
+# phase_wizard — interactive Q&A when `curl | bash` runs without
+# mode-defining flags. Sets DOMAIN / NO_TLS / BASE_DOMAIN / ENABLE_HA /
+# INSTALL_DIR + SYNAPSE_AUTO_INSTALL_DOCKER from the operator's
+# answers. Bails the install with exit 130 if they decline at the
+# summary confirm. No-ops in --non-interactive mode and when the
+# operator already answered everything via flags.
+phase_wizard() {
+    CURRENT_STEP="wizard"
+    if ! wizard::should_run; then
+        return 0
+    fi
+    wizard::run
+}
+
+# phase_autoinstall_docker — when the wizard agreed to fix missing
+# dependencies, install Docker via the official one-liner BEFORE
+# the preflight runs. preflight then sees a working Docker and
+# moves on instead of failing the whole script. Idempotent: the
+# get.docker.com script no-ops when docker is already present.
+phase_autoinstall_docker() {
+    CURRENT_STEP="autoinstall_docker"
+    # Interactive path: operator already said yes via the wizard.
+    # Non-interactive root path: we treat "auto-install when missing"
+    # as the sensible default, since the alternative is "fail with a
+    # one-line cure right next to the abort message", which is the
+    # frustration the wizard was built to avoid.
+    if (( ${SYNAPSE_AUTO_INSTALL_DOCKER:-0} == 0 )) \
+            && (( ${NON_INTERACTIVE:-0} == 0 )); then
+        return 0
+    fi
+    if detect::has_docker; then
+        return 0
+    fi
+    if [[ "$EUID" -ne 0 ]] && ! detect::has_cmd sudo; then
+        ui::fail "Docker missing and we don't have root/sudo to install it"
+        return 2
+    fi
+    ui::step "Installing Docker (one-time, ~1 min)"
+    if ! wizard::install_docker; then
+        ui::fail "Docker auto-install failed — see $LOG_FILE"
+        return 2
+    fi
 }
 
 # Phases -------------------------------------------------------------
@@ -919,6 +965,8 @@ main() {
     source_libs
     acquire_lock
     phase_banner
+    phase_wizard
+    phase_autoinstall_docker
     phase_preflight
     phase_install_deps
     phase_install_dir
