@@ -82,6 +82,12 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(middleware.RequestLogger(d.Logger))
 	r.Use(middleware.CORS(d.AllowedOrigins))
 	r.Use(chimw.Recoverer)
+	// Short-circuit OpenAPI paths that Synapse self-hosted intentionally
+	// doesn't implement (Convex Cloud's billing, SSO, Discord/Vercel,
+	// OAuth apps, cloud backups). Returns 404 not_supported_in_self_hosted
+	// before auth so probes reveal the cut without leaking auth state.
+	// Catalog: internal/api/not_supported.go.
+	r.Use(NotSupportedMiddleware)
 	// 30s is plenty now that create_deployment is async — it returns 201 the
 	// moment the row is inserted, and the docker pull/start/healthcheck runs
 	// in a background goroutine. No request handler should hold a connection
@@ -97,6 +103,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	deploymentsH := &DeploymentsHandler{
 		DB:                    d.DB,
 		Docker:                d.Docker,
+		Tokens:                tokensH,
 		PortRangeMin:          d.PortRangeMin,
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
@@ -110,8 +117,9 @@ func NewRouter(d RouterDeps) http.Handler {
 	// listDeployments handlers can call publicDeploymentURL — same
 	// rewrite as /auth and /cli_credentials so dashboards and CLIs see
 	// public URLs instead of the loopback "http://127.0.0.1:<port>".
-	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH}
-	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
+	// Tokens enables scope-aware access-token CRUD under /access_tokens.
+	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
+	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -134,6 +142,15 @@ func NewRouter(d RouterDeps) http.Handler {
 		// handler compiling and the path looking right.
 		r.Route("/internal", func(r chi.Router) {
 			r.Method(http.MethodGet, "/tls_ask", &TLSAskHandler{DB: d.DB, BaseDomain: d.BaseDomain})
+			// list_deployments_for_dashboard — cross-origin endpoint
+			// the upstream Convex Dashboard hits from inside the
+			// /embed/<name> iframe. Public route, but the request
+			// must carry a `?token=` query param holding a
+			// project-scoped PAT (minted by the Synapse Dashboard
+			// before the iframe loads, TTL ~15min). See
+			// dashboard_proxy.go for the auth + cors discussion.
+			dashProxy := &DashboardProxyHandler{DB: d.DB, Deployments: deploymentsH}
+			r.Get("/list_deployments_for_dashboard", dashProxy.listDeploymentsForDashboard)
 		})
 
 		// Authenticated.
@@ -150,6 +167,11 @@ func NewRouter(d RouterDeps) http.Handler {
 			// Registered directly (not via Mount) because chi's Mount("/", ...)
 			// collides with the existing GET /v1/ index handler above.
 			tokensH.Register(r)
+			// Profile-level cloud-spec endpoints — mounted flat the same way
+			// as access tokens (Mount("/", ...) collides with the index
+			// handler). See MeHandler.RegisterTopLevel for the per-route
+			// rationale.
+			meH.RegisterTopLevel(r)
 		})
 	})
 

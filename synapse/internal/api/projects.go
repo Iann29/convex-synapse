@@ -12,6 +12,7 @@ import (
 
 	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedb "github.com/Iann29/synapse/internal/db"
 	"github.com/Iann29/synapse/internal/models"
 )
 
@@ -24,6 +25,7 @@ import (
 type ProjectsHandler struct {
 	DB          *pgxpool.Pool
 	Deployments *DeploymentsHandler
+	Tokens      *AccessTokensHandler
 }
 
 func (h *ProjectsHandler) Routes() chi.Router {
@@ -33,9 +35,19 @@ func (h *ProjectsHandler) Routes() chi.Router {
 		r.Get("/", h.getProject)
 		r.Put("/", h.updateProject)
 		r.Post("/delete", h.deleteProject)
+		r.Post("/transfer", h.transferProject)
 		r.Get("/list_deployments", h.listDeployments)
 		r.Get("/list_default_environment_variables", h.listEnvVars)
 		r.Post("/update_default_environment_variables", h.updateEnvVars)
+		// Scoped access tokens (v1.0+). Project-scoped tokens carry
+		// scope=project; the cloud-spec separates "app" tokens
+		// (preview-deploy keys) from regular project tokens — we expose
+		// both endpoints, scope-tagged differently so the dashboard can
+		// render two lists.
+		r.Post("/access_tokens", h.createProjectAccessToken)
+		r.Get("/access_tokens", h.listProjectAccessTokens)
+		r.Post("/app_access_tokens", h.createAppAccessToken)
+		r.Get("/app_access_tokens", h.listAppAccessTokens)
 		if h.Deployments != nil {
 			h.Deployments.MountProjectScopedRoutes(r)
 		}
@@ -89,6 +101,9 @@ func (h *ProjectsHandler) loadProjectForRequest(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify access")
 		return nil, nil, "", false
 	}
+	if !enforceProjectAccess(w, r.Context(), p.ID, t.ID) {
+		return nil, nil, "", false
+	}
 	return &p, &t, role, true
 }
 
@@ -103,9 +118,23 @@ func (h *ProjectsHandler) getProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- PUT /v1/projects/{id} ----------
+//
+// Mirrors Convex Cloud's update_project. Both `name` and `slug` are
+// optional (UpdateProjectArgs in the OpenAPI spec). The cloud spec
+// returns 204 No Content; we return 200 + the updated project for
+// dashboard convenience — a no-op no-args call is therefore a cheap
+// "echo back the current state".
+//
+// Slug uniqueness is per-team (UNIQUE(team_id, slug)). The
+// SELECT-then-UPDATE shape races concurrent renames; we lean on the
+// constraint and surface its violation as a structured 409 slug_taken.
+// We don't auto-pick a free slug here — a user-supplied slug is
+// authoritative; mangling it silently ("blog" → "blog-1") would
+// surprise the operator.
 
 type updateProjectReq struct {
 	Name *string `json:"name,omitempty"`
+	Slug *string `json:"slug,omitempty"`
 }
 
 func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) {
@@ -122,36 +151,330 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	renamed := false
+
 	oldName := p.Name
+	oldSlug := p.Slug
+	var newName, newSlug *string
+
 	if req.Name != nil {
-		newName := strings.TrimSpace(*req.Name)
-		if newName == "" {
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
 			writeError(w, http.StatusBadRequest, "missing_name", "Project name is required")
 			return
 		}
-		_, err := h.DB.Exec(r.Context(),
-			`UPDATE projects SET name = $1 WHERE id = $2`, newName, p.ID)
-		if err != nil {
-			logErr("update project", err)
-			writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
+		newName = &trimmed
+	}
+	if req.Slug != nil {
+		trimmed := strings.TrimSpace(*req.Slug)
+		if trimmed == "" {
+			writeError(w, http.StatusBadRequest, "missing_slug", "Project slug is required")
 			return
 		}
-		renamed = newName != oldName
-		p.Name = newName
+		// Cloud's slug shape: lowercase letters, digits, dashes. Be liberal
+		// and accept what slugify() would produce so callers can pre-render
+		// before sending. Reject anything else loudly.
+		if !isValidSlug(trimmed) {
+			writeError(w, http.StatusBadRequest, "invalid_slug",
+				"slug must contain only lowercase letters, digits, and dashes")
+			return
+		}
+		newSlug = &trimmed
 	}
-	if renamed {
-		uid, _ := auth.UserID(r.Context())
-		_ = audit.Record(r.Context(), h.DB, audit.Options{
-			TeamID:     t.ID,
-			ActorID:    uid,
-			Action:     audit.ActionRenameProject,
-			TargetType: audit.TargetProject,
-			TargetID:   p.ID,
-			Metadata:   map[string]any{"oldName": oldName, "newName": p.Name},
-		})
+
+	if newName == nil && newSlug == nil {
+		// No-op call (Cloud allows empty body). Return the current state so
+		// callers can use this endpoint as a "fetch then echo" probe.
+		writeJSON(w, http.StatusOK, p)
+		return
 	}
+
+	// Build a single UPDATE that touches only the supplied fields. Either
+	// COALESCE (with NULL meaning "keep existing") or a small builder works;
+	// COALESCE keeps the SQL stable and the parameter shape predictable.
+	tag, err := h.DB.Exec(r.Context(), `
+		UPDATE projects
+		   SET name = COALESCE($1, name),
+		       slug = COALESCE($2, slug)
+		 WHERE id = $3
+	`, sqlNullableString(newName), sqlNullableString(newSlug), p.ID)
+	if err != nil {
+		if synapsedb.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "slug_taken",
+				"A project with this slug already exists in the team")
+			return
+		}
+		logErr("update project", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Should not happen — loadProjectForRequest already proved the row
+		// exists. Defensive: surface as 404 rather than a confusing 200 with
+		// stale state.
+		writeError(w, http.StatusNotFound, "project_not_found", "Project not found")
+		return
+	}
+
+	if newName != nil {
+		p.Name = *newName
+	}
+	if newSlug != nil {
+		p.Slug = *newSlug
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	// Keep the legacy renameProject action when the change is name-only —
+	// existing audit-log dashboards/queries already filter on that string.
+	// Slug-touching updates use the more general updateProject vocabulary.
+	action := audit.ActionUpdateProject
+	if newSlug == nil && newName != nil {
+		action = audit.ActionRenameProject
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     action,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"oldName": oldName,
+			"newName": p.Name,
+			"oldSlug": oldSlug,
+			"newSlug": p.Slug,
+		},
+	})
 	writeJSON(w, http.StatusOK, p)
+}
+
+// ---------- POST /v1/projects/{id}/access_tokens ----------
+//
+// Project-scoped tokens (and the "app" variant below) require team-admin
+// role to create. The created token's scope_id is the project id; the
+// auth middleware's load*ForRequest helpers verify that the bearer can
+// actually reach the project at request time.
+
+func (h *ProjectsHandler) createProjectAccessToken(w http.ResponseWriter, r *http.Request) {
+	h.createProjectScopedToken(w, r, models.TokenScopeProject)
+}
+
+func (h *ProjectsHandler) createAppAccessToken(w http.ResponseWriter, r *http.Request) {
+	h.createProjectScopedToken(w, r, models.TokenScopeApp)
+}
+
+func (h *ProjectsHandler) createProjectScopedToken(w http.ResponseWriter, r *http.Request, scope string) {
+	p, _, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only team admins can create project access tokens")
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	var req createScopedTokenReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, plain, ok := h.Tokens.createForOwner(w, r, uid, req.Name, scope, p.ID, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusCreated, createTokenResp{Token: plain, AccessToken: view})
+}
+
+func (h *ProjectsHandler) listProjectAccessTokens(w http.ResponseWriter, r *http.Request) {
+	h.listProjectScopedTokens(w, r, models.TokenScopeProject)
+}
+
+func (h *ProjectsHandler) listAppAccessTokens(w http.ResponseWriter, r *http.Request) {
+	h.listProjectScopedTokens(w, r, models.TokenScopeApp)
+}
+
+func (h *ProjectsHandler) listProjectScopedTokens(w http.ResponseWriter, r *http.Request, scope string) {
+	p, _, _, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	limit, ok := parseTokenListLimit(w, r)
+	if !ok {
+		return
+	}
+	resp, ok := h.Tokens.listForOwner(w, r, uid, scope, p.ID, limit, r.URL.Query().Get("cursor"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// sqlNullableString turns a *string into the value pgx will treat as NULL
+// when nil. Helper kept private — only used by COALESCE-style updates that
+// need three-valued logic ("not present in JSON" ≠ "set to ''").
+func sqlNullableString(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
+// isValidSlug enforces the lowercase-letters/digits/dashes shape that
+// slugify() produces. Empty input returns false; callers should reject
+// missing-slug separately.
+func isValidSlug(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ---------- POST /v1/projects/{id}/transfer ----------
+//
+// Mirrors Convex Cloud's transfer_project (operationId on the OpenAPI spec).
+// Caller must be admin of BOTH the source team (the project's current owner)
+// AND the destination team — otherwise this would let anyone with admin on
+// any team they belong to forklift projects out of teams they have nothing
+// to do with.
+//
+// FK + cascades: projects.team_id is a plain UUID FK to teams. Deployments,
+// env vars and audit_events all hang off project_id (CASCADE / SET NULL),
+// not team_id, so the row update is the only mutation needed. Existing
+// access_tokens scoped to this project keep working — scope is project_id,
+// not team_id.
+
+type transferProjectReq struct {
+	DestinationTeamID string `json:"destinationTeamId"`
+}
+
+func (h *ProjectsHandler) transferProject(w http.ResponseWriter, r *http.Request) {
+	p, srcTeam, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can transfer projects")
+		return
+	}
+	var req transferProjectReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.DestinationTeamID = strings.TrimSpace(req.DestinationTeamID)
+	if req.DestinationTeamID == "" {
+		writeError(w, http.StatusBadRequest, "missing_destination", "destinationTeamId is required")
+		return
+	}
+	if req.DestinationTeamID == srcTeam.ID {
+		// Already there — no-op so callers that retry don't get a misleading
+		// 409. Cloud returns 204 here too.
+		writeJSON(w, http.StatusNoContent, nil)
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+
+	// Destination must exist AND the caller must be admin there. Resolve by
+	// id only (the spec uses TeamId, not slug or ref) so we don't accidentally
+	// match a team whose slug happens to collide with a UUID-shaped string.
+	var destRole string
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT m.role
+		  FROM teams t
+		  JOIN team_members m ON m.team_id = t.id
+		 WHERE t.id::text = $1 AND m.user_id = $2
+	`, req.DestinationTeamID, uid).Scan(&destRole)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Distinguish "team doesn't exist" from "team exists but you're not
+		// a member" so the operator gets a useful hint. Cheap second probe.
+		var exists bool
+		_ = h.DB.QueryRow(r.Context(),
+			`SELECT EXISTS (SELECT 1 FROM teams WHERE id::text = $1)`,
+			req.DestinationTeamID).Scan(&exists)
+		if !exists {
+			writeError(w, http.StatusNotFound, "team_not_found", "Destination team not found")
+			return
+		}
+		writeError(w, http.StatusForbidden, "forbidden", "You are not a member of the destination team")
+		return
+	}
+	if err != nil {
+		logErr("check destination team", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify destination team")
+		return
+	}
+	if destRole != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden", "You must be an admin of the destination team")
+		return
+	}
+
+	// Slug uniqueness is per-team (UNIQUE(team_id, slug)). A project with the
+	// same slug as ours could already live in the destination — surface that
+	// as a structured 409 instead of a 500 from the constraint.
+	if _, err := h.DB.Exec(r.Context(), `
+		UPDATE projects SET team_id = $1 WHERE id = $2
+	`, req.DestinationTeamID, p.ID); err != nil {
+		if synapsedb.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "slug_taken",
+				"A project with this slug already exists in the destination team")
+			return
+		}
+		logErr("transfer project", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to transfer project")
+		return
+	}
+
+	// Audit on BOTH teams — losing one is the kind of thing the operator
+	// will want to find via either side's audit log. Best-effort, so a
+	// failure on one doesn't block the other.
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     srcTeam.ID,
+		ActorID:    uid,
+		Action:     audit.ActionTransferProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"name":              p.Name,
+			"slug":              p.Slug,
+			"sourceTeamId":      srcTeam.ID,
+			"destinationTeamId": req.DestinationTeamID,
+			"direction":         "out",
+		},
+	})
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     req.DestinationTeamID,
+		ActorID:    uid,
+		Action:     audit.ActionTransferProject,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"name":              p.Name,
+			"slug":              p.Slug,
+			"sourceTeamId":      srcTeam.ID,
+			"destinationTeamId": req.DestinationTeamID,
+			"direction":         "in",
+		},
+	})
+	writeJSON(w, http.StatusNoContent, nil)
 }
 
 // ---------- POST /v1/projects/{id}/delete ----------

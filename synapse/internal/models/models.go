@@ -163,6 +163,12 @@ const (
 	TokenScopeTeam       = "team"
 	TokenScopeProject    = "project"
 	TokenScopeDeployment = "deployment"
+	// TokenScopeApp mirrors Convex Cloud's app_access_tokens family — a
+	// short-lived per-project key targeted at CI/CD preview deploys. From
+	// Synapse's authorization standpoint it behaves like a project-scoped
+	// token; the distinct label exists so the dashboard can categorise it
+	// separately ("app tokens" vs "project tokens"). v1.0+ migration 000007.
+	TokenScopeApp = "app"
 )
 
 type AccessToken struct {

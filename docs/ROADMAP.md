@@ -155,6 +155,36 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 ### ✅ Shipped this milestone
 
+- [x] **In-header deployment picker on the Convex Dashboard (Strategy E).**
+  The green-pill switcher Convex Cloud ships in its dashboard header —
+  but rendered as an overlay above the upstream iframe instead of inside
+  it. Picker lives in our Synapse Dashboard fork
+  (`dashboard/components/DeploymentPicker.tsx`); switching a deployment
+  routes to `/embed/<new-name>` which re-mounts the iframe with fresh
+  credentials via the existing postMessage handshake. Zero fork of the
+  upstream image, zero rushjs/Docker tax. Reserved
+  `GET /v1/internal/list_deployments_for_dashboard?token=...` endpoint
+  for a future in-iframe Strategy B if we ever take that path. Decision
+  log + as-built notes in
+  [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md).
+  Tests: +7 Go integration (224), +4 Playwright (38). Real-VPS smoked.
+- [x] **OpenAPI surface — 100% of self-hosted-relevant subset (v1.0).** Closes
+  the gap that brought coverage from ~70% to "everything that makes sense
+  for a self-hosted box". 12 new handlers + a structured `404
+  not_supported_in_self_hosted` middleware for the ~60 cloud-only paths
+  (billing, SSO via WorkOS, Discord/Vercel, OAuth apps, cloud backups,
+  referrals). New endpoints: `POST /v1/projects/{id}/transfer`,
+  `PUT /v1/projects/{id}` (now accepts slug), `POST /v1/teams/{ref}` (update),
+  `POST /v1/teams/{ref}/delete`, `POST /v1/teams/{ref}/update_member_role`,
+  `POST /v1/teams/{ref}/remove_member`, `PUT /v1/update_profile_name`,
+  `POST /v1/delete_account`, `GET /v1/member_data`, `GET /v1/optins`,
+  scoped access tokens (`POST/GET /v1/teams/{ref}/access_tokens`,
+  `POST/GET /v1/projects/{id}/access_tokens`,
+  `POST/GET /v1/projects/{id}/app_access_tokens`,
+  `POST/GET /v1/deployments/{name}/access_tokens`) with hierarchy-aware
+  scope enforcement at every load*ForRequest helper. Migration 000007
+  extends the access_tokens scope CHECK to allow 'app'. Tests:
+  146 → 217 Go integration cases.
 - [x] **Audit log** writer + reader (subset of cloud's vocabulary)
 - [x] **Volume snapshot backups → S3 ✅ DONE** — `setup.sh --backup --to-s3=s3://bucket/path/` uploads the tarball after the local bundle (additive — local copy is the safety net). `setup.sh --restore=s3://bucket/key.tar.gz` downloads first, then runs the existing local-archive restore flow. Uses `curl --aws-sigv4` (no aws CLI dep). Standard `AWS_*` env conventions; `SYNAPSE_BACKUP_S3_ENDPOINT` for S3-compatible (Backblaze B2, Cloudflare R2, Wasabi, MinIO). 30 new bats (23 s3.bats + 7 lifecycle.bats); 275 → 305 bats green. Real-VPS smoke pending bucket creds (PR #39).
 - [x] **Custom domains with auto-TLS ✅ DONE** — `SYNAPSE_BASE_DOMAIN=<host>` makes deployment URLs `https://<name>.<host>` instead of `<host>/d/<name>/`. Caddy on-demand TLS issues per-host certs; `/v1/internal/tls_ask` gates issuance on real, non-deleted deployments. Real-VPS smoke pending wildcard DNS setup (operator-side).
@@ -187,21 +217,27 @@ Effort scale: **S** ≈ 1 session · **M** ≈ 2-3 sessions · **L** ≈ multi-w
 
 ## Compatibility scorecard
 
-OpenAPI v1 endpoint coverage today:
+We aim for **100% of the OpenAPI subset relevant to a self-hosted box** — not
+100% of paths. Roughly 60 of the 113 cloud paths are intentionally cut
+(billing, SSO via WorkOS, Discord/Vercel, OAuth apps, cloud-managed
+backups, referrals). Those return `404 not_supported_in_self_hosted`
+with a stable code so callers can distinguish "wrong URL" from "won't
+ship". Catalogue: `synapse/internal/api/not_supported.go`.
 
 | Resource | Coverage |
 |---|---|
-| Auth | custom (no WorkOS) |
-| Profile (`/me`) | ✅ |
-| Teams | ~80% — no SSO, no billing endpoints |
-| Projects | ~70% — no preview deploy keys, no transfer |
-| Deployments | ~70% — custom domains ✅ (v1.0); no transfer, no patch |
-| Personal access tokens | ✅ create / list / delete |
+| Auth | custom (no WorkOS — OIDC tracked separately) |
+| Profile (`/me`) | ✅ get / update_profile_name / delete_account / member_data / optins |
+| Teams | ✅ get / update / delete / list_projects / list_members / list_deployments / invites / accept / update_member_role / remove_member |
+| Projects | ✅ get / update (name+slug) / delete / transfer / env vars / list_deployments |
+| Deployments | ✅ get / create / adopt / delete / auth / cli_credentials / deploy_keys / upgrade_to_ha / custom domains (v1.0) |
+| Personal access tokens | ✅ user / team / project / app / deployment scopes + scope-aware auth middleware |
 | Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |
 | Audit log | ✅ team-scoped read; admin-only |
-| Reverse proxy | ✅ `/d/{name}/*` (custom — Cloud has dedicated subdomains) |
+| Reverse proxy | ✅ `/d/{name}/*` + Host-header subdomains (custom domains v1.0) |
 | CLI compat | ✅ `cli_credentials` endpoint + signed admin keys |
-| Cloud backups | ❌ v1.0 |
+| Cloud backups | 🔧 self-hosted equivalent: `setup.sh --backup [--to-s3=...]` |
+| Billing / SSO / Discord / Vercel / OAuth apps / referrals | ⛔ intentionally cut — `404 not_supported_in_self_hosted` |
 
 The dashboard fork (when complete) covers data, functions, logs, schedules,
 files, history, and per-deployment settings — all by talking directly to the

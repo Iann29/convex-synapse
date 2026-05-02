@@ -23,10 +23,12 @@ test("create a personal access token, see it once, then delete it", async ({
   await page.getByRole("link", { name: "Account" }).click();
   await expect(page).toHaveURL(/\/me\b/);
 
-  // Open the create-token dialog from the panel header.
+  // Open the create-token dialog from the panel header. The TokensPanel
+  // component scopes the input id by token scope (`token-name-user` here)
+  // so multiple panels on a page don't collide on the id.
   await page.getByRole("button", { name: "New token" }).click();
   const dialog = page.getByRole("dialog");
-  await dialog.locator("#token-name").fill("ci-runner");
+  await dialog.locator("#token-name-user").fill("ci-runner");
   await dialog.getByRole("button", { name: "Create", exact: true }).click();
 
   // Plaintext token shows up exactly once; must be a syn_* string.

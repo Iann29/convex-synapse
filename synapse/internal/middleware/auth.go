@@ -51,10 +51,13 @@ func bearerFromHeader(r *http.Request) string {
 }
 
 func authenticate(ctx context.Context, token string, jwt *auth.JWTIssuer, db *pgxpool.Pool) (context.Context, bool) {
-	// Opaque token: prefix lookup hits a unique index.
+	// Opaque token: prefix lookup hits a unique index. We RETURN scope
+	// + scope_id alongside the user identity so scope-sensitive handlers
+	// can gate access without a second query. v1.0+ scope-aware auth.
 	if strings.HasPrefix(token, auth.TokenPrefix) {
 		hash := auth.HashToken(token)
-		var userID, email string
+		var userID, email, scope string
+		var scopeID *string
 		err := db.QueryRow(ctx, `
 			UPDATE access_tokens t
 			   SET last_used_at = now()
@@ -62,16 +65,22 @@ func authenticate(ctx context.Context, token string, jwt *auth.JWTIssuer, db *pg
 			 WHERE t.token_hash = $1
 			   AND u.id = t.user_id
 			   AND (t.expires_at IS NULL OR t.expires_at > now())
-			 RETURNING u.id, u.email
-		`, hash).Scan(&userID, &email)
+			 RETURNING u.id, u.email, t.scope, t.scope_id
+		`, hash).Scan(&userID, &email, &scope, &scopeID)
 		if err != nil {
 			return ctx, false
 		}
 		_ = pgx.Rows(nil) // keep import in case of future query helpers
-		return auth.WithUser(ctx, userID, email), true
+		sid := ""
+		if scopeID != nil {
+			sid = *scopeID
+		}
+		return auth.WithPrincipal(ctx, userID, email, scope, sid), true
 	}
 
-	// JWT path.
+	// JWT path. JWTs are always user-scoped (the dashboard refresh flow
+	// doesn't know about team/project/deployment) — pass through WithUser
+	// which is equivalent to WithPrincipal(scope="user", scopeID="").
 	claims, err := jwt.Verify(token)
 	if err != nil {
 		return ctx, false

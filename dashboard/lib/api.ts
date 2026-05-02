@@ -12,6 +12,10 @@ export type Team = {
   slug: string;
   creatorId?: string;
   createdAt?: string;
+  // defaultRegion is stored verbatim and round-tripped on update_team —
+  // Synapse self-hosted is single-region so this is informational. Cloud
+  // uses it to drive the dashboard's region picker.
+  defaultRegion?: string;
 };
 
 export type TeamMember = {
@@ -101,7 +105,11 @@ export type PendingInvite = {
 export type AccessToken = {
   id: string;
   name: string;
-  scope: "user" | "team" | "project" | "deployment";
+  // 'app' is a project-scope variant used for preview deploy keys (CI/CD).
+  // Same access surface as 'project' but listed in a separate panel so
+  // operators can categorise long-lived service tokens vs short-lived
+  // preview keys.
+  scope: "user" | "team" | "project" | "app" | "deployment";
   scopeId?: string;
   createTime: string;
   expiresAt?: string;
@@ -250,6 +258,23 @@ export const api = {
     return request<User>("/v1/me");
   },
 
+  // Profile mutations. Both endpoints are also exposed under /v1/me/...; we
+  // hit the top-level cloud-spec routes so a future drop-in replacement of
+  // the dashboard against another self-hosted Convex backend works without
+  // changing client code.
+  updateProfileName(name: string): Promise<User> {
+    return request<User>("/v1/update_profile_name", {
+      method: "PUT",
+      body: { name },
+    });
+  },
+  deleteAccount(): Promise<{ id: string; status: string }> {
+    return request<{ id: string; status: string }>("/v1/delete_account", {
+      method: "POST",
+      body: {},
+    });
+  },
+
   teams: {
     async list(): Promise<Team[]> {
       // Endpoint may return either an array or {teams: [...]}.
@@ -308,6 +333,69 @@ export const api = {
       return request<void>(
         `/v1/teams/${encodeURIComponent(ref)}/invites/${encodeURIComponent(inviteId)}/cancel`,
         { method: "POST", body: {} },
+      );
+    },
+    // POST /v1/teams/{ref} — update team name / slug / defaultRegion.
+    // All fields optional. Returns 200 with the refreshed Team.
+    update(
+      ref: string,
+      patch: { name?: string; slug?: string; defaultRegion?: string },
+    ): Promise<Team> {
+      return request<Team>(`/v1/teams/${encodeURIComponent(ref)}`, {
+        method: "POST",
+        body: patch,
+      });
+    },
+    // POST /v1/teams/{ref}/delete — admin-only, refuses 409 team_has_deployments.
+    delete(ref: string): Promise<{ id: string; status: string }> {
+      return request<{ id: string; status: string }>(
+        `/v1/teams/${encodeURIComponent(ref)}/delete`,
+        { method: "POST", body: {} },
+      );
+    },
+    // POST /v1/teams/{ref}/update_member_role — admin/member; the cloud
+    // alias 'developer' is also accepted server-side (mapped → member).
+    updateMemberRole(
+      ref: string,
+      memberId: string,
+      role: "admin" | "member" | "developer",
+    ): Promise<{ memberId: string; role: string }> {
+      return request<{ memberId: string; role: string }>(
+        `/v1/teams/${encodeURIComponent(ref)}/update_member_role`,
+        { method: "POST", body: { memberId, role } },
+      );
+    },
+    // POST /v1/teams/{ref}/remove_member — admin or self-removal.
+    removeMember(
+      ref: string,
+      memberId: string,
+    ): Promise<{ memberId: string; status: string }> {
+      return request<{ memberId: string; status: string }>(
+        `/v1/teams/${encodeURIComponent(ref)}/remove_member`,
+        { method: "POST", body: { memberId } },
+      );
+    },
+    // Team-scoped access tokens. Issued tokens carry scope=team + scope_id=<this team>.
+    listTokens(
+      ref: string,
+      opts: { cursor?: string; limit?: number } = {},
+    ): Promise<ListTokensResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListTokensResponse>(
+        `/v1/teams/${encodeURIComponent(ref)}/access_tokens${qs ? `?${qs}` : ""}`,
+      );
+    },
+    createToken(
+      ref: string,
+      name: string,
+      opts: { expiresAt?: string } = {},
+    ): Promise<CreateTokenResponse> {
+      return request<CreateTokenResponse>(
+        `/v1/teams/${encodeURIComponent(ref)}/access_tokens`,
+        { method: "POST", body: { name, ...opts } },
       );
     },
     auditLog(
@@ -383,6 +471,75 @@ export const api = {
         body: { name },
       });
     },
+    // PUT /v1/projects/{id} — accepts any subset of {name, slug}. Slug
+    // shape is enforced server-side (lowercase letters / digits / dashes);
+    // collisions return 409 slug_taken.
+    update(
+      id: string,
+      patch: { name?: string; slug?: string },
+    ): Promise<Project> {
+      return request<Project>(`/v1/projects/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: patch,
+      });
+    },
+    // POST /v1/projects/{id}/transfer — admin of source AND destination team.
+    // 204 on success; we map that to void here.
+    transfer(id: string, destinationTeamId: string): Promise<void> {
+      return request<void>(`/v1/projects/${encodeURIComponent(id)}/transfer`, {
+        method: "POST",
+        body: { destinationTeamId },
+      });
+    },
+    // Project-scoped tokens (scope=project). Issued tokens can act on this
+    // project + its deployments; team-level operations 403.
+    listTokens(
+      id: string,
+      opts: { cursor?: string; limit?: number } = {},
+    ): Promise<ListTokensResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListTokensResponse>(
+        `/v1/projects/${encodeURIComponent(id)}/access_tokens${qs ? `?${qs}` : ""}`,
+      );
+    },
+    createToken(
+      id: string,
+      name: string,
+      opts: { expiresAt?: string } = {},
+    ): Promise<CreateTokenResponse> {
+      return request<CreateTokenResponse>(
+        `/v1/projects/${encodeURIComponent(id)}/access_tokens`,
+        { method: "POST", body: { name, ...opts } },
+      );
+    },
+    // App tokens (scope=app). Same access surface as project tokens but
+    // displayed separately so operators can label "preview deploy keys"
+    // (CI/CD short-lived) apart from regular project tokens.
+    listAppTokens(
+      id: string,
+      opts: { cursor?: string; limit?: number } = {},
+    ): Promise<ListTokensResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListTokensResponse>(
+        `/v1/projects/${encodeURIComponent(id)}/app_access_tokens${qs ? `?${qs}` : ""}`,
+      );
+    },
+    createAppToken(
+      id: string,
+      name: string,
+      opts: { expiresAt?: string } = {},
+    ): Promise<CreateTokenResponse> {
+      return request<CreateTokenResponse>(
+        `/v1/projects/${encodeURIComponent(id)}/app_access_tokens`,
+        { method: "POST", body: { name, ...opts } },
+      );
+    },
     async listEnvVars(id: string): Promise<EnvVar[]> {
       const r = await request<{ configs: EnvVar[] }>(
         `/v1/projects/${encodeURIComponent(id)}/list_default_environment_variables`
@@ -401,6 +558,14 @@ export const api = {
   },
 
   deployments: {
+    // Returns the full Deployment row (projectId, type, status, etc).
+    // Used by the /embed/<name> picker to discover the project a
+    // deployment belongs to before listing its siblings.
+    get(name: string): Promise<Deployment> {
+      return request<Deployment>(
+        `/v1/deployments/${encodeURIComponent(name)}`
+      );
+    },
     // Returns deploymentUrl + adminKey for talking to the backend directly.
     // Mirrors Convex Cloud's /api/dashboard/instances/{name}/auth.
     auth(name: string): Promise<DeploymentAuth> {
@@ -420,6 +585,30 @@ export const api = {
         method: "POST",
         body: {},
       });
+    },
+    // Deployment-scoped tokens (scope=deployment). Strictest scope —
+    // bearer can only act on this exact deployment.
+    listTokens(
+      name: string,
+      opts: { cursor?: string; limit?: number } = {},
+    ): Promise<ListTokensResponse> {
+      const params = new URLSearchParams();
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const qs = params.toString();
+      return request<ListTokensResponse>(
+        `/v1/deployments/${encodeURIComponent(name)}/access_tokens${qs ? `?${qs}` : ""}`,
+      );
+    },
+    createToken(
+      name: string,
+      tokenName: string,
+      opts: { expiresAt?: string } = {},
+    ): Promise<CreateTokenResponse> {
+      return request<CreateTokenResponse>(
+        `/v1/deployments/${encodeURIComponent(name)}/access_tokens`,
+        { method: "POST", body: { name: tokenName, ...opts } },
+      );
     },
   },
 
