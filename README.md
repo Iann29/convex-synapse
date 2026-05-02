@@ -1,5 +1,6 @@
 # Synapse
 
+[![Release](https://img.shields.io/github/v/release/Iann29/convex-synapse?label=release&color=blueviolet)](https://github.com/Iann29/convex-synapse/releases/latest)
 [![CI](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
@@ -10,8 +11,11 @@
 Convex's official self-hosted backend is great — but their dashboard
 only talks to one instance via a hardcoded admin key. No teams, no
 projects, no provisioning. Synapse is the management layer that fills
-that gap: teams, projects, multi-deployment, audit log, `npx convex`
-auth, and an embedded Convex Dashboard with one-click "Open dashboard".
+that gap: teams, projects, multi-deployment, **custom domains with
+auto-TLS**, **project-level RBAC** (admin / member / viewer), S3
+backups, audit log, `npx convex` auth, and an embedded Convex
+Dashboard with an **in-iframe deployment picker** — all behind a
+one-line installer.
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh \
@@ -27,25 +31,40 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Synapse Dashboard          Next.js • teams/projects/audit  │
-│                             port 6790                       │
-└──────────────┬──────────────────────────────────────────────┘
+                  🌐 Operator's browser / npx convex
+                              │ HTTPS
+                              ▼
+            ┌───────────────────────────────────────────┐
+            │  Caddy reverse proxy                      │
+            │  • Let's Encrypt for <domain>             │
+            │  • on-demand TLS for *.<base-domain>      │
+            │  • /v1/internal/tls_ask gates issuance    │
+            └───────────────────┬───────────────────────┘
+                                │
+┌───────────────────────────────▼───────────────────────────────┐
+│  Synapse Dashboard            Next.js • teams · projects ·    │
+│                               RBAC · audit · access-tokens    │
+│                               port 6790                       │
+│                               • /embed/<name> shell with      │
+│                                 in-iframe deployment picker   │
+└──────────────┬────────────────────────────────────────────────┘
                │ REST API (OpenAPI v1 compatible)
-┌──────────────▼──────────────────────────────────────────────┐
-│  Synapse API                Go • chi • pgx • docker SDK     │
-│                             port 8080                       │
-│                             • Postgres (metadata)           │
-│                             • /d/{name}/* reverse proxy     │
-└──────────────┬──────────────────────────────────────────────┘
+┌──────────────▼────────────────────────────────────────────────┐
+│  Synapse API                  Go • chi • pgx • docker SDK     │
+│                               port 8080                       │
+│                               • Postgres (metadata)           │
+│                               • /d/{name}/* reverse proxy     │
+│                               • <name>.<base-domain> Host     │
+│                                 routing for custom domains    │
+└──────────────┬────────────────────────────────────────────────┘
                │ docker run
        ┌───────┼───────┐
        ▼       ▼       ▼
    ┌───────────────────────┐    ┌───────────────────────┐
    │ Convex backend × N    │    │ Convex Dashboard      │
-   │ (one container per    │    │ (data/functions/logs  │
-   │  deployment, ~1s spin │    │  UI, embedded under   │
-   │  up; 2× replicas in   │    │  /embed/<name>)       │
+   │ (one container per    │    │ (data / functions /   │
+   │  deployment, ~1s spin │    │  logs UI, embedded    │
+   │  up; 2× replicas in   │    │  under /embed/<name>) │
    │  HA mode)             │    │                       │
    └───────────────────────┘    └───────────────────────┘
 ```
@@ -79,6 +98,19 @@ self-tested. Validated end-to-end against a real Hetzner CPX22.
 **Tests:** 238 Go integration tests + 46 Playwright e2e + 305 bats unit
 tests, all green in CI on every push.
 
+## Releases
+
+Latest: [**v1.0.0** — "Safe to depend on"](https://github.com/Iann29/convex-synapse/releases/tag/v1.0.0)
+(2026-05-02).
+
+`./setup.sh --upgrade` queries
+[`/releases/latest`](https://github.com/Iann29/convex-synapse/releases/latest)
+to discover the target tag automatically and falls back via snapshot
+on failure. Versioning + deprecation policy lives in
+[`docs/API.md`](docs/API.md) — semver on the `/v1/...` surface,
+breaking changes bump major, error codes are stable, deprecations
+get one minor cycle of dual-shipping before removal.
+
 For roadmap, design notes, and what's deliberately out of scope, see
 [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For more screenshots,
@@ -108,7 +140,10 @@ curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh 
 
 Open `http://localhost:6790`, register, click around. Useful flags
 worth knowing: `--enable-ha`, `--doctor`, `--install-dir=`,
-`--upgrade` (v0.6.1), `--no-bootstrap` (run from a local checkout).
+`--upgrade [--ref=<tag>]`, `--backup [--to-s3=...]` /
+`--restore=<archive|s3://...>`, `--base-domain=<host>` (for
+wildcard custom-domain mode), `--no-bootstrap` (run from a local
+checkout).
 
 ### Manual install (inspect first)
 
