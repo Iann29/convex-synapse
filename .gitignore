@@ -53,3 +53,6 @@ synapse/bin/
 # Local installer scratch (rendered .env, install logs)
 /synapse-install.log
 /install.log
+
+# Playwright artefacts (root-level when running tests from CWD other than dashboard/)
+test-results/
