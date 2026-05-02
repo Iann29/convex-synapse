@@ -11,17 +11,91 @@ import {
   ApiError,
   api,
   type AccessToken,
+  type CreateTokenResponse,
   type ListTokensResponse,
 } from "@/lib/api";
 
-// Personal access tokens panel for /me. Tokens authenticate the CLI / CI
-// against Synapse without going through /v1/auth/login. The plaintext is
-// shown ONCE on creation — server stores only a SHA-256 hash and can't
-// surface it again.
-export function TokensPanel() {
+// TokensPanel renders the create/list/delete UI for personal access tokens
+// at any of the four cloud-spec scopes. Default (no props) is the legacy
+// user-scoped behavior — same UI we shipped on /me before scoped tokens
+// landed.
+//
+// scope="team"|"project"|"app"|"deployment" picks the resource-specific
+// endpoint via the `target` prop, which carries the URL identifier
+// (team slug, project id, deployment name). Issued tokens inherit the
+// scope automatically server-side.
+//
+// Why one component for all five scopes:
+//   - The shape of "create form, issued-token reveal, list, delete row"
+//     is identical regardless of scope.
+//   - Dropping in a fresh component per scope diverges quickly (typo'd
+//     toast string in one, missing aria-label in another).
+//   - Tests can stay on stable test ids — `token-row-<name>`, `issued-token` —
+//     across every page the panel renders.
+//
+// Delete still goes through /v1/delete_personal_access_token because
+// access tokens carry the same DELETE surface regardless of scope (the
+// row's user_id is the gate). One endpoint, one handler.
+
+export type TokenScope = "user" | "team" | "project" | "app" | "deployment";
+
+type Props =
+  | {
+      scope?: "user";
+      target?: undefined;
+      heading?: string;
+      description?: string;
+    }
+  | {
+      scope: "team" | "project" | "app" | "deployment";
+      target: string;
+      heading?: string;
+      description?: string;
+    };
+
+const HEADINGS: Record<TokenScope, string> = {
+  user: "Personal access tokens",
+  team: "Team access tokens",
+  project: "Project access tokens",
+  app: "App tokens (preview deploy keys)",
+  deployment: "Deployment access tokens",
+};
+
+const DESCRIPTIONS: Record<TokenScope, string> = {
+  user: "Use these for CLI / CI / programmatic access. Tokens carry your full account permissions.",
+  team: "Tokens scoped to this team — bearer can act on this team's projects and deployments only.",
+  project: "Tokens scoped to this project. Bearer can act on this project's deployments only.",
+  app: "Short-lived tokens for CI/CD preview deploys. Same access surface as project tokens; categorised separately for clarity.",
+  deployment: "Tokens scoped to this deployment only. The strictest scope.",
+};
+
+export function TokensPanel(props: Props = { scope: "user" }) {
+  const scope = props.scope ?? "user";
+  const target = "target" in props ? props.target : undefined;
+
+  // Cache key is unique per (scope, target) so multiple panels on a page
+  // don't share state.
+  const swrKey =
+    scope === "user" ? "/tokens" : `/tokens/${scope}/${target}`;
+
+  const list = (): Promise<ListTokensResponse> => {
+    if (scope === "user") return api.tokens.list();
+    if (scope === "team") return api.teams.listTokens(target!);
+    if (scope === "project") return api.projects.listTokens(target!);
+    if (scope === "app") return api.projects.listAppTokens(target!);
+    return api.deployments.listTokens(target!);
+  };
+  const create = (name: string): Promise<CreateTokenResponse> => {
+    if (scope === "user") return api.tokens.create(name);
+    if (scope === "team") return api.teams.createToken(target!, name);
+    if (scope === "project") return api.projects.createToken(target!, name);
+    if (scope === "app") return api.projects.createAppToken(target!, name);
+    return api.deployments.createToken(target!, name);
+  };
+
   const { data, error, isLoading, mutate } = useSWR<ListTokensResponse>(
-    "/tokens",
-    () => api.tokens.list(),
+    swrKey,
+    list,
   );
 
   const [open, setOpen] = useState(false);
@@ -40,13 +114,13 @@ export function TokensPanel() {
     setIssued(null);
   };
 
-  const create = async (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
     if (!name.trim()) return;
     setPending(true);
     try {
-      const res = await api.tokens.create(name.trim());
+      const res = await create(name.trim());
       setIssued({ name: res.accessToken.name, token: res.token });
       setName("");
       await mutate();
@@ -58,8 +132,6 @@ export function TokensPanel() {
   };
 
   const remove = async (token: AccessToken) => {
-    // Native confirm is fine for a destructive op on a single row;
-    // matches the pattern used elsewhere (project delete).
     if (
       typeof window !== "undefined" &&
       !window.confirm(`Delete token "${token.name}"? This can't be undone.`)
@@ -76,19 +148,28 @@ export function TokensPanel() {
     }
   };
 
+  const heading = props.heading ?? HEADINGS[scope];
+  const description = props.description ?? DESCRIPTIONS[scope];
+  const headingId = `tokens-heading-${scope}-${target ?? "self"}`;
+
   return (
-    <section className="space-y-3" aria-labelledby="tokens-heading">
+    <section className="space-y-3" aria-labelledby={headingId}>
       <div className="flex items-center justify-between">
         <div>
-          <h2 id="tokens-heading" className="text-sm font-semibold text-neutral-200">
-            Personal access tokens
+          <h2
+            id={headingId}
+            className="text-sm font-semibold text-neutral-200"
+          >
+            {heading}
           </h2>
-          <p className="text-xs text-neutral-500">
-            Use these for CLI / CI / programmatic access. Tokens carry your
-            full account permissions.
-          </p>
+          <p className="text-xs text-neutral-500">{description}</p>
         </div>
-        <Button onClick={() => setOpen(true)}>New token</Button>
+        <Button
+          onClick={() => setOpen(true)}
+          data-testid={`tokens-new-${scope}`}
+        >
+          New token
+        </Button>
       </div>
 
       {isLoading && (
@@ -153,16 +234,19 @@ export function TokensPanel() {
       <Dialog
         open={open}
         onClose={closeDialog}
-        title={issued ? "Token created" : "New personal access token"}
+        title={issued ? "Token created" : `New ${scope} access token`}
       >
         {!issued && (
-          <form onSubmit={create} className="space-y-4">
+          <form onSubmit={submit} className="space-y-4">
             <div className="space-y-2">
-              <label htmlFor="token-name" className="block text-xs text-neutral-400">
+              <label
+                htmlFor={`token-name-${scope}`}
+                className="block text-xs text-neutral-400"
+              >
                 Name
               </label>
               <Input
-                id="token-name"
+                id={`token-name-${scope}`}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="ci-runner"
@@ -184,7 +268,11 @@ export function TokensPanel() {
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={pending || !name.trim()}>
+              <Button
+                type="submit"
+                disabled={pending || !name.trim()}
+                data-testid={`tokens-create-${scope}`}
+              >
                 {pending ? "Creating..." : "Create"}
               </Button>
             </div>
