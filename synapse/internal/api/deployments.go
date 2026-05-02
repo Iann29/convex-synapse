@@ -47,6 +47,12 @@ type Provisioner interface {
 type DeploymentsHandler struct {
 	DB                    *pgxpool.Pool
 	Docker                Provisioner
+	// Tokens is wired by router.go so deployment-scoped access-token
+	// endpoints under /v1/deployments/{name}/access_tokens can reuse the
+	// AccessTokensHandler insert/list path. Optional: a nil value 500s the
+	// scoped-token routes (we never ship a router without it, so this is
+	// strictly defensive).
+	Tokens *AccessTokensHandler
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
@@ -131,8 +137,63 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Get("/cli_credentials", h.deploymentCLICredentials)
 		r.Post("/create_deploy_key", h.createDeployKey)
 		r.Post("/upgrade_to_ha", h.upgradeToHA)
+		// Scoped access tokens (v1.0+). Created tokens carry
+		// scope=deployment + scope_id=<this deployment>; the auth
+		// middleware enforces the scope at every subsequent request.
+		r.Post("/access_tokens", h.createDeploymentAccessToken)
+		r.Get("/access_tokens", h.listDeploymentAccessTokens)
 	})
 	return r
+}
+
+// ---------- POST /v1/deployments/{name}/access_tokens ----------
+
+func (h *DeploymentsHandler) createDeploymentAccessToken(w http.ResponseWriter, r *http.Request) {
+	d, _, _, role, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only team admins can create deployment access tokens")
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	var req createScopedTokenReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, plain, ok := h.Tokens.createForOwner(w, r, uid, req.Name, models.TokenScopeDeployment, d.ID, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusCreated, createTokenResp{Token: plain, AccessToken: view})
+}
+
+func (h *DeploymentsHandler) listDeploymentAccessTokens(w http.ResponseWriter, r *http.Request) {
+	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	limit, ok := parseTokenListLimit(w, r)
+	if !ok {
+		return
+	}
+	resp, ok := h.Tokens.listForOwner(w, r, uid, models.TokenScopeDeployment, d.ID, limit, r.URL.Query().Get("cursor"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // MountProjectScopedRoutes adds POST /v1/projects/{id}/create_deployment to
@@ -180,6 +241,9 @@ func (h *DeploymentsHandler) loadDeploymentForRequest(w http.ResponseWriter, r *
 	if err != nil {
 		logErr("check membership", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify access")
+		return nil, nil, nil, "", false
+	}
+	if !enforceDeploymentAccess(w, r.Context(), d.ID, p.ID, t.ID) {
 		return nil, nil, nil, "", false
 	}
 	return d, p, t, role, true

@@ -25,6 +25,7 @@ import (
 type ProjectsHandler struct {
 	DB          *pgxpool.Pool
 	Deployments *DeploymentsHandler
+	Tokens      *AccessTokensHandler
 }
 
 func (h *ProjectsHandler) Routes() chi.Router {
@@ -38,6 +39,15 @@ func (h *ProjectsHandler) Routes() chi.Router {
 		r.Get("/list_deployments", h.listDeployments)
 		r.Get("/list_default_environment_variables", h.listEnvVars)
 		r.Post("/update_default_environment_variables", h.updateEnvVars)
+		// Scoped access tokens (v1.0+). Project-scoped tokens carry
+		// scope=project; the cloud-spec separates "app" tokens
+		// (preview-deploy keys) from regular project tokens — we expose
+		// both endpoints, scope-tagged differently so the dashboard can
+		// render two lists.
+		r.Post("/access_tokens", h.createProjectAccessToken)
+		r.Get("/access_tokens", h.listProjectAccessTokens)
+		r.Post("/app_access_tokens", h.createAppAccessToken)
+		r.Get("/app_access_tokens", h.listAppAccessTokens)
 		if h.Deployments != nil {
 			h.Deployments.MountProjectScopedRoutes(r)
 		}
@@ -89,6 +99,9 @@ func (h *ProjectsHandler) loadProjectForRequest(w http.ResponseWriter, r *http.R
 	if err != nil {
 		logErr("check membership", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify access")
+		return nil, nil, "", false
+	}
+	if !enforceProjectAccess(w, r.Context(), p.ID, t.ID) {
 		return nil, nil, "", false
 	}
 	return &p, &t, role, true
@@ -231,6 +244,77 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 		},
 	})
 	writeJSON(w, http.StatusOK, p)
+}
+
+// ---------- POST /v1/projects/{id}/access_tokens ----------
+//
+// Project-scoped tokens (and the "app" variant below) require team-admin
+// role to create. The created token's scope_id is the project id; the
+// auth middleware's load*ForRequest helpers verify that the bearer can
+// actually reach the project at request time.
+
+func (h *ProjectsHandler) createProjectAccessToken(w http.ResponseWriter, r *http.Request) {
+	h.createProjectScopedToken(w, r, models.TokenScopeProject)
+}
+
+func (h *ProjectsHandler) createAppAccessToken(w http.ResponseWriter, r *http.Request) {
+	h.createProjectScopedToken(w, r, models.TokenScopeApp)
+}
+
+func (h *ProjectsHandler) createProjectScopedToken(w http.ResponseWriter, r *http.Request, scope string) {
+	p, _, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only team admins can create project access tokens")
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	var req createScopedTokenReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, plain, ok := h.Tokens.createForOwner(w, r, uid, req.Name, scope, p.ID, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusCreated, createTokenResp{Token: plain, AccessToken: view})
+}
+
+func (h *ProjectsHandler) listProjectAccessTokens(w http.ResponseWriter, r *http.Request) {
+	h.listProjectScopedTokens(w, r, models.TokenScopeProject)
+}
+
+func (h *ProjectsHandler) listAppAccessTokens(w http.ResponseWriter, r *http.Request) {
+	h.listProjectScopedTokens(w, r, models.TokenScopeApp)
+}
+
+func (h *ProjectsHandler) listProjectScopedTokens(w http.ResponseWriter, r *http.Request, scope string) {
+	p, _, _, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	limit, ok := parseTokenListLimit(w, r)
+	if !ok {
+		return
+	}
+	resp, ok := h.Tokens.listForOwner(w, r, uid, scope, p.ID, limit, r.URL.Query().Get("cursor"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // sqlNullableString turns a *string into the value pgx will treat as NULL

@@ -28,6 +28,7 @@ import (
 type TeamsHandler struct {
 	DB          *pgxpool.Pool
 	Deployments *DeploymentsHandler
+	Tokens      *AccessTokensHandler
 }
 
 func (h *TeamsHandler) Routes() chi.Router {
@@ -54,6 +55,10 @@ func (h *TeamsHandler) Routes() chi.Router {
 		r.Get("/invites", h.listInvites)
 		r.Post("/invites/{inviteID}/cancel", h.cancelInvite)
 		r.Get("/audit_log", h.listAuditLog)
+		// Scoped access tokens (v1.0+) — caller has team admin role and
+		// the token they're issuing inherits scope=team + scopeId=<this team>.
+		r.Post("/access_tokens", h.createTeamAccessToken)
+		r.Get("/access_tokens", h.listTeamAccessTokens)
 	})
 
 	return r
@@ -306,6 +311,12 @@ func (h *TeamsHandler) loadTeamForRequest(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		logErr("assert member", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to check membership")
+		return nil, "", false
+	}
+	// Token-scope gate (v1.0+): if the caller is using a scoped PAT,
+	// enforce that the scope can actually reach this team. JWT-auth
+	// callers and `user`-scoped PATs bypass.
+	if !enforceTeamAccess(w, r.Context(), t.ID) {
 		return nil, "", false
 	}
 	return t, role, true
@@ -633,6 +644,66 @@ func (h *TeamsHandler) updateMemberRole(w http.ResponseWriter, r *http.Request) 
 		"memberId": req.MemberID,
 		"role":     storedRole,
 	})
+}
+
+// ---------- POST /v1/teams/{teamRef}/access_tokens ----------
+//
+// Mirrors the Cloud's `/v1/teams/{team_id}/access_tokens` family. The
+// created token inherits scope=team + scope_id=<this team>; admin-only
+// to mirror invite/role-management gates. Body shape is the same
+// `{ name, expiresAt? }` as the personal-tokens endpoint.
+
+type createScopedTokenReq struct {
+	Name      string     `json:"name"`
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+}
+
+func (h *TeamsHandler) createTeamAccessToken(w http.ResponseWriter, r *http.Request) {
+	t, role, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if role != models.RoleAdmin {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only team admins can create team access tokens")
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	var req createScopedTokenReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, plain, ok := h.Tokens.createForOwner(w, r, uid, req.Name, models.TokenScopeTeam, t.ID, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusCreated, createTokenResp{Token: plain, AccessToken: view})
+}
+
+func (h *TeamsHandler) listTeamAccessTokens(w http.ResponseWriter, r *http.Request) {
+	t, _, ok := h.loadTeamForRequest(w, r)
+	if !ok {
+		return
+	}
+	if h.Tokens == nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Tokens handler not wired")
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	limit, ok := parseTokenListLimit(w, r)
+	if !ok {
+		return
+	}
+	resp, ok := h.Tokens.listForOwner(w, r, uid, models.TokenScopeTeam, t.ID, limit, r.URL.Query().Get("cursor"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // normaliseRole maps the Cloud vocabulary (admin/developer) to Synapse's

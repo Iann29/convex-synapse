@@ -84,27 +84,17 @@ func (h *AccessTokensHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "missing_name", "Token name is required")
-		return
-	}
-	if len(req.Name) > 100 {
-		writeError(w, http.StatusBadRequest, "invalid_name", "Token name is too long (max 100 chars)")
-		return
-	}
 	scope := req.Scope
 	if scope == "" {
 		scope = models.TokenScopeUser
 	}
 	switch scope {
-	case models.TokenScopeUser, models.TokenScopeTeam, models.TokenScopeProject, models.TokenScopeDeployment:
+	case models.TokenScopeUser, models.TokenScopeTeam, models.TokenScopeProject, models.TokenScopeDeployment, models.TokenScopeApp:
 		// ok
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_scope", "Scope must be one of: user, team, project, deployment")
+		writeError(w, http.StatusBadRequest, "invalid_scope", "Scope must be one of: user, team, project, deployment, app")
 		return
 	}
-	// Non-user scopes need a target id.
 	if scope != models.TokenScopeUser && req.ScopeID == "" {
 		writeError(w, http.StatusBadRequest, "missing_scope_id", "scopeId is required when scope is not 'user'")
 		return
@@ -115,54 +105,81 @@ func (h *AccessTokensHandler) create(w http.ResponseWriter, r *http.Request) {
 		// deleted later.
 		req.ScopeID = ""
 	}
-	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
-		writeError(w, http.StatusBadRequest, "invalid_expires_at", "expiresAt must be in the future")
+	view, plain, ok := h.createForOwner(w, r, uid, req.Name, scope, req.ScopeID, req.ExpiresAt)
+	if !ok {
 		return
+	}
+	writeJSON(w, http.StatusCreated, createTokenResp{
+		Token:       plain,
+		AccessToken: view,
+	})
+}
+
+// createForOwner is the shared insert path for personal AND scoped
+// access tokens. Returns the populated view + plaintext token, or ok=false
+// after writing the appropriate 4xx/5xx. Reused by the scope-specific
+// endpoints under /v1/teams/{ref}/access_tokens etc.
+func (h *AccessTokensHandler) createForOwner(
+	w http.ResponseWriter, r *http.Request,
+	ownerID, name, scope, scopeID string, expiresAt *time.Time,
+) (accessTokenView, string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "missing_name", "Token name is required")
+		return accessTokenView{}, "", false
+	}
+	if len(name) > 100 {
+		writeError(w, http.StatusBadRequest, "invalid_name", "Token name is too long (max 100 chars)")
+		return accessTokenView{}, "", false
+	}
+	if expiresAt != nil && !expiresAt.After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "invalid_expires_at", "expiresAt must be in the future")
+		return accessTokenView{}, "", false
 	}
 
 	plain, hash, err := auth.GenerateToken()
 	if err != nil {
 		logErr("generate token", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate token")
-		return
+		return accessTokenView{}, "", false
 	}
 
 	var view accessTokenView
-	var scopeID *string
-	if req.ScopeID != "" {
-		scopeID = &req.ScopeID
+	var scopeIDPtr *string
+	if scopeID != "" {
+		scopeIDPtr = &scopeID
 	}
 	var dbScopeID *string
 	err = h.DB.QueryRow(r.Context(), `
 		INSERT INTO access_tokens (user_id, name, token_hash, scope, scope_id, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, name, scope, scope_id, created_at, expires_at, last_used_at
-	`, uid, req.Name, hash, scope, scopeID, req.ExpiresAt).Scan(
+	`, ownerID, name, hash, scope, scopeIDPtr, expiresAt).Scan(
 		&view.ID, &view.Name, &view.Scope, &dbScopeID, &view.CreateTime, &view.ExpiresAt, &view.LastUsedAt,
 	)
 	if err != nil {
 		logErr("insert access token", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create token")
-		return
+		return accessTokenView{}, "", false
 	}
 	if dbScopeID != nil {
 		view.ScopeID = *dbScopeID
 	}
 
-	// PATs are user-scoped, not team-scoped — TeamID stays empty so the row
-	// shows up in the per-account audit feed (when we expose one), not under
-	// any individual team.
+	// PATs are user-scoped audit-trail-wise — TeamID stays empty so the row
+	// shows up in the per-account audit feed, not under any individual team.
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
-		ActorID:    uid,
+		ActorID:    ownerID,
 		Action:     audit.ActionCreatePersonalAccessToken,
 		TargetType: audit.TargetAccessToken,
 		TargetID:   view.ID,
-		Metadata:   map[string]any{"name": view.Name, "scope": view.Scope},
+		Metadata: map[string]any{
+			"name":    view.Name,
+			"scope":   view.Scope,
+			"scopeId": view.ScopeID,
+		},
 	})
-	writeJSON(w, http.StatusCreated, createTokenResp{
-		Token:       plain,
-		AccessToken: view,
-	})
+	return view, plain, true
 }
 
 // ---------- GET /v1/list_personal_access_tokens ----------
@@ -178,65 +195,95 @@ func (h *AccessTokensHandler) list(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Not authenticated")
 		return
 	}
+	limit, ok := parseTokenListLimit(w, r)
+	if !ok {
+		return
+	}
+	resp, ok := h.listForOwner(w, r, uid, "", "", limit, r.URL.Query().Get("cursor"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
-	// Pagination: ordered by (created_at DESC, id DESC) for stable cursoring.
-	// The cursor is the last seen id from the previous page; we then ask for
-	// rows whose (created_at, id) is strictly less than the cursor row's
-	// values. A simpler approach (offset) would drift if rows are inserted
-	// during paging, so we use keyset paging instead.
+// parseTokenListLimit reads the optional `limit` query param. Defaults
+// to 50, capped at 200. Validates negative/zero/non-numeric inputs.
+func parseTokenListLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	limit := 50
-	if s := r.URL.Query().Get("limit"); s != "" {
-		n, err := strconv.Atoi(s)
-		if err != nil || n <= 0 {
-			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be a positive integer")
-			return
-		}
-		if n > 200 {
-			n = 200
-		}
-		limit = n
+	s := r.URL.Query().Get("limit")
+	if s == "" {
+		return limit, true
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be a positive integer")
+		return 0, false
+	}
+	if n > 200 {
+		n = 200
+	}
+	return n, true
+}
+
+// listForOwner is the shared listing path. When scopeFilter is empty
+// it returns ALL the user's tokens (the personal-tokens endpoint);
+// otherwise it filters to the specific scope+scopeID.
+//
+// Why filter by user_id even on scope-listings: showing other admins'
+// tokens leaks their lifecycle timestamps. Operators who need a
+// team-wide audit can hit the audit_log endpoint where token creates/
+// deletes already record actor_id + scope.
+func (h *AccessTokensHandler) listForOwner(
+	w http.ResponseWriter, r *http.Request,
+	ownerID, scopeFilter, scopeIDFilter string, limit int, cursor string,
+) (listTokensResp, bool) {
+	args := []any{ownerID}
+	where := "user_id = $1"
+	if scopeFilter != "" {
+		where += " AND scope = $2 AND scope_id::text = $3"
+		args = append(args, scopeFilter, scopeIDFilter)
 	}
 
 	var rows pgx.Rows
-	cursor := r.URL.Query().Get("cursor")
+	var err error
 	if cursor == "" {
-		rows, err = h.DB.Query(r.Context(), `
-			SELECT id, name, scope, scope_id, created_at, expires_at, last_used_at
-			  FROM access_tokens
-			 WHERE user_id = $1
-			 ORDER BY created_at DESC, id DESC
-			 LIMIT $2
-		`, uid, limit+1)
+		rows, err = h.DB.Query(r.Context(),
+			`SELECT id, name, scope, scope_id, created_at, expires_at, last_used_at
+			   FROM access_tokens
+			  WHERE `+where+`
+			  ORDER BY created_at DESC, id DESC
+			  LIMIT $`+itoa(len(args)+1),
+			append(args, limit+1)...,
+		)
 	} else {
-		// Resolve cursor → (created_at, id) of that row; reject if it doesn't
-		// belong to the caller (avoids leaking other users' token timestamps
-		// via timing differences).
 		var cursorAt time.Time
 		err = h.DB.QueryRow(r.Context(),
 			`SELECT created_at FROM access_tokens WHERE id = $1 AND user_id = $2`,
-			cursor, uid).Scan(&cursorAt)
+			cursor, ownerID).Scan(&cursorAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusBadRequest, "invalid_cursor", "Cursor does not refer to a token you own")
-			return
+			return listTokensResp{}, false
 		}
 		if err != nil {
 			logErr("resolve cursor", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to resolve cursor")
-			return
+			return listTokensResp{}, false
 		}
-		rows, err = h.DB.Query(r.Context(), `
-			SELECT id, name, scope, scope_id, created_at, expires_at, last_used_at
-			  FROM access_tokens
-			 WHERE user_id = $1
-			   AND (created_at, id) < ($2, $3)
-			 ORDER BY created_at DESC, id DESC
-			 LIMIT $4
-		`, uid, cursorAt, cursor, limit+1)
+		args = append(args, cursorAt, cursor, limit+1)
+		rows, err = h.DB.Query(r.Context(),
+			`SELECT id, name, scope, scope_id, created_at, expires_at, last_used_at
+			   FROM access_tokens
+			  WHERE `+where+`
+			    AND (created_at, id) < ($`+itoa(len(args)-2)+`, $`+itoa(len(args)-1)+`)
+			  ORDER BY created_at DESC, id DESC
+			  LIMIT $`+itoa(len(args)),
+			args...,
+		)
 	}
 	if err != nil {
 		logErr("list access tokens", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to list tokens")
-		return
+		return listTokensResp{}, false
 	}
 	defer rows.Close()
 
@@ -247,7 +294,7 @@ func (h *AccessTokensHandler) list(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&v.ID, &v.Name, &v.Scope, &scopeID, &v.CreateTime, &v.ExpiresAt, &v.LastUsedAt); err != nil {
 			logErr("scan access token", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to read tokens")
-			return
+			return listTokensResp{}, false
 		}
 		if scopeID != nil {
 			v.ScopeID = *scopeID
@@ -257,17 +304,16 @@ func (h *AccessTokensHandler) list(w http.ResponseWriter, r *http.Request) {
 	if err := rows.Err(); err != nil {
 		logErr("iterate access tokens", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to read tokens")
-		return
+		return listTokensResp{}, false
 	}
-
-	// Trim the sentinel row used to detect "more pages exist".
 	resp := listTokensResp{Items: items}
 	if len(items) > limit {
 		resp.Items = items[:limit]
 		resp.NextCursor = items[limit-1].ID
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp, true
 }
+
 
 // ---------- POST /v1/delete_personal_access_token ----------
 

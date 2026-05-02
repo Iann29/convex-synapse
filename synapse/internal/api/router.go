@@ -103,6 +103,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	deploymentsH := &DeploymentsHandler{
 		DB:                    d.DB,
 		Docker:                d.Docker,
+		Tokens:                tokensH,
 		PortRangeMin:          d.PortRangeMin,
 		PortRangeMax:          d.PortRangeMax,
 		HealthcheckViaNetwork: d.HealthcheckViaNetwork,
@@ -116,8 +117,9 @@ func NewRouter(d RouterDeps) http.Handler {
 	// listDeployments handlers can call publicDeploymentURL — same
 	// rewrite as /auth and /cli_credentials so dashboards and CLIs see
 	// public URLs instead of the loopback "http://127.0.0.1:<port>".
-	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH}
-	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH}
+	// Tokens enables scope-aware access-token CRUD under /access_tokens.
+	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
+	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
