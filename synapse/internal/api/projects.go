@@ -105,9 +105,23 @@ func (h *ProjectsHandler) getProject(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------- PUT /v1/projects/{id} ----------
+//
+// Mirrors Convex Cloud's update_project. Both `name` and `slug` are
+// optional (UpdateProjectArgs in the OpenAPI spec). The cloud spec
+// returns 204 No Content; we return 200 + the updated project for
+// dashboard convenience — a no-op no-args call is therefore a cheap
+// "echo back the current state".
+//
+// Slug uniqueness is per-team (UNIQUE(team_id, slug)). The
+// SELECT-then-UPDATE shape races concurrent renames; we lean on the
+// constraint and surface its violation as a structured 409 slug_taken.
+// We don't auto-pick a free slug here — a user-supplied slug is
+// authoritative; mangling it silently ("blog" → "blog-1") would
+// surprise the operator.
 
 type updateProjectReq struct {
 	Name *string `json:"name,omitempty"`
+	Slug *string `json:"slug,omitempty"`
 }
 
 func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) {
@@ -124,36 +138,129 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	renamed := false
+
 	oldName := p.Name
+	oldSlug := p.Slug
+	var newName, newSlug *string
+
 	if req.Name != nil {
-		newName := strings.TrimSpace(*req.Name)
-		if newName == "" {
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
 			writeError(w, http.StatusBadRequest, "missing_name", "Project name is required")
 			return
 		}
-		_, err := h.DB.Exec(r.Context(),
-			`UPDATE projects SET name = $1 WHERE id = $2`, newName, p.ID)
-		if err != nil {
-			logErr("update project", err)
-			writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
+		newName = &trimmed
+	}
+	if req.Slug != nil {
+		trimmed := strings.TrimSpace(*req.Slug)
+		if trimmed == "" {
+			writeError(w, http.StatusBadRequest, "missing_slug", "Project slug is required")
 			return
 		}
-		renamed = newName != oldName
-		p.Name = newName
+		// Cloud's slug shape: lowercase letters, digits, dashes. Be liberal
+		// and accept what slugify() would produce so callers can pre-render
+		// before sending. Reject anything else loudly.
+		if !isValidSlug(trimmed) {
+			writeError(w, http.StatusBadRequest, "invalid_slug",
+				"slug must contain only lowercase letters, digits, and dashes")
+			return
+		}
+		newSlug = &trimmed
 	}
-	if renamed {
-		uid, _ := auth.UserID(r.Context())
-		_ = audit.Record(r.Context(), h.DB, audit.Options{
-			TeamID:     t.ID,
-			ActorID:    uid,
-			Action:     audit.ActionRenameProject,
-			TargetType: audit.TargetProject,
-			TargetID:   p.ID,
-			Metadata:   map[string]any{"oldName": oldName, "newName": p.Name},
-		})
+
+	if newName == nil && newSlug == nil {
+		// No-op call (Cloud allows empty body). Return the current state so
+		// callers can use this endpoint as a "fetch then echo" probe.
+		writeJSON(w, http.StatusOK, p)
+		return
 	}
+
+	// Build a single UPDATE that touches only the supplied fields. Either
+	// COALESCE (with NULL meaning "keep existing") or a small builder works;
+	// COALESCE keeps the SQL stable and the parameter shape predictable.
+	tag, err := h.DB.Exec(r.Context(), `
+		UPDATE projects
+		   SET name = COALESCE($1, name),
+		       slug = COALESCE($2, slug)
+		 WHERE id = $3
+	`, sqlNullableString(newName), sqlNullableString(newSlug), p.ID)
+	if err != nil {
+		if synapsedb.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "slug_taken",
+				"A project with this slug already exists in the team")
+			return
+		}
+		logErr("update project", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to update project")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Should not happen — loadProjectForRequest already proved the row
+		// exists. Defensive: surface as 404 rather than a confusing 200 with
+		// stale state.
+		writeError(w, http.StatusNotFound, "project_not_found", "Project not found")
+		return
+	}
+
+	if newName != nil {
+		p.Name = *newName
+	}
+	if newSlug != nil {
+		p.Slug = *newSlug
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	// Keep the legacy renameProject action when the change is name-only —
+	// existing audit-log dashboards/queries already filter on that string.
+	// Slug-touching updates use the more general updateProject vocabulary.
+	action := audit.ActionUpdateProject
+	if newSlug == nil && newName != nil {
+		action = audit.ActionRenameProject
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     action,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"oldName": oldName,
+			"newName": p.Name,
+			"oldSlug": oldSlug,
+			"newSlug": p.Slug,
+		},
+	})
 	writeJSON(w, http.StatusOK, p)
+}
+
+// sqlNullableString turns a *string into the value pgx will treat as NULL
+// when nil. Helper kept private — only used by COALESCE-style updates that
+// need three-valued logic ("not present in JSON" ≠ "set to ''").
+func sqlNullableString(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
+// isValidSlug enforces the lowercase-letters/digits/dashes shape that
+// slugify() produces. Empty input returns false; callers should reject
+// missing-slug separately.
+func isValidSlug(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ---------- POST /v1/projects/{id}/transfer ----------

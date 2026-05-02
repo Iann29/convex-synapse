@@ -134,6 +134,79 @@ func TestProjects_UpdateMissingName(t *testing.T) {
 	}
 }
 
+func TestProjects_UpdateSlugOnly(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Slug Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Original")
+
+	var updated projectResp
+	h.DoJSON(http.MethodPut, "/v1/projects/"+proj.ID, owner.AccessToken,
+		map[string]any{"slug": "renamed-slug"}, http.StatusOK, &updated)
+	if updated.Slug != "renamed-slug" {
+		t.Errorf("slug=%q want renamed-slug", updated.Slug)
+	}
+	if updated.Name != "Original" {
+		t.Errorf("name unexpectedly changed: %q", updated.Name)
+	}
+}
+
+func TestProjects_UpdateNameAndSlug(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Both Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Old")
+
+	var updated projectResp
+	h.DoJSON(http.MethodPut, "/v1/projects/"+proj.ID, owner.AccessToken,
+		map[string]any{"name": "New Name", "slug": "new-slug"},
+		http.StatusOK, &updated)
+	if updated.Name != "New Name" || updated.Slug != "new-slug" {
+		t.Errorf("got name=%q slug=%q", updated.Name, updated.Slug)
+	}
+}
+
+func TestProjects_UpdateInvalidSlug(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Bad Slug Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "X")
+
+	env := h.AssertStatus(http.MethodPut, "/v1/projects/"+proj.ID, owner.AccessToken,
+		map[string]any{"slug": "Has Spaces"}, http.StatusBadRequest)
+	if env.Code != "invalid_slug" {
+		t.Errorf("code=%q want invalid_slug", env.Code)
+	}
+}
+
+func TestProjects_UpdateSlugConflict(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Conf Co")
+	first := createProject(t, h, owner.AccessToken, team.Slug, "First")
+	second := createProject(t, h, owner.AccessToken, team.Slug, "Second")
+
+	env := h.AssertStatus(http.MethodPut, "/v1/projects/"+second.ID, owner.AccessToken,
+		map[string]any{"slug": first.Slug}, http.StatusConflict)
+	if env.Code != "slug_taken" {
+		t.Errorf("code=%q want slug_taken", env.Code)
+	}
+}
+
+func TestProjects_UpdateEmptyBodyNoOp(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "NoOp Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Same")
+
+	var got projectResp
+	h.DoJSON(http.MethodPut, "/v1/projects/"+proj.ID, owner.AccessToken,
+		map[string]any{}, http.StatusOK, &got)
+	if got.Name != "Same" || got.Slug != proj.Slug {
+		t.Errorf("expected unchanged project, got %+v", got)
+	}
+}
+
 func TestProjects_DeleteCascadesEnvVars(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()
