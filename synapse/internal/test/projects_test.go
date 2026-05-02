@@ -303,6 +303,140 @@ func TestProjects_EnvVarsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProjects_Transfer_HappyPath(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	src := createTeam(t, h, owner.AccessToken, "Source Co")
+	dst := createTeam(t, h, owner.AccessToken, "Dest Co")
+	proj := createProject(t, h, owner.AccessToken, src.Slug, "Movable")
+
+	// Transfer succeeds; status 204 + empty body.
+	resp := h.Do(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer", owner.AccessToken,
+		map[string]string{"destinationTeamId": dst.ID})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// GET reflects the new team_id.
+	var got projectResp
+	h.DoJSON(http.MethodGet, "/v1/projects/"+proj.ID, owner.AccessToken, nil, http.StatusOK, &got)
+	if got.TeamID != dst.ID {
+		t.Errorf("team id mismatch: got %s want %s", got.TeamID, dst.ID)
+	}
+}
+
+func TestProjects_Transfer_SameTeamNoOp(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Solo Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Stays")
+
+	resp := h.Do(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer", owner.AccessToken,
+		map[string]string{"destinationTeamId": team.ID})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("self-transfer status=%d want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestProjects_Transfer_NonAdminSource403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	mover := h.RegisterRandomUser()
+	src := createTeam(t, h, owner.AccessToken, "Source")
+	dst := createTeam(t, h, owner.AccessToken, "Dest")
+	proj := createProject(t, h, owner.AccessToken, src.Slug, "Forbidden")
+
+	// Add mover as plain member of both teams (not admin of source).
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member'), ($3, $2, 'admin')`,
+		src.ID, mover.ID, dst.ID); err != nil {
+		t.Fatalf("seed members: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer",
+		mover.AccessToken, map[string]string{"destinationTeamId": dst.ID},
+		http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("got code %q want forbidden", env.Code)
+	}
+}
+
+func TestProjects_Transfer_NonAdminDest403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	mover := h.RegisterRandomUser()
+	src := createTeam(t, h, owner.AccessToken, "OurSource")
+	dst := createTeam(t, h, owner.AccessToken, "OurDest")
+	proj := createProject(t, h, owner.AccessToken, src.Slug, "Almost")
+
+	// Admin of source, plain member of dest.
+	if _, err := h.DB.Exec(h.rootCtx,
+		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'admin'), ($3, $2, 'member')`,
+		src.ID, mover.ID, dst.ID); err != nil {
+		t.Fatalf("seed members: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer",
+		mover.AccessToken, map[string]string{"destinationTeamId": dst.ID},
+		http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("got code %q want forbidden", env.Code)
+	}
+}
+
+func TestProjects_Transfer_DestTeamNotFound(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Lonely Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Orphan")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer",
+		owner.AccessToken,
+		map[string]string{"destinationTeamId": "00000000-0000-0000-0000-000000000000"},
+		http.StatusNotFound)
+	if env.Code != "team_not_found" {
+		t.Errorf("got code %q want team_not_found", env.Code)
+	}
+}
+
+func TestProjects_Transfer_StrangerToDestTeam403(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	stranger := h.RegisterRandomUser()
+	src := createTeam(t, h, owner.AccessToken, "Mine")
+	dst := createTeam(t, h, stranger.AccessToken, "TheirsAlone")
+	proj := createProject(t, h, owner.AccessToken, src.Slug, "Trying")
+
+	// owner is admin of src, totally outside dst.
+	env := h.AssertStatus(http.MethodPost, "/v1/projects/"+proj.ID+"/transfer",
+		owner.AccessToken, map[string]string{"destinationTeamId": dst.ID},
+		http.StatusForbidden)
+	if env.Code != "forbidden" {
+		t.Errorf("got code %q want forbidden", env.Code)
+	}
+}
+
+func TestProjects_Transfer_SlugCollision409(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	src := createTeam(t, h, owner.AccessToken, "Source X")
+	dst := createTeam(t, h, owner.AccessToken, "Dest X")
+
+	// Same name → same slug in both teams. UNIQUE(team_id, slug) bites the
+	// transfer.
+	moving := createProject(t, h, owner.AccessToken, src.Slug, "Same Name")
+	_ = createProject(t, h, owner.AccessToken, dst.Slug, "Same Name")
+
+	env := h.AssertStatus(http.MethodPost, "/v1/projects/"+moving.ID+"/transfer",
+		owner.AccessToken, map[string]string{"destinationTeamId": dst.ID},
+		http.StatusConflict)
+	if env.Code != "slug_taken" {
+		t.Errorf("got code %q want slug_taken", env.Code)
+	}
+}
+
 func TestProjects_EnvVarsAdminOnly(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()

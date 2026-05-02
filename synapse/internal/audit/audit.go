@@ -30,15 +30,25 @@ const (
 
 	// Teams.
 	ActionCreateTeam       = "createTeam"
+	ActionUpdateTeam       = "updateTeam"
+	ActionDeleteTeam       = "deleteTeam"
 	ActionInviteTeamMember = "inviteTeamMember"
 	ActionCancelInvite     = "cancelInvite"
 	ActionAcceptInvite     = "acceptInvite"
+	ActionUpdateMemberRole = "updateMemberRole"
+	ActionRemoveMember     = "removeMember"
+
+	// Profile (account-scoped, no team).
+	ActionUpdateProfileName = "updateProfileName"
+	ActionDeleteAccount     = "deleteAccount"
 
 	// Projects.
-	ActionCreateProject  = "createProject"
-	ActionDeleteProject  = "deleteProject"
-	ActionRenameProject  = "renameProject"
-	ActionUpdateEnvVars  = "updateProjectEnvVars"
+	ActionCreateProject   = "createProject"
+	ActionDeleteProject   = "deleteProject"
+	ActionRenameProject   = "renameProject"
+	ActionUpdateProject   = "updateProject"
+	ActionTransferProject = "transferProject"
+	ActionUpdateEnvVars   = "updateProjectEnvVars"
 
 	// Deployments.
 	ActionCreateDeployment = "createDeployment"
