@@ -1,10 +1,7 @@
-import { test, expect, type Page } from "@playwright/test";
-import { Client } from "pg";
+import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 import { truncateAll } from "./helpers/db";
 
-const DB_URL =
-  process.env.SYNAPSE_DB_URL ||
-  "postgres://synapse:synapse@localhost:5432/synapse";
+const API_BASE = process.env.SYNAPSE_API_URL || "http://localhost:8080";
 
 async function registerViaUI(page: Page, email = "ian@example.com") {
   await page.goto("/register");
@@ -15,33 +12,65 @@ async function registerViaUI(page: Page, email = "ian@example.com") {
   await expect(page).toHaveURL(/\/teams\b/);
 }
 
-// Seed a second user + add them to the team. Bypasses the invite UI
-// dance — RBAC tests don't care about invites, they care about the
-// members panel.
-async function seedSecondUser(
+// Add a second team member through the real REST surface — register
+// + invite + accept. Uses APIRequestContext so the work happens in
+// the same network namespace + connection pool the dashboard hits,
+// avoiding the SQL-injection visibility race we saw on slower CI
+// runners (INSERT lands but the dashboard's SWR fetch via Synapse
+// returned the pre-insert snapshot for one beat).
+async function inviteSecondMember(
+  request: APIRequestContext,
+  ownerEmail: string,
+  ownerPassword: string,
   teamSlug: string,
-  email: string,
-  name: string,
+  newEmail: string,
+  newName: string,
 ): Promise<string> {
-  const c = new Client({ connectionString: DB_URL });
-  await c.connect();
-  try {
-    const passwordHash =
-      "$2a$12$VtIBO0hvcJ6FH2HDjk2DYO7jGwk4b2P6hvrOpZ55mPBqJlUgGhzpW";
-    const u = await c.query<{ id: string }>(
-      `INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id`,
-      [email, passwordHash, name],
-    );
-    const userId = u.rows[0].id;
-    await c.query(
-      `INSERT INTO team_members (team_id, user_id, role)
-         SELECT id, $1, 'member' FROM teams WHERE slug = $2`,
-      [userId, teamSlug],
-    );
-    return userId;
-  } finally {
-    await c.end();
+  // Owner login (the dashboard already has them logged in via UI but
+  // we need the bearer here for fetch).
+  const ownerRes = await request.post(`${API_BASE}/v1/auth/login`, {
+    data: { email: ownerEmail, password: ownerPassword },
+  });
+  if (!ownerRes.ok()) {
+    throw new Error(`owner login failed: ${ownerRes.status()}`);
   }
+  const ownerData = await ownerRes.json();
+  const ownerToken = ownerData.accessToken as string;
+
+  // Register the new user.
+  const regRes = await request.post(`${API_BASE}/v1/auth/register`, {
+    data: { email: newEmail, password: "strongpass123", name: newName },
+  });
+  if (!regRes.ok()) {
+    throw new Error(`register ${newEmail} failed: ${regRes.status()}`);
+  }
+  const regData = await regRes.json();
+  const newUserId = regData.user.id as string;
+  const newUserToken = regData.accessToken as string;
+
+  // Owner mints an invite for the new email.
+  const inviteRes = await request.post(
+    `${API_BASE}/v1/teams/${encodeURIComponent(teamSlug)}/invite_team_member`,
+    {
+      headers: { Authorization: `Bearer ${ownerToken}` },
+      data: { email: newEmail, role: "member" },
+    },
+  );
+  if (!inviteRes.ok()) {
+    throw new Error(`invite ${newEmail} failed: ${inviteRes.status()}`);
+  }
+  const inviteData = await inviteRes.json();
+  const inviteToken = inviteData.inviteToken as string;
+
+  // New user accepts.
+  const acceptRes = await request.post(`${API_BASE}/v1/team_invites/accept`, {
+    headers: { Authorization: `Bearer ${newUserToken}` },
+    data: { token: inviteToken },
+  });
+  if (!acceptRes.ok()) {
+    throw new Error(`accept ${newEmail} failed: ${acceptRes.status()}`);
+  }
+  return newUserId;
 }
 
 async function createTeamAndProject(
@@ -68,34 +97,53 @@ test.beforeEach(async () => {
 
 test("admin sees members panel with team-source badge for everyone initially", async ({
   page,
+  request,
 }) => {
   await registerViaUI(page, "owner@example.com");
   await createTeamAndProject(page, "RBAC Co", "RBAC Project");
-  await seedSecondUser("rbac-co", "mate@example.com", "Mate");
+  await inviteSecondMember(
+    request,
+    "owner@example.com",
+    "strongpass123",
+    "rbac-co",
+    "mate@example.com",
+    "Mate",
+  );
 
-  // Refetch list — Members panel reloads via SWR after we seed.
+  // SWR fetched /list_members on first mount with only the owner.
+  // After a fresh team-member row lands, reload to drop SWR cache
+  // and let the panel pick up the second row.
   await page.reload();
-  // Members panel renders.
+  await expect(
+    page.getByTestId("project-member-row-mate@example.com"),
+  ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Members" })).toBeVisible();
   await expect(
     page.getByTestId("project-member-row-owner@example.com"),
   ).toBeVisible();
-  await expect(
-    page.getByTestId("project-member-row-mate@example.com"),
-  ).toBeVisible();
-  // Both rows show team source initially (no overrides yet).
   const mateRow = page.getByTestId("project-member-row-mate@example.com");
   await expect(mateRow.getByText("team", { exact: true })).toBeVisible();
 });
 
 test("admin downgrades a teammate to viewer via the role select", async ({
   page,
+  request,
 }) => {
   await registerViaUI(page, "boss@example.com");
   await createTeamAndProject(page, "Downgrade Co", "DProject");
-  await seedSecondUser("downgrade-co", "junior@example.com", "Junior");
-  await page.reload();
+  await inviteSecondMember(
+    request,
+    "boss@example.com",
+    "strongpass123",
+    "downgrade-co",
+    "junior@example.com",
+    "Junior",
+  );
 
+  await page.reload();
+  await expect(
+    page.getByTestId("project-member-row-junior@example.com"),
+  ).toBeVisible();
   // Switch role select to viewer for the seeded mate.
   const select = page.getByTestId("project-member-role-junior@example.com");
   await select.selectOption("viewer");
@@ -110,12 +158,23 @@ test("admin downgrades a teammate to viewer via the role select", async ({
 
 test("admin drops the override and the row falls back to team", async ({
   page,
+  request,
 }) => {
   await registerViaUI(page, "boss2@example.com");
   await createTeamAndProject(page, "Drop Co", "DropProj");
-  await seedSecondUser("drop-co", "mate2@example.com", "Mate");
-  await page.reload();
+  await inviteSecondMember(
+    request,
+    "boss2@example.com",
+    "strongpass123",
+    "drop-co",
+    "mate2@example.com",
+    "Mate",
+  );
 
+  await page.reload();
+  await expect(
+    page.getByTestId("project-member-row-mate2@example.com"),
+  ).toBeVisible();
   // Set viewer override first.
   await page
     .getByTestId("project-member-role-mate2@example.com")
