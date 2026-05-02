@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
+import { ProjectMembersPanel } from "@/components/ProjectMembersPanel";
 import { TokensPanel } from "@/components/TokensPanel";
 import { ApiError, api, type Deployment, type Project, type Team } from "@/lib/api";
 
@@ -477,6 +478,13 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
 
       <hr className="border-neutral-900" />
       <EnvVarsPanel projectId={projectId} />
+
+      {/* Project-level RBAC: per-project admin/member/viewer overrides on
+          top of team_members. The panel auto-derives the caller's role
+          from the listing it fetches, so admin controls only appear for
+          actual project admins. */}
+      <hr className="border-neutral-900" />
+      <ProjectMembersPanel projectId={projectId} />
 
       {/* Project-scoped + app-scoped tokens. Both are scope=project at the
           access-token table level (well, scope=app for app tokens), but
