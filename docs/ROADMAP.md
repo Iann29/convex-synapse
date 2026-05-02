@@ -155,6 +155,19 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
 
 ### ✅ Shipped this milestone
 
+- [x] **In-header deployment picker on the Convex Dashboard (Strategy E).**
+  The green-pill switcher Convex Cloud ships in its dashboard header —
+  but rendered as an overlay above the upstream iframe instead of inside
+  it. Picker lives in our Synapse Dashboard fork
+  (`dashboard/components/DeploymentPicker.tsx`); switching a deployment
+  routes to `/embed/<new-name>` which re-mounts the iframe with fresh
+  credentials via the existing postMessage handshake. Zero fork of the
+  upstream image, zero rushjs/Docker tax. Reserved
+  `GET /v1/internal/list_deployments_for_dashboard?token=...` endpoint
+  for a future in-iframe Strategy B if we ever take that path. Decision
+  log + as-built notes in
+  [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md).
+  Tests: +7 Go integration (224), +4 Playwright (38). Real-VPS smoked.
 - [x] **OpenAPI surface — 100% of self-hosted-relevant subset (v1.0).** Closes
   the gap that brought coverage from ~70% to "everything that makes sense
   for a self-hosted box". 12 new handlers + a structured `404

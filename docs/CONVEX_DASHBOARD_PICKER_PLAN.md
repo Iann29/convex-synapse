@@ -1,7 +1,9 @@
 # Convex Dashboard — In-Header Deployment Picker
 
-> **Status:** Investigation + RFC. No code yet. Operator decision required
-> on Strategy (§5) and Open Questions (§7) before any implementation.
+> **Status:** ✅ Shipped (Strategy E — overlay) on 2026-05-02. See §12 for the
+> as-built notes. The original investigation in §1–§9 is preserved as the
+> design record. The §7 open questions were resolved while the operator
+> was asleep — choices documented in §13.
 
 ## 1. Goal
 
@@ -350,3 +352,102 @@ These are decisions I shouldn't make without you:
 Operator picks Strategy A / B / C / D from §5 and answers the open
 questions in §7. Then I open `feat/convex-dashboard-picker` and start
 Phase 1 in a follow-up PR.
+
+## 12. As-built (Strategy E — overlay)
+
+While reviewing the four candidates I realised a fifth that wasn't in
+the original list: **the picker doesn't have to live INSIDE the iframed
+upstream dashboard at all.** It can live in the parent page (our
+Synapse Dashboard fork), as an overlay header rendered ABOVE the
+iframe. That sidesteps the upstream-fork tax entirely while still
+giving the operator a one-click switch.
+
+### What shipped
+
+| Piece | Where |
+|---|---|
+| Picker UI | `dashboard/components/DeploymentPicker.tsx` |
+| Embed shell integration | `dashboard/app/embed/[name]/page.tsx` |
+| Cross-origin list-deployments endpoint (reserved for future Strategy B) | `synapse/internal/api/dashboard_proxy.go` (`GET /v1/internal/list_deployments_for_dashboard?token=...`) |
+| Go integration tests | `synapse/internal/test/dashboard_proxy_test.go` (7 cases) |
+| Playwright e2e | `dashboard/tests/dashboard_picker.spec.ts` (4 cases) |
+| RFC (this doc) | `docs/CONVEX_DASHBOARD_PICKER_PLAN.md` |
+
+### How Strategy E works
+
+```
+┌─ Synapse Dashboard (our fork) ───────────────────────────────────┐
+│ ┌─ Overlay header (h-10) ─────────────────────────────────────┐ │
+│ │ Team / Project breadcrumb         <DeploymentPicker pill>   │ │
+│ ├─────────────────────────────────────────────────────────────┤ │
+│ │ ┌─ <iframe> the upstream Convex Dashboard ────────────────┐ │ │
+│ │ │ [Logo] [Avatar/Project]                                 │ │ │
+│ │ │ Health · Data · Functions · ...                         │ │ │
+│ │ │ ...                                                     │ │ │
+│ │ └─────────────────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The picker renders OUR data (fetched directly from the Synapse REST
+API), not the iframe's. Switching a deployment routes the parent page
+to `/embed/<new-name>`, which re-mounts the iframe with fresh
+credentials via the existing postMessage handshake. No upstream
+protocol changes; no fork; no rebase tax.
+
+### Trade-offs vs Strategy B (full fork)
+
+| Aspect | Strategy E (shipped) | Strategy B (forked) |
+|---|---|---|
+| Initial cost | ~6 h | ~1-2 weeks |
+| Recurring cost | 0 | ~2-4 h/month rebase |
+| Upstream upgrades | Automatic | Manual |
+| Switch UX | Full iframe reload | In-place credential swap |
+| Visual integration | Two stacked headers | Single header |
+| Picker hotkeys | Work outside iframe; pass-through to iframe via the parent | Native to the iframe |
+
+The "two stacked headers" cosmetic is the one real downside. v1 ships
+with our header at `h-10` (40px) so it doesn't dominate the iframe.
+If operators ask for tighter integration we promote to Strategy B as
+documented in §5.
+
+### Phase 2 of Strategy E (still open)
+
+The overlay covers the most-painful case (switching a deployment).
+Ideas that didn't make this round but stay viable on Strategy E:
+
+- **Hide the iframe's own header** via CSP-permitted CSS in our shell.
+  Today the upstream renders [Logo] + Avatar + ToggleTheme inside the
+  iframe; trimming those gives single-header look without forking.
+- **Sync route between picker and iframe** — when the operator
+  navigates `/data` inside the iframe, reflect that in the parent's
+  URL (`/embed/<name>/data`). Today the parent URL is just the
+  deployment; the iframe's own router holds the page state.
+- **Remember last viewed deployment per project** in localStorage so
+  reopening from the project page lands on the same deployment.
+  (Cloud does this via `useRememberLastViewedDeploymentForProject`.)
+
+### Endpoint reservation: `list_deployments_for_dashboard`
+
+The cross-origin endpoint shipped in 37ff428 is unused by the v1
+overlay (the picker fetches via the same-origin Synapse API instead).
+It stays in the codebase as the seam Strategy B would slot into:
+when we eventually fork the dashboard image, the fork's
+`?a=<api-url>&d=<name>` flow has a real endpoint to call.
+
+The endpoint cost ~7 Go integration tests + ~150 lines of handler
+code; cheap insurance.
+
+## 13. Resolved decisions
+
+The §7 questions, answered with operator-asleep defaults. Each is
+revisable in a follow-up PR if the operator disagrees.
+
+| # | Question | Decision | Reasoning |
+|---|---|---|---|
+| 1 | Scope of dropdown — keep "Other Deployments"? | Skip for v1 | Self-hosted is single-operator most of the time; a section that's empty 90% of the time is noise. Easy to add when multi-operator workflows appear. |
+| 2 | Phase 1 (interstitial) acceptable as v1? | No — went straight to overlay | Operator wanted "lindo" — the interstitial doesn't qualify. |
+| 3 | Fork hosting | N/A — Strategy E doesn't fork | |
+| 4 | Upstream rebase cadence | N/A — Strategy E doesn't rebase | |
+| 5 | Custom Domains tab in Settings | Skip for v1 | Not picker-related; tracked separately in ROADMAP under "Phase 3 polish". |
+
