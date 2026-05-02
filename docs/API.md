@@ -39,6 +39,32 @@ Body: `{refreshToken}`. Returns a new token pair.
 
 Returns the authenticated user.
 
+### `PUT /v1/update_profile_name` ✅ (alias `/v1/me/update_profile_name`)
+
+Body `{name}`. Updates the caller's display name and returns the refreshed
+user shape. Empty/whitespace name is rejected with 400 `missing_name`.
+
+### `POST /v1/delete_account` ✅ (alias `/v1/me/delete_account`)
+
+Deletes the caller's account. Refused with 409 `last_admin` when the user
+is the last admin of any team they belong to (the cascade would orphan
+it), or 409 `team_creator` when they are the `creator_user_id` of any
+existing team (`teams.creator_user_id` is `ON DELETE RESTRICT`).
+Workaround for both: delete (or transfer creation of) the team(s) first
+via `POST /v1/teams/{ref}/delete`. Cascades the user's team membership
+rows; audit_events.actor_id and projects.creator_user_id `SET NULL`.
+
+### `GET /v1/member_data` ✅ (alias `/v1/me/member_data`)
+
+Returns `{teams, projects, deployments, optInsToAccept}`. Saves three
+round-trips for the cloud dashboard's "load my world" path. Self-hosted
+operators have no opt-ins, so `optInsToAccept` is always `[]`.
+
+### `GET /v1/optins` ✅
+
+Returns `{optInsToAccept: []}`. Self-hosted operators don't agree to
+Convex Cloud's TOS or marketing opt-ins; the operator owns the box.
+
 ## Teams
 
 ### `POST /v1/teams/create_team` ✅
@@ -52,6 +78,49 @@ Lists teams the caller belongs to.
 ### `GET /v1/teams/{ref}` ✅
 
 `ref` is either the UUID or the slug. Returns `Team`.
+
+### `POST /v1/teams/{ref}` ✅ (admins only)
+
+Update team. Body `{name?, slug?, defaultRegion?}` — every field optional.
+Slug uniqueness is global; collision returns 409 `slug_taken`. `defaultRegion`
+is stored verbatim but has no behavioural effect today (Synapse is single-
+region; the field exists for parity with the cloud dashboard's region picker).
+
+### `POST /v1/teams/{ref}/delete` ✅ (admins only)
+
+Delete team. Refused with 409 `team_has_deployments` when any non-deleted
+deployment hangs off a project in this team — orphaning Docker containers
+when their owning team disappears is worse than asking the operator to
+delete them first. Once cleared, CASCADE removes projects, members, and
+invites. The audit row is written before the DELETE so team_id stays
+useful for "what happened in this team" queries through the moment of
+deletion.
+
+### `POST /v1/teams/{ref}/update_member_role` ✅ (admins only)
+
+Body `{memberId, role}`. Role accepts `admin`, `member`, or the cloud
+alias `developer` (mapped → member). Refuses with 409 `last_admin` when
+demoting the only admin. The check + UPDATE run inside `SELECT FOR UPDATE`
+so two concurrent demotions can't race past the guard.
+
+### `POST /v1/teams/{ref}/remove_member` ✅
+
+Body `{memberId}`. Either an admin removes any member, or any member
+removes themselves. Refused with 409 `last_admin` if the target is the
+only remaining admin. Audit metadata flags `selfRemoval=true` so logs
+distinguish "kicked" from "left".
+
+### `POST /v1/teams/{ref}/access_tokens` ✅ (admins only)
+
+Body `{name, expiresAt?}`. Creates an opaque PAT scoped to this team.
+Same response shape as `/v1/create_personal_access_token`. The bearer of
+the resulting token can act inside this team (and any project /
+deployment beneath it) but NOT in other teams. See "Token scopes" below.
+
+### `GET /v1/teams/{ref}/access_tokens` ✅
+
+Lists the caller's team-scoped tokens for this team (paginated:
+`?limit&?cursor`).
 
 ### `GET /v1/teams/{ref}/list_projects` ✅
 ### `GET /v1/teams/{ref}/list_members` ✅
@@ -151,13 +220,51 @@ membership insert (re-accepting from a second tab is a no-op).
 ## Projects
 
 ### `GET /v1/projects/{id}` ✅
-### `PUT /v1/projects/{id}` 📍 (admins only) — body `{name?}`
+### `PUT /v1/projects/{id}` ✅ (admins only)
+
+Body `{name?, slug?}` — both optional. Slug uniqueness is per-team
+(`UNIQUE(team_id, slug)`); collision returns 409 `slug_taken`. The shape
+must be lowercase letters / digits / dashes; otherwise 400 `invalid_slug`.
+Cloud's spec returns 204; Synapse returns 200 + the updated project so
+the dashboard can skip a follow-up GET.
+
+### `POST /v1/projects/{id}/transfer` ✅ (admins of source AND destination)
+
+Body `{destinationTeamId}`. Moves the project (and all its deployments,
+env vars, audit events) to another team. Caller must be admin of BOTH
+teams. 404 `team_not_found` for unknown destination, 403 `forbidden`
+when caller is not admin in either team, 409 `slug_taken` when a project
+with the same slug already exists in the destination. Self-transfer
+(destinationTeamId == current team) returns 204 no-op. Audit fires on
+both teams with `direction: in/out` metadata.
+
 ### `POST /v1/projects/{id}/delete` ✅ (admins only)
 ### `GET /v1/projects/{id}/list_deployments` ✅
 ### `GET /v1/projects/{id}/list_default_environment_variables` ✅
 ### `POST /v1/projects/{id}/update_default_environment_variables` ✅ (admins only)
 
 Body: `{changes: [{op:"set"|"delete", name, value?, deploymentTypes?}]}`.
+
+### `POST /v1/projects/{id}/access_tokens` ✅ (admins only)
+
+Body `{name, expiresAt?}`. Creates a project-scoped PAT. The bearer can
+act on this project and its deployments but NOT siblings. See "Token
+scopes" below.
+
+### `GET /v1/projects/{id}/access_tokens` ✅
+
+Lists the caller's project-scoped tokens.
+
+### `POST /v1/projects/{id}/app_access_tokens` ✅ (admins only)
+
+Same shape as `/access_tokens` but creates a token with `scope=app`. App
+tokens have the same access surface as project-scoped tokens; the label
+is what the dashboard uses to categorise "preview deploy keys" (CI/CD)
+separately from regular project tokens.
+
+### `GET /v1/projects/{id}/app_access_tokens` ✅
+
+Lists the caller's app-scoped tokens for this project.
 
 ## Deployments
 
@@ -273,6 +380,15 @@ npx convex deploy
 
 Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
 
+### `POST /v1/deployments/{name}/access_tokens` ✅ (admins only)
+
+Body `{name, expiresAt?}`. Creates a deployment-scoped PAT. The bearer
+can ONLY act on this exact deployment.
+
+### `GET /v1/deployments/{name}/access_tokens` ✅
+
+Lists the caller's deployment-scoped tokens for this deployment.
+
 ## Reverse proxy
 
 When `SYNAPSE_PROXY_ENABLED=true`, the API server also serves
@@ -292,6 +408,25 @@ http://localhost:8080/d/quiet-cat-1234/api/check_admin_key
 
 No auth check at the proxy layer — deployments enforce admin-key auth
 themselves.
+
+## Token scopes (v1.0+)
+
+Synapse access tokens carry a `scope`: `user`, `team`, `project`,
+`deployment`, or `app`. The scope determines what the token can reach:
+
+| Scope (X) | team Y | project Y | deployment Y |
+|---|---|---|---|
+| `user`       | yes  | yes  | yes  |
+| `team`       | only X==Y | only Y's team==X | only via project in X |
+| `project` / `app` | no   | only X==Y | only deployments under X |
+| `deployment` | no   | no   | only X==Y |
+
+Mismatch returns `403 forbidden_token_scope`. `user` is the unrestricted
+default (and what all JWT-authenticated dashboard sessions use).
+
+Create scoped tokens via the resource-specific endpoints listed above
+(e.g. `POST /v1/teams/{ref}/access_tokens`); the personal endpoint below
+creates `user`-scoped tokens unless you explicitly pass `scope` + `scopeId`.
 
 ## Personal access tokens
 
@@ -315,7 +450,9 @@ Body:
 ```
 
 - `name` (required) — short label, ≤100 chars.
-- `scope` (default `"user"`) — one of `user`, `team`, `project`, `deployment`.
+- `scope` (default `"user"`) — one of `user`, `team`, `project`, `deployment`, `app`.
+  Most callers use the resource-scoped endpoints (e.g.
+  `/v1/teams/{ref}/access_tokens`) which set scope automatically.
 - `scopeId` — required when `scope` is not `"user"`; the UUID of the
   team/project/deployment the token is bound to.
 - `expiresAt` — optional ISO-8601 timestamp; must be in the future. Omit
@@ -374,6 +511,25 @@ the caller. Returns `{"id": "…"}` on success, `404 token_not_found`
 otherwise. Subsequent auth attempts with that token will be rejected by
 the auth middleware.
 
+## Out of scope (cloud-only)
+
+Roughly 60 paths from the Convex Cloud OpenAPI spec are intentionally NOT
+implemented in Synapse — billing (Orb / Stripe), SSO via WorkOS, Discord /
+Vercel integrations, OAuth apps, cloud-managed backups, referrals. A
+single middleware (`internal/api/not_supported.go`) intercepts these
+paths and returns:
+
+```
+HTTP/1.1 404 Not Found
+{"code":"not_supported_in_self_hosted","message":"…"}
+```
+
+The structured `code` lets clients distinguish "this URL is wrong" from
+"this feature is intentionally cut" and avoid retry loops. See
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md) "Out of scope" for the
+rationale on each family. The middleware runs BEFORE auth so probes
+reveal the cut without needing a JWT/PAT first.
+
 ## Errors
 
 All errors return `{code, message}` with an HTTP status. Codes are stable;
@@ -387,7 +543,14 @@ messages may evolve.
 | `unauthorized` | 401 | missing or expired bearer |
 | `invalid_token` | 401 | token signature/expiry/kind wrong |
 | `invalid_credentials` | 401 | login email/password mismatch |
-| `forbidden` | 403 | authenticated but not allowed |
+| `forbidden` | 403 | authenticated but not allowed (role gate) |
+| `forbidden_token_scope` | 403 | PAT scoped to a different resource |
 | `*_not_found` | 404 | target doesn't exist (or you can't see it) |
+| `not_supported_in_self_hosted` | 404 | path is cloud-only — see "Out of scope" |
 | `email_taken` | 409 | unique constraint on registration |
+| `slug_taken` | 409 | team or project slug already in use |
+| `name_taken` | 409 | adopted-deployment name collision |
+| `team_has_deployments` | 409 | delete_team refuses while live deployments exist |
+| `team_creator` | 409 | delete_account refuses for creator of any team |
+| `last_admin` | 409 | role/membership change would orphan a team |
 | `internal` | 500 | server bug — check logs |
