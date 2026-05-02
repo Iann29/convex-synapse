@@ -12,7 +12,8 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
-import { ApiError, api, type Deployment, type Project } from "@/lib/api";
+import { TokensPanel } from "@/components/TokensPanel";
+import { ApiError, api, type Deployment, type Project, type Team } from "@/lib/api";
 
 type Params = { team: string; project: string };
 
@@ -143,9 +144,28 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
   const [deletingName, setDeletingName] = useState<string | null>(null);
   const [deletingProject, setDeletingProject] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
-  const [renameValue, setRenameValue] = useState("");
+  const [renameName, setRenameName] = useState("");
+  const [renameSlug, setRenameSlug] = useState("");
   const [renamePending, setRenamePending] = useState(false);
   const [copiedName, setCopiedName] = useState<string | null>(null);
+
+  // Transfer dialog state. Loaded lazily (only when the dialog opens) so
+  // the projects page doesn't pay the /v1/teams round-trip on every paint.
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferDest, setTransferDest] = useState("");
+  const [transferPending, setTransferPending] = useState(false);
+  const [transferError, setTransferError] = useState<string | null>(null);
+  const { data: myTeams } = useSWR<Team[] | null>(
+    transferOpen ? "/teams" : null,
+    () => api.teams.list(),
+  );
+  // Resolve current team to its UUID so we can hide it from the
+  // destination dropdown — transferring to the same team is a no-op
+  // server-side but a confusing UX option.
+  const { data: currentTeam } = useSWR<Team>(
+    ["/team", teamRef],
+    () => api.teams.get(teamRef),
+  );
 
   const copyUrl = async (name: string, url: string) => {
     try {
@@ -167,17 +187,67 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
     e.preventDefault();
     setActionError(null);
     setRenamePending(true);
+
+    // Build a partial patch — empty name/slug means "leave alone". The PUT
+    // endpoint accepts any subset of {name, slug} and 204s on no-op, so a
+    // dialog left untouched is harmless to submit.
+    const patch: { name?: string; slug?: string } = {};
+    if (renameName.trim() && renameName.trim() !== project?.name) {
+      patch.name = renameName.trim();
+    }
+    if (renameSlug.trim() && renameSlug.trim() !== project?.slug) {
+      patch.slug = renameSlug.trim();
+    }
+
     try {
-      await api.projects.rename(projectId, renameValue.trim());
+      await api.projects.update(projectId, patch);
       setRenameOpen(false);
       // Refresh the project cache so the header updates immediately.
       await mutateProject();
     } catch (err) {
-      setActionError(
-        err instanceof ApiError ? err.message : "Could not rename project"
-      );
+      if (err instanceof ApiError && err.code === "slug_taken") {
+        setActionError("Slug already in use by another project in this team.");
+      } else if (err instanceof ApiError && err.code === "invalid_slug") {
+        setActionError("Slug must be lowercase letters, digits, and dashes only.");
+      } else {
+        setActionError(
+          err instanceof ApiError ? err.message : "Could not rename project",
+        );
+      }
     } finally {
       setRenamePending(false);
+    }
+  };
+
+  const submitTransfer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTransferError(null);
+    if (!transferDest) {
+      setTransferError("Pick a destination team");
+      return;
+    }
+    setTransferPending(true);
+    try {
+      await api.projects.transfer(projectId, transferDest);
+      // Project's team_id flipped — every URL referencing the old team
+      // path is stale. Resolve the new team's slug to keep the user on a
+      // working page.
+      const dest = (myTeams ?? []).find((t) => t.id === transferDest);
+      const destSlug = dest?.slug ?? transferDest;
+      router.push(`/teams/${encodeURIComponent(destSlug)}/${encodeURIComponent(projectId)}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "slug_taken") {
+        setTransferError(
+          "A project with this slug already exists in the destination team.",
+        );
+      } else if (err instanceof ApiError && err.code === "forbidden") {
+        setTransferError("You must be admin of both teams to transfer a project.");
+      } else {
+        setTransferError(
+          err instanceof ApiError ? err.message : "Could not transfer project",
+        );
+      }
+      setTransferPending(false);
     }
   };
 
@@ -254,12 +324,25 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             <Button
               variant="secondary"
               onClick={() => {
-                setRenameValue(project?.name ?? "");
+                setRenameName(project?.name ?? "");
+                setRenameSlug(project?.slug ?? "");
                 setRenameOpen(true);
               }}
               aria-label="Rename project"
             >
               Rename
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setTransferDest("");
+                setTransferError(null);
+                setTransferOpen(true);
+              }}
+              aria-label="Transfer project to another team"
+              data-testid="project-transfer-open"
+            >
+              Transfer
             </Button>
             <Button
               variant="danger"
@@ -395,7 +478,23 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
       <hr className="border-neutral-900" />
       <EnvVarsPanel projectId={projectId} />
 
-      {/* TODO: settings page (rename / delete project). */}
+      {/* Project-scoped + app-scoped tokens. Both are scope=project at the
+          access-token table level (well, scope=app for app tokens), but
+          they're rendered as separate sections so operators can label
+          long-lived service tokens vs short-lived preview deploy keys.
+          The TokensPanel component handles the API plumbing per scope. */}
+      <hr className="border-neutral-900" />
+      <Card>
+        <CardBody>
+          <TokensPanel scope="project" target={projectId} />
+        </CardBody>
+      </Card>
+      <Card>
+        <CardBody>
+          <TokensPanel scope="app" target={projectId} />
+        </CardBody>
+      </Card>
+
 
       <Dialog open={open} onClose={() => setOpen(false)} title="Create deployment">
         <form onSubmit={create} className="space-y-4">
@@ -548,15 +647,29 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
         <form onSubmit={submitRename} className="space-y-4">
           <div className="space-y-2">
             <label htmlFor="rename-project" className="block text-xs text-neutral-400">
-              New name
+              Name
             </label>
             <Input
               id="rename-project"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-              required
+              value={renameName}
+              onChange={(e) => setRenameName(e.target.value)}
               autoFocus
             />
+          </div>
+          <div className="space-y-2">
+            <label htmlFor="rename-project-slug" className="block text-xs text-neutral-400">
+              Slug
+            </label>
+            <Input
+              id="rename-project-slug"
+              value={renameSlug}
+              onChange={(e) => setRenameSlug(e.target.value)}
+              pattern="[a-z0-9-]+"
+              title="Lowercase letters, digits, and dashes only"
+            />
+            <p className="text-xs text-neutral-500">
+              Used in URLs. Must be unique within this team.
+            </p>
           </div>
           <div className="flex justify-end gap-2">
             <Button
@@ -567,8 +680,74 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={renamePending || !renameValue.trim()}>
+            <Button
+              type="submit"
+              disabled={
+                renamePending ||
+                (!renameName.trim() && !renameSlug.trim())
+              }
+              data-testid="project-rename-save"
+            >
               {renamePending ? "Saving…" : "Save"}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+
+      <Dialog
+        open={transferOpen}
+        onClose={() => !transferPending && setTransferOpen(false)}
+        title="Transfer project"
+      >
+        <form onSubmit={submitTransfer} className="space-y-4">
+          <p className="text-xs text-neutral-400">
+            Move this project (and all its deployments) to another team you
+            admin. Refused if a project with the same slug already lives
+            there.
+          </p>
+          <div className="space-y-2">
+            <label
+              htmlFor="transfer-dest"
+              className="block text-xs text-neutral-400"
+            >
+              Destination team
+            </label>
+            <select
+              id="transfer-dest"
+              value={transferDest}
+              onChange={(e) => setTransferDest(e.target.value)}
+              className="h-9 w-full rounded-md border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 focus:border-neutral-500 focus:outline-none"
+              data-testid="project-transfer-dest"
+              required
+            >
+              <option value="">Pick a team…</option>
+              {(myTeams ?? [])
+                .filter((t) => t.id !== currentTeam?.id)
+                .map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} ({t.slug})
+                  </option>
+                ))}
+            </select>
+          </div>
+          {transferError && (
+            <p className="text-xs text-red-400">{transferError}</p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setTransferOpen(false)}
+              disabled={transferPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={transferPending || !transferDest}
+              data-testid="project-transfer-submit"
+            >
+              {transferPending ? "Transferring…" : "Transfer"}
             </Button>
           </div>
         </form>
