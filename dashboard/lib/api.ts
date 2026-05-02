@@ -102,6 +102,32 @@ export type CliCredentials = {
   envSnippet: string;
 };
 
+// DeployKey mirrors models.DeployKey on the backend. `adminKey` is only
+// populated on the create response (operator sees it once); subsequent
+// list responses see only the `prefix` chip.
+export type DeployKey = {
+  id: string;
+  deploymentId: string;
+  name: string;
+  adminKey?: string;
+  prefix: string;
+  createdBy?: string;
+  createdByName?: string;
+  createTime: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+};
+
+// Returned once at create time. `adminKey` is the freshly-minted value;
+// `envSnippet` and `exportSnippet` are paste-ready for `.env.local` and
+// shell respectively. The dashboard MUST surface this immediately and
+// not store it — Synapse keeps only the prefix + sha256 hash going
+// forward (GitHub-PAT model).
+export type CreateDeployKeyResponse = DeployKey & {
+  envSnippet: string;
+  exportSnippet: string;
+};
+
 export type EnvVar = {
   name: string;
   value: string;
@@ -674,6 +700,29 @@ export const api = {
       return request<CreateTokenResponse>(
         `/v1/deployments/${encodeURIComponent(name)}/access_tokens`,
         { method: "POST", body: { name: tokenName, ...opts } },
+      );
+    },
+    // Deploy keys (v1.0.3+). Per-deployment named admin keys for CI
+    // integrations. Mirrors Convex Cloud's "Personal Deployment
+    // Settings → Deploy Keys" surface.
+    listDeployKeys(name: string): Promise<{ deployKeys: DeployKey[] }> {
+      return request<{ deployKeys: DeployKey[] }>(
+        `/v1/deployments/${encodeURIComponent(name)}/deploy_keys`,
+      );
+    },
+    createDeployKey(
+      name: string,
+      keyName: string,
+    ): Promise<CreateDeployKeyResponse> {
+      return request<CreateDeployKeyResponse>(
+        `/v1/deployments/${encodeURIComponent(name)}/deploy_keys`,
+        { method: "POST", body: { name: keyName } },
+      );
+    },
+    revokeDeployKey(name: string, keyId: string): Promise<void> {
+      return request<void>(
+        `/v1/deployments/${encodeURIComponent(name)}/deploy_keys/${encodeURIComponent(keyId)}/revoke`,
+        { method: "POST", body: {} },
       );
     },
   },

@@ -181,6 +181,34 @@ type ProjectMember struct {
 	Source string `json:"source,omitempty"`
 }
 
+// DeployKey is a named alias for an admin key on a single deployment,
+// used by CI integrations (Vercel, GitHub Actions, etc) so the operator
+// gets a clean audit trail per credential. Mirrors Convex Cloud's
+// "Personal Deployment Settings → Deploy Keys" UX.
+//
+// IMPORTANT: revoke is best-effort — the Convex backend authenticates
+// admin keys by signature against INSTANCE_SECRET (stateless), so we
+// cannot per-key revoke without rotating the deployment's instance
+// secret. revoked_at hides the row from the dashboard list; real
+// invalidation requires a deployment-wide rotation. The dashboard
+// surfaces that gotcha. See migration 000009 for the full design note.
+//
+// AdminKey is non-empty *only* on the create-response struct (the operator
+// gets the value back exactly once, GitHub-PAT-style); subsequent reads
+// see only Prefix.
+type DeployKey struct {
+	ID            string     `json:"id"`
+	DeploymentID  string     `json:"deploymentId"`
+	Name          string     `json:"name"`
+	AdminKey      string     `json:"adminKey,omitempty"`
+	Prefix        string     `json:"prefix"`
+	CreatedBy     *string    `json:"createdBy,omitempty"`
+	CreatedByName string     `json:"createdByName,omitempty"`
+	CreatedAt     time.Time  `json:"createTime"`
+	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
+	RevokedAt     *time.Time `json:"revokedAt,omitempty"`
+}
+
 const (
 	TokenScopeUser       = "user"
 	TokenScopeTeam       = "team"
