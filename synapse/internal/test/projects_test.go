@@ -510,17 +510,27 @@ func TestProjects_Transfer_SlugCollision409(t *testing.T) {
 	}
 }
 
-func TestProjects_EnvVarsAdminOnly(t *testing.T) {
+func TestProjects_EnvVars_MembersAllowed_ViewersBlocked(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()
 	member := h.RegisterRandomUser()
-	team := createTeam(t, h, owner.AccessToken, "EnvAdmin Co")
+	viewer := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "EnvRBAC Co")
 	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
 
-	if _, err := h.DB.Exec(h.rootCtx,
-		`INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member')`,
-		team.ID, member.ID); err != nil {
-		t.Fatalf("seed member: %v", err)
+	// Both extras start as plain team members (no project override).
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'member'), ($1, $3, 'member')
+	`, team.ID, member.ID, viewer.ID); err != nil {
+		t.Fatalf("seed members: %v", err)
+	}
+	// Downgrade `viewer` via a project_members override — this is the
+	// v1.0+ RBAC promise: a team member can be locked down to read-only
+	// on one specific project.
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'viewer')
+	`, proj.ID, viewer.ID); err != nil {
+		t.Fatalf("seed viewer override: %v", err)
 	}
 
 	type envVarChange struct {
@@ -531,19 +541,32 @@ func TestProjects_EnvVarsAdminOnly(t *testing.T) {
 	type updateEnvVarsReq struct {
 		Changes []envVarChange `json:"changes"`
 	}
-	env := h.AssertStatus(http.MethodPost,
+	type listResp struct {
+		Configs []any `json:"configs"`
+	}
+
+	// Member can write — was admin-only before v1.0 RBAC, now any
+	// editor (admin or member) is fine.
+	h.DoJSON(http.MethodPost,
 		"/v1/projects/"+proj.ID+"/update_default_environment_variables",
 		member.AccessToken,
+		updateEnvVarsReq{Changes: []envVarChange{{Op: "set", Name: "X", Value: "y"}}},
+		http.StatusOK, &map[string]any{})
+
+	// Viewer is blocked from writes…
+	env := h.AssertStatus(http.MethodPost,
+		"/v1/projects/"+proj.ID+"/update_default_environment_variables",
+		viewer.AccessToken,
 		updateEnvVarsReq{Changes: []envVarChange{{Op: "set", Name: "X", Value: "y"}}},
 		http.StatusForbidden)
 	if env.Code != "forbidden" {
 		t.Errorf("got code %q want forbidden", env.Code)
 	}
 
-	// But list_env is OK for plain members.
-	type listResp struct {
-		Configs []any `json:"configs"`
-	}
+	// …but reads stay open for everyone with project access.
+	h.DoJSON(http.MethodGet,
+		"/v1/projects/"+proj.ID+"/list_default_environment_variables",
+		viewer.AccessToken, nil, http.StatusOK, &listResp{})
 	h.DoJSON(http.MethodGet,
 		"/v1/projects/"+proj.ID+"/list_default_environment_variables",
 		member.AccessToken, nil, http.StatusOK, &listResp{})

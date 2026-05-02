@@ -38,6 +38,14 @@ const (
 	ActionUpdateMemberRole = "updateMemberRole"
 	ActionRemoveMember     = "removeMember"
 
+	// Project-level RBAC (v1.0+, migration 000008). Project member
+	// actions live alongside team-member actions because they share
+	// the same audit_events shape; the metadata.scope field
+	// distinguishes "team" vs "project".
+	ActionAddProjectMember        = "addProjectMember"
+	ActionUpdateProjectMemberRole = "updateProjectMemberRole"
+	ActionRemoveProjectMember     = "removeProjectMember"
+
 	// Profile (account-scoped, no team).
 	ActionUpdateProfileName = "updateProfileName"
 	ActionDeleteAccount     = "deleteAccount"

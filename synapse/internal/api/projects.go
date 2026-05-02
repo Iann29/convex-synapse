@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -28,6 +29,47 @@ type ProjectsHandler struct {
 	Tokens      *AccessTokensHandler
 }
 
+// canAdminProject is true for full administrators of a project.
+// Mutations that destroy or rename the project itself, or that touch
+// the membership list, gate on this. Intentionally narrow — a v1.0+
+// project member with role="member" can edit env vars and create
+// deployments but can't delete the project.
+func canAdminProject(role string) bool {
+	return role == models.RoleAdmin
+}
+
+// canEditProject is the broader gate for non-destructive writes:
+// updating env vars, creating deployments, etc. Members + admins
+// pass; viewers don't.
+func canEditProject(role string) bool {
+	return role == models.RoleAdmin || role == models.RoleMember
+}
+
+// effectiveProjectRole resolves the role a user has on a specific
+// project. project_members rows override team_members; absence falls
+// through to team. If neither row exists, returns pgx.ErrNoRows.
+//
+// Used by loadProjectForRequest + loadDeploymentForRequest to compute
+// the role passed to the handler. New writers should NOT touch the
+// raw `team_members` SELECT — go through this helper so per-project
+// overrides are honoured everywhere.
+func effectiveProjectRole(ctx context.Context, db *pgxpool.Pool, projectID, teamID, userID string) (string, error) {
+	var role string
+	err := db.QueryRow(ctx,
+		`SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2`,
+		projectID, userID).Scan(&role)
+	if err == nil {
+		return role, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = db.QueryRow(ctx,
+		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
+		teamID, userID).Scan(&role)
+	return role, err
+}
+
 func (h *ProjectsHandler) Routes() chi.Router {
 	r := chi.NewRouter()
 
@@ -39,6 +81,11 @@ func (h *ProjectsHandler) Routes() chi.Router {
 		r.Get("/list_deployments", h.listDeployments)
 		r.Get("/list_default_environment_variables", h.listEnvVars)
 		r.Post("/update_default_environment_variables", h.updateEnvVars)
+		// Project-level RBAC (v1.0+, migration 000008).
+		r.Get("/list_members", h.listProjectMembers)
+		r.Post("/add_member", h.addProjectMember)
+		r.Post("/update_member_role", h.updateProjectMemberRole)
+		r.Post("/remove_member", h.removeProjectMember)
 		// Scoped access tokens (v1.0+). Project-scoped tokens carry
 		// scope=project; the cloud-spec separates "app" tokens
 		// (preview-deploy keys) from regular project tokens — we expose
@@ -88,10 +135,7 @@ func (h *ProjectsHandler) loadProjectForRequest(w http.ResponseWriter, r *http.R
 	}
 	p.TeamSlug = t.Slug
 
-	var role string
-	err = h.DB.QueryRow(r.Context(),
-		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
-		t.ID, uid).Scan(&role)
+	role, err := effectiveProjectRole(r.Context(), h.DB, p.ID, t.ID, uid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusForbidden, "forbidden", "You do not have access to this project")
 		return nil, nil, "", false
@@ -142,8 +186,8 @@ func (h *ProjectsHandler) updateProject(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can update projects")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can update the project")
 		return
 	}
 	var req updateProjectReq
@@ -266,9 +310,9 @@ func (h *ProjectsHandler) createProjectScopedToken(w http.ResponseWriter, r *htt
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
+	if !canAdminProject(role) {
 		writeError(w, http.StatusForbidden, "forbidden",
-			"Only team admins can create project access tokens")
+			"Only project admins can create project access tokens")
 		return
 	}
 	if h.Tokens == nil {
@@ -370,8 +414,8 @@ func (h *ProjectsHandler) transferProject(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can transfer projects")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can transfer the project")
 		return
 	}
 	var req transferProjectReq
@@ -484,8 +528,8 @@ func (h *ProjectsHandler) deleteProject(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can delete projects")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can delete the project")
 		return
 	}
 
@@ -692,8 +736,8 @@ func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can edit env vars")
+	if !canEditProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Viewers cannot edit env vars; ask a project admin or member")
 		return
 	}
 	var req updateEnvVarsReq
@@ -766,4 +810,316 @@ func (h *ProjectsHandler) updateEnvVars(w http.ResponseWriter, r *http.Request) 
 		Metadata:   map[string]any{"applied": len(req.Changes), "names": names},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"applied": len(req.Changes)})
+}
+
+// ---------- GET /v1/projects/{id}/list_members ----------
+//
+// Returns the merged member list for a project: every team member of
+// the owning team, with the role they actually have on this project
+// (project_members override when present, team role when not). The
+// `source` field flags which way each row came in so the dashboard
+// can render "team admin (project viewer)" without recomputing.
+//
+// Visible to anyone with access to the project — viewers included.
+// Listing members is informational; promoting / demoting is gated
+// on canAdminProject.
+
+type projectMemberView struct {
+	ID         string    `json:"id"`
+	Email      string    `json:"email"`
+	Name       string    `json:"name"`
+	Role       string    `json:"role"`
+	Source     string    `json:"source"`
+	CreateTime time.Time `json:"createTime"`
+}
+
+func (h *ProjectsHandler) listProjectMembers(w http.ResponseWriter, r *http.Request) {
+	p, t, _, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	// One query, joined: team_members LEFT JOIN project_members on
+	// (team.team_id, team.user_id) → (project.project_id, project.user_id).
+	// COALESCE picks the override role when project_members has a row.
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT u.id, u.email, u.name,
+		       COALESCE(pm.role, tm.role) AS role,
+		       CASE WHEN pm.role IS NOT NULL THEN 'project' ELSE 'team' END AS source,
+		       COALESCE(pm.created_at, tm.created_at) AS created_at
+		  FROM team_members tm
+		  JOIN users u ON u.id = tm.user_id
+		  LEFT JOIN project_members pm
+		         ON pm.project_id = $1 AND pm.user_id = tm.user_id
+		 WHERE tm.team_id = $2
+		 ORDER BY tm.created_at ASC, u.id ASC
+	`, p.ID, t.ID)
+	if err != nil {
+		logErr("list project members", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to list members")
+		return
+	}
+	defer rows.Close()
+	out := make([]projectMemberView, 0)
+	for rows.Next() {
+		var v projectMemberView
+		if err := rows.Scan(&v.ID, &v.Email, &v.Name, &v.Role, &v.Source, &v.CreateTime); err != nil {
+			logErr("scan project member", err)
+			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan members")
+			return
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---------- POST /v1/projects/{id}/add_member ----------
+//
+// Adds (or upserts) a project_members override for a user that's
+// already a team_member. Body: { userId, role: "admin"|"member"|"viewer" }.
+// Project admin only. The "must already be team member" guard keeps
+// the team as the security boundary — adding random users requires
+// the team-invite flow first.
+
+type addProjectMemberReq struct {
+	UserID string `json:"userId"`
+	Role   string `json:"role"`
+}
+
+func (h *ProjectsHandler) addProjectMember(w http.ResponseWriter, r *http.Request) {
+	p, t, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can manage members")
+		return
+	}
+	var req addProjectMemberReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	if req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "missing_user", "userId is required")
+		return
+	}
+	storedRole, err := normaliseProjectRole(req.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_role", err.Error())
+		return
+	}
+
+	// Target must already be a team member of the project's team. Lets
+	// us keep "team" as the trust boundary — projects are partitions of
+	// a team, not a parallel access plane.
+	var exists bool
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)`,
+		t.ID, req.UserID).Scan(&exists); err != nil {
+		logErr("check team membership", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify team membership")
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusBadRequest, "not_team_member",
+			"User must be a member of the project's team before being added to a project")
+		return
+	}
+
+	if _, err := h.DB.Exec(r.Context(), `
+		INSERT INTO project_members (project_id, user_id, role)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+	`, p.ID, req.UserID, storedRole); err != nil {
+		logErr("insert project member", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to add member")
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionAddProjectMember,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"memberId": req.UserID,
+			"role":     storedRole,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"projectId": p.ID,
+		"userId":    req.UserID,
+		"role":      storedRole,
+	})
+}
+
+// ---------- POST /v1/projects/{id}/update_member_role ----------
+//
+// Same shape as team-level update_member_role for parity. Upserts
+// project_members.role; if the user has no override row yet, this is
+// equivalent to add_member with the same target. Project admin only.
+
+type updateProjectMemberRoleReq struct {
+	MemberID string `json:"memberId"`
+	Role     string `json:"role"`
+}
+
+func (h *ProjectsHandler) updateProjectMemberRole(w http.ResponseWriter, r *http.Request) {
+	p, t, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can manage members")
+		return
+	}
+	var req updateProjectMemberRoleReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.MemberID = strings.TrimSpace(req.MemberID)
+	if req.MemberID == "" {
+		writeError(w, http.StatusBadRequest, "missing_member", "memberId is required")
+		return
+	}
+	storedRole, err := normaliseProjectRole(req.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_role", err.Error())
+		return
+	}
+
+	// Same team-membership guard as add_member — keeps semantics
+	// identical regardless of whether the override row exists yet.
+	var exists bool
+	if err := h.DB.QueryRow(r.Context(),
+		`SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2)`,
+		t.ID, req.MemberID).Scan(&exists); err != nil {
+		logErr("check team membership", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to verify team membership")
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusBadRequest, "not_team_member",
+			"User must be a member of the project's team")
+		return
+	}
+
+	if _, err := h.DB.Exec(r.Context(), `
+		INSERT INTO project_members (project_id, user_id, role)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+	`, p.ID, req.MemberID, storedRole); err != nil {
+		logErr("update project member role", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to update role")
+		return
+	}
+
+	uid, _ := auth.UserID(r.Context())
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionUpdateProjectMemberRole,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"memberId": req.MemberID,
+			"newRole":  storedRole,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"memberId": req.MemberID,
+		"role":     storedRole,
+	})
+}
+
+// ---------- POST /v1/projects/{id}/remove_member ----------
+//
+// Removes the project_members override for a user. After remove, the
+// user falls back to whatever role they have at the team level — if
+// any. Operators wanting to fully kick someone from a project should
+// remove them from the team instead (project_members CASCADE).
+//
+// Self-removal is allowed (any role can call with their own id); other
+// users can be removed only by project admins.
+
+type removeProjectMemberReq struct {
+	MemberID string `json:"memberId"`
+}
+
+func (h *ProjectsHandler) removeProjectMember(w http.ResponseWriter, r *http.Request) {
+	p, t, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	uid, _ := auth.UserID(r.Context())
+	var req removeProjectMemberReq
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	req.MemberID = strings.TrimSpace(req.MemberID)
+	if req.MemberID == "" {
+		writeError(w, http.StatusBadRequest, "missing_member", "memberId is required")
+		return
+	}
+	selfRemoval := req.MemberID == uid
+	if !selfRemoval && !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only project admins can remove other members")
+		return
+	}
+
+	tag, err := h.DB.Exec(r.Context(),
+		`DELETE FROM project_members WHERE project_id = $1 AND user_id::text = $2`,
+		p.ID, req.MemberID)
+	if err != nil {
+		logErr("remove project member", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to remove member")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// No override row to remove — surface as 404 so callers can
+		// distinguish "already removed" from "didn't exist". The
+		// member may still exist via team_members fallback; that's
+		// fine — they keep their team role.
+		writeError(w, http.StatusNotFound, "no_override",
+			"User has no project-level override; their team role is in effect")
+		return
+	}
+
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     t.ID,
+		ActorID:    uid,
+		Action:     audit.ActionRemoveProjectMember,
+		TargetType: audit.TargetProject,
+		TargetID:   p.ID,
+		Metadata: map[string]any{
+			"memberId":    req.MemberID,
+			"selfRemoval": selfRemoval,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"memberId": req.MemberID,
+		"status":   "override_removed",
+	})
+}
+
+// normaliseProjectRole accepts admin / member / viewer (Cloud's role
+// vocabulary for project-level overrides). Returns the canonical
+// stored value or an error explaining the allowed set.
+func normaliseProjectRole(role string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "admin":
+		return models.RoleAdmin, nil
+	case "member":
+		return models.RoleMember, nil
+	case "viewer":
+		return models.RoleViewer, nil
+	default:
+		return "", errors.New("role must be 'admin', 'member', or 'viewer'")
+	}
 }

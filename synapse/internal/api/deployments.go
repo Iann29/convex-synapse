@@ -153,9 +153,9 @@ func (h *DeploymentsHandler) createDeploymentAccessToken(w http.ResponseWriter, 
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
+	if !canAdminProject(role) {
 		writeError(w, http.StatusForbidden, "forbidden",
-			"Only team admins can create deployment access tokens")
+			"Only project admins can create deployment access tokens")
 		return
 	}
 	if h.Tokens == nil {
@@ -230,10 +230,7 @@ func (h *DeploymentsHandler) loadDeploymentForRequest(w http.ResponseWriter, r *
 		return nil, nil, nil, "", false
 	}
 
-	var role string
-	err = h.DB.QueryRow(r.Context(),
-		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
-		t.ID, uid).Scan(&role)
+	role, err := effectiveProjectRole(r.Context(), h.DB, p.ID, t.ID, uid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusForbidden, "forbidden", "You do not have access to this deployment")
 		return nil, nil, nil, "", false
@@ -576,17 +573,18 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to load project")
 		return
 	}
-	var role string
-	err = h.DB.QueryRow(r.Context(),
-		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
-		teamID, uid).Scan(&role)
-	if errors.Is(err, pgx.ErrNoRows) || role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can create deployments")
+	role, err := effectiveProjectRole(r.Context(), h.DB, projectID, teamID, uid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "forbidden", "You do not have access to this project")
 		return
 	}
 	if err != nil {
 		logErr("check role", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to check role")
+		return
+	}
+	if !canEditProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Viewers cannot create deployments; ask a project admin or member")
 		return
 	}
 
@@ -864,17 +862,18 @@ func (h *DeploymentsHandler) adoptDeployment(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to load project")
 		return
 	}
-	var role string
-	err = h.DB.QueryRow(r.Context(),
-		`SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2`,
-		teamID, uid).Scan(&role)
-	if errors.Is(err, pgx.ErrNoRows) || role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can adopt deployments")
+	role, err := effectiveProjectRole(r.Context(), h.DB, projectID, teamID, uid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusForbidden, "forbidden", "You do not have access to this project")
 		return
 	}
 	if err != nil {
 		logErr("check role", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to check role")
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can adopt deployments")
 		return
 	}
 
@@ -1189,8 +1188,8 @@ func (h *DeploymentsHandler) upgradeToHA(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can upgrade deployments")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can upgrade deployments")
 		return
 	}
 	if !h.HA.Enabled {
@@ -1266,8 +1265,8 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can delete deployments")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can delete deployments")
 		return
 	}
 
@@ -1440,8 +1439,8 @@ func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	if role != models.RoleAdmin {
-		writeError(w, http.StatusForbidden, "forbidden", "Only team admins can create deploy keys")
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden", "Only project admins can create deploy keys")
 		return
 	}
 	var req createDeployKeyReq
