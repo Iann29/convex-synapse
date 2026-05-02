@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { ApiError, api, type CliCredentials } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 
 type Props = {
   deploymentName: string;
@@ -50,13 +51,13 @@ export function CliCredentialsPanel({ deploymentName }: Props) {
 
   const copy = async () => {
     if (!creds) return;
-    try {
-      await navigator.clipboard.writeText(creds.exportSnippet);
+    const ok = await copyToClipboard(creds.exportSnippet);
+    if (ok) {
       setCopied(true);
       // 1.5s mirrors the URL-copy affordance on the deployment row.
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      setError("Could not copy to clipboard");
+    } else {
+      setError("Could not copy — select the snippet manually and Ctrl+C");
     }
   };
 

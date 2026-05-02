@@ -9,6 +9,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, api, type Team } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 
 type Params = { team: string };
 
@@ -79,13 +80,11 @@ export default function TeamGeneralPage({
 function CopySlugButton({ slug }: { slug: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(slug);
+    const ok = await copyToClipboard(slug);
+    if (ok) {
       setCopied(true);
       const t = setTimeout(() => setCopied(false), 1500);
       return () => clearTimeout(t);
-    } catch {
-      // Insecure origins can't reach the clipboard — just no-op.
     }
   };
   return (
