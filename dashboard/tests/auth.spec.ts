@@ -39,7 +39,13 @@ test("login with wrong password shows error and stays on /login", async ({ page 
   await expect(page.getByRole("alert")).toBeVisible();
 });
 
-test("anonymous /teams redirects to /login", async ({ page }) => {
+test("anonymous /teams redirects to /login (or /setup on a fresh box)", async ({
+  page,
+}) => {
   await page.goto("/teams");
-  await expect(page).toHaveURL(/\/login\b/);
+  // Anonymous → /login. If users table is empty (post-truncate), /login's
+  // install_status probe further redirects to /setup. Either is a valid
+  // "you're not signed in" landing page; race timing between the two
+  // varies across CI/local.
+  await expect(page).toHaveURL(/\/(login|setup)\b/);
 });
