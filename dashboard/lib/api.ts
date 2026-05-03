@@ -71,6 +71,13 @@ export type Deployment = {
   // present + true means the row is backed by Postgres + S3 with N replicas.
   haEnabled?: boolean;
   replicaCount?: number;
+  // v1.1+: runtime backing this deployment. "convex" (default) is the
+  // upstream Convex backend container. "aster" is an Aster runner cell
+  // (https://github.com/Iann29/aster) — capability-narrowed execution
+  // plane. Aster deployments don't have an HTTP dashboard yet, so the
+  // UI surfaces them with a different badge + a non-clickable "Open
+  // dashboard" hint.
+  kind?: "convex" | "aster";
 };
 
 // Body shape for POST /v1/projects/{id}/adopt_deployment.

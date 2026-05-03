@@ -428,6 +428,11 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                           HA{d.replicaCount ? ` ×${d.replicaCount}` : ""}
                         </Badge>
                       )}
+                      {d.kind === "aster" && (
+                        <Badge tone="amber" title="Aster runner cell — capability-narrowed execution plane (preview)">
+                          aster
+                        </Badge>
+                      )}
                     </div>
                     {(d.deploymentUrl || d.url) && (
                       <div className="mt-1 flex items-center gap-2">
@@ -452,7 +457,18 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                       variant="secondary"
                       size="sm"
                       onClick={() => openDashboard(d.name)}
-                      disabled={openingName === d.name}
+                      // The Convex dashboard iframe expects an HTTP backend;
+                      // kind=aster runs on a Unix-domain socket so the
+                      // existing handshake doesn't apply yet. Disable until
+                      // the cell-on-demand request path lands.
+                      disabled={
+                        openingName === d.name || d.kind === "aster"
+                      }
+                      title={
+                        d.kind === "aster"
+                          ? "Aster runner — HTTP dashboard not available yet"
+                          : undefined
+                      }
                     >
                       {openingName === d.name ? "Opening..." : "Open dashboard"}
                     </Button>
