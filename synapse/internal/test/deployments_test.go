@@ -42,6 +42,7 @@ type deploymentResp struct {
 	ProjectID      string     `json:"projectId"`
 	Name           string     `json:"name"`
 	DeploymentType string     `json:"deploymentType"`
+	Kind           string     `json:"kind"`
 	Status         string     `json:"status"`
 	DeploymentURL  string     `json:"deploymentUrl,omitempty"`
 	IsDefault      bool       `json:"isDefault"`
