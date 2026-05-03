@@ -42,6 +42,14 @@ type Provisioner interface {
 	// `/api/check_admin_key` validation. Random hex strings are rejected by
 	// the keybroker which signs admin keys with INSTANCE_SECRET.
 	GenerateAdminKey(ctx context.Context, instanceName, instanceSecret string) (string, error)
+
+	// DestroyAster removes a kind=aster deployment's brokerd container
+	// + per-deployment volume. Mirrors Destroy but for the Aster path
+	// (which has no SQLite volume / port mapping).
+	DestroyAster(ctx context.Context, deploymentName string) error
+	// StatusAster reports the brokerd container's docker state. Empty
+	// string + nil error means "container not found".
+	StatusAster(ctx context.Context, deploymentName string) (string, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -900,7 +908,7 @@ func (h *DeploymentsHandler) createAsterDeployment(
 		Name:           "",
 		DeploymentType: req.Type,
 		Kind:           models.DeploymentKindAster,
-		Status:         models.DeploymentStatusRunning,
+		Status:         models.DeploymentStatusProvisioning,
 		InstanceSecret: instanceSecret,
 		IsDefault:      req.IsDefault,
 		Reference:      req.Reference,
@@ -919,31 +927,38 @@ func (h *DeploymentsHandler) createAsterDeployment(
 		}
 		defer tx.Rollback(r.Context())
 
-		// admin_key='' — no Convex-style admin key for an Aster deployment.
-		// The column is NOT NULL but accepts empty string. The future
-		// Aster auth model uses sealed capsules + cell identity, not a
-		// shared admin key.
+		// admin_key='' — Aster has no Convex-style admin key. The column
+		// is NOT NULL but accepts empty string. The Aster auth model is
+		// capsule seals + cell identity, not a shared bearer.
 		if txErr = tx.QueryRow(r.Context(), `
 			INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
 			                          admin_key, instance_secret, is_default, reference,
 			                          creator_user_id, ha_enabled, replica_count)
 			VALUES ($1, $2, $3, $4, $5, NULL, '', $6, $7, NULLIF($8, ''), $9, false, 1)
 			RETURNING id, created_at
-		`, projectID, name, req.Type, models.DeploymentKindAster, models.DeploymentStatusRunning,
+		`, projectID, name, req.Type, models.DeploymentKindAster, models.DeploymentStatusProvisioning,
 			instanceSecret, req.IsDefault, req.Reference, uid,
 		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
 			return txErr
 		}
 
-		// Synthetic replica row. host_port NULL + container_id NULL is
-		// how the row signals "no Docker container backs me". Health
-		// worker / proxy will need to learn to skip kind=aster rows
-		// before they probe these — tracked separately, out of scope
-		// for the registration-only API.
-		if _, txErr = tx.Exec(r.Context(), `
+		// Replica row in 'provisioning' so the worker has a target to
+		// flip to 'running' once Docker.Provision returns. host_port and
+		// container_id stay NULL until provision succeeds — the brokerd
+		// listens on a Unix-domain socket, not a TCP port.
+		var replicaID string
+		if txErr = tx.QueryRow(r.Context(), `
 			INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, container_id, status)
-			VALUES ($1, 0, NULL, NULL, 'running')
-		`, d.ID); txErr != nil {
+			VALUES ($1, 0, NULL, NULL, 'provisioning')
+			RETURNING id
+		`, d.ID).Scan(&replicaID); txErr != nil {
+			return txErr
+		}
+
+		// Enqueue the same provisioning_job kind the Convex path uses;
+		// the worker reads d.kind from the join and dispatches into
+		// Client.provisionAster instead of the SQLite/HA path.
+		if txErr = provisioner.EnqueueReplica(r.Context(), tx, d.ID, replicaID, h.HealthcheckViaNetwork); txErr != nil {
 			return txErr
 		}
 		d.Name = name
@@ -1493,9 +1508,17 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 	if !d.Adopted {
 		// Tear down the container/volume first; if that fails, leave the row
 		// alone so the operator can retry. A successful Destroy is idempotent.
-		if err := h.Docker.Destroy(r.Context(), d.Name); err != nil {
-			logErr("docker destroy", err)
-			writeError(w, http.StatusInternalServerError, "destroy_failed", err.Error())
+		// kind=aster routes to DestroyAster (brokerd container + per-deployment
+		// volume); everything else uses the Convex backend Destroy.
+		var destroyErr error
+		if d.Kind == models.DeploymentKindAster {
+			destroyErr = h.Docker.DestroyAster(r.Context(), d.Name)
+		} else {
+			destroyErr = h.Docker.Destroy(r.Context(), d.Name)
+		}
+		if destroyErr != nil {
+			logErr("docker destroy", destroyErr)
+			writeError(w, http.StatusInternalServerError, "destroy_failed", destroyErr.Error())
 			return
 		}
 	}

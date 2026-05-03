@@ -478,9 +478,12 @@ type FakeDocker struct {
 	StatusFn           func(ctx context.Context, name string) (string, error)
 	StatusReplicaFn    func(ctx context.Context, name string, replicaIndex int) (string, error)
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
+	DestroyAsterFn     func(ctx context.Context, name string) error
+	StatusAsterFn      func(ctx context.Context, name string) (string, error)
 
-	Provisioned []dockerprov.DeploymentSpec
-	Destroyed   []string
+	Provisioned        []dockerprov.DeploymentSpec
+	Destroyed          []string
+	DestroyedAster     []string
 }
 
 func NewFakeDocker() *FakeDocker {
@@ -534,6 +537,25 @@ func (f *FakeDocker) GenerateAdminKey(ctx context.Context, name, secret string) 
 		return f.GenerateAdminKeyFn(ctx, name, secret)
 	}
 	return "fake-admin-key-" + name, nil
+}
+
+// DestroyAster mirrors Destroy but for kind=aster deployments. Default
+// records the name in DestroyedAster and returns nil; tests can override
+// to simulate failures.
+func (f *FakeDocker) DestroyAster(ctx context.Context, name string) error {
+	f.DestroyedAster = append(f.DestroyedAster, name)
+	if f.DestroyAsterFn != nil {
+		return f.DestroyAsterFn(ctx, name)
+	}
+	return nil
+}
+
+// StatusAster mirrors Status but for the brokerd container.
+func (f *FakeDocker) StatusAster(ctx context.Context, name string) (string, error) {
+	if f.StatusAsterFn != nil {
+		return f.StatusAsterFn(ctx, name)
+	}
+	return "running", nil
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising
