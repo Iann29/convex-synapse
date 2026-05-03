@@ -1,0 +1,16 @@
+{
+  "name": "aster-e2e-fixture",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "convex dev",
+    "deploy": "convex deploy"
+  },
+  "dependencies": {
+    "convex": "^1.30.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.5.0"
+  }
+}
