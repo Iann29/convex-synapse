@@ -314,7 +314,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	// scanning straight into the non-pointer fields blows up on NULL, so
 	// we go through pointers and dereference defensively below.
 	err := db.QueryRow(ctx, `
-		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
+		SELECT d.id, d.project_id, d.name, d.deployment_type, d.kind, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
 		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
 		       d.ha_enabled, d.replica_count,
@@ -326,7 +326,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		 WHERE d.name = $1
 		   AND d.status <> 'deleted'
 	`, name).Scan(
-		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
+		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Kind, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
 		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
 		&d.HAEnabled, &d.ReplicaCount,
@@ -588,6 +588,12 @@ type createDeploymentReq struct {
 	Reference string `json:"reference,omitempty"`
 	IsDefault bool   `json:"isDefault,omitempty"`
 
+	// Kind selects the runtime: "convex" (default) provisions a Convex
+	// backend container; "aster" registers an Aster runner cell row
+	// without provisioning anything (the production Aster image isn't
+	// released yet — see github.com/Iann29/aster). Empty == "convex".
+	Kind string `json:"kind,omitempty"`
+
 	// HA, if true, provisions the deployment with replica_count=2 backed
 	// by Postgres + S3 instead of SQLite + local volume. Refused with
 	// 400 ha_disabled when SYNAPSE_HA_ENABLED isn't true on this Synapse
@@ -656,6 +662,29 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		req.Type = models.DeploymentTypeDev
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_type", "deploymentType must be dev|prod|preview|custom")
+		return
+	}
+	switch req.Kind {
+	case models.DeploymentKindConvex, models.DeploymentKindAster:
+	case "":
+		req.Kind = models.DeploymentKindConvex
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be convex|aster")
+		return
+	}
+	if req.Kind == models.DeploymentKindAster && req.HA {
+		// HA semantics (Postgres + S3 + dual replicas) are tied to the
+		// Convex backend image. Aster has its own (future) story for
+		// horizontal execution; refusing here keeps the contract honest.
+		writeError(w, http.StatusBadRequest, "invalid_combination", "HA is not yet supported for kind=aster")
+		return
+	}
+	if req.Kind == models.DeploymentKindAster {
+		// kind=aster bypasses the entire provisioning pipeline: no port,
+		// no admin key, no replica row, no provisioning job — just record
+		// the metadata and return. publicDeploymentURL stays empty until
+		// an Aster image is wired in.
+		h.createAsterDeployment(w, r, projectID, teamID, uid, req)
 		return
 	}
 	if req.HA {
@@ -740,12 +769,12 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		// resolves to something live during a roll-out.
 		primaryPort := ports[0]
 		if txErr = tx.QueryRow(r.Context(), `
-			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
+			INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
 			                          admin_key, instance_secret, is_default, reference,
 			                          creator_user_id, ha_enabled, replica_count)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12, $13)
 			RETURNING id, created_at
-		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, primaryPort,
+		`, projectID, name, req.Type, models.DeploymentKindConvex, models.DeploymentStatusProvisioning, primaryPort,
 			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
 			req.HA, replicaCount,
 		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
@@ -810,6 +839,7 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 	d.Name = name
+	d.Kind = models.DeploymentKindConvex
 	if len(ports) > 0 {
 		d.HostPort = ports[0]
 	}
@@ -839,6 +869,106 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	// renders something the operator's browser can actually hit (PR #10
 	// added the helper but only wired it into /auth + /cli_credentials).
 	d.DeploymentURL = h.publicDeploymentURL(&d)
+	writeJSON(w, http.StatusCreated, d)
+}
+
+// createAsterDeployment is the kind=aster branch of createDeployment. It
+// inserts the deployment row plus a placeholder replica row but does
+// NOT allocate a host port, generate an admin key, enqueue a
+// provisioning job, or call Docker.Provision. The Aster image is not
+// released yet; this endpoint exists so Synapse can already model an
+// "Aster deployment" the same way it models a Convex one — name, RBAC,
+// audit log — while we ship the runtime behind it.
+//
+// The replica row is synthetic (host_port NULL, container_id NULL,
+// status='running'). Keeping it preserves the "every deployment has at
+// least one replica row" invariant the rest of the codebase assumes.
+func (h *DeploymentsHandler) createAsterDeployment(
+	w http.ResponseWriter,
+	r *http.Request,
+	projectID, teamID, uid string,
+	req createDeploymentReq,
+) {
+	instanceSecret, err := dockerprov.RandomHex(32)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
+		return
+	}
+
+	d := models.Deployment{
+		ProjectID:      projectID,
+		Name:           "",
+		DeploymentType: req.Type,
+		Kind:           models.DeploymentKindAster,
+		Status:         models.DeploymentStatusRunning,
+		InstanceSecret: instanceSecret,
+		IsDefault:      req.IsDefault,
+		Reference:      req.Reference,
+		CreatorUserID:  uid,
+		ReplicaCount:   1,
+	}
+
+	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
+		name, allocErr := h.allocateDeploymentName(r.Context())
+		if allocErr != nil {
+			return allocErr
+		}
+		tx, txErr := h.DB.Begin(r.Context())
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback(r.Context())
+
+		// admin_key='' — no Convex-style admin key for an Aster deployment.
+		// The column is NOT NULL but accepts empty string. The future
+		// Aster auth model uses sealed capsules + cell identity, not a
+		// shared admin key.
+		if txErr = tx.QueryRow(r.Context(), `
+			INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
+			                          admin_key, instance_secret, is_default, reference,
+			                          creator_user_id, ha_enabled, replica_count)
+			VALUES ($1, $2, $3, $4, $5, NULL, '', $6, $7, NULLIF($8, ''), $9, false, 1)
+			RETURNING id, created_at
+		`, projectID, name, req.Type, models.DeploymentKindAster, models.DeploymentStatusRunning,
+			instanceSecret, req.IsDefault, req.Reference, uid,
+		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
+			return txErr
+		}
+
+		// Synthetic replica row. host_port NULL + container_id NULL is
+		// how the row signals "no Docker container backs me". Health
+		// worker / proxy will need to learn to skip kind=aster rows
+		// before they probe these — tracked separately, out of scope
+		// for the registration-only API.
+		if _, txErr = tx.Exec(r.Context(), `
+			INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, container_id, status)
+			VALUES ($1, 0, NULL, NULL, 'running')
+		`, d.ID); txErr != nil {
+			return txErr
+		}
+		d.Name = name
+		return tx.Commit(r.Context())
+	})
+	if err != nil {
+		logErr("insert aster deployment", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to record deployment")
+		return
+	}
+
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionCreateDeployment,
+		TargetType: audit.TargetDeployment,
+		TargetID:   d.ID,
+		Metadata: map[string]any{
+			"name":           d.Name,
+			"deploymentType": req.Type,
+			"kind":           models.DeploymentKindAster,
+			"projectId":      projectID,
+		},
+	})
+
 	writeJSON(w, http.StatusCreated, d)
 }
 
