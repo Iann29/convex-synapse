@@ -9,10 +9,11 @@ Synapse spans Go (backend), Postgres (state), Docker (provisioning), and
 Next.js (dashboard). Features touch most of those layers; the convention
 below keeps changes consistent and tested.
 
-> **Working on the auto-installer (v0.6) instead?** Don't follow this
+> **Working on the auto-installer instead?** Don't follow this
 > recipe. Bash + bats + the operator-facing CLI live in
 > `installer/` and `setup.sh` — see the **synapse-installer** skill
-> (and `docs/V0_6_INSTALLER_PLAN.md`) for the right conventions.
+> for the right conventions, plus the v0.6 / v1.0 / v1.1+ ground
+> rules in [`AGENTS.md`](../../../AGENTS.md).
 
 ## The order to do things
 

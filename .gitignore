@@ -56,3 +56,15 @@ synapse/bin/
 
 # Playwright artefacts (root-level when running tests from CWD other than dashboard/)
 test-results/
+
+# Python bytecode caches (e.g. installer/updater/ daemon imports)
+**/__pycache__/
+
+# Claude Code runtime state (per-machine, not project)
+.claude/scheduled_tasks.lock
+
+# External-agent scratch space. The aster-runner-v0.2 prototype lives under
+# docs/search/ so a parallel agent can keep iterating without polluting this
+# repo's history. The validated copy is the standalone /home/ian/aster-runner
+# repo (or its GitHub mirror).
+docs/search/

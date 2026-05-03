@@ -601,8 +601,9 @@ func escapeJSON(s string) string {
 // the Resolver changes; the active probe loop arrives in a follow-up
 // once we have HA deployments to probe against.
 //
-// (Left here so reviewers see where the loop will live; spec deliberately
-// out-of-scope for this PR per docs/V0_5_PLAN.md.)
+// (Left here so reviewers see where the loop will live; the active
+// probe loop is deliberately out-of-scope for the v0.5 HA work — see
+// docs/ROADMAP.md "Deferred / out of scope" for the current status.)
 type healthProbe struct {
 	DB     *pgxpool.Pool
 	Period time.Duration

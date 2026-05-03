@@ -72,7 +72,7 @@ PR #1 on 2026-04-29.
 
 ## v0.5 — "HA-per-deployment" ✅ DONE
 
-10/10 chunks merged. `ha:true` on `create_deployment` provisions 2 replicas backed by Postgres + S3 (AES-GCM-encrypted creds at rest); proxy fails over between replicas on connection error; health worker rolls up replica statuses into the deployment-level status; dashboard exposes a toggle + `HA ×N` badge. Single-replica deployments unchanged. Full design log: [docs/V0_5_PLAN.md](V0_5_PLAN.md). Operator guide: [docs/HA_TESTING.md](HA_TESTING.md).
+10/10 chunks merged. `ha:true` on `create_deployment` provisions 2 replicas backed by Postgres + S3 (AES-GCM-encrypted creds at rest); proxy fails over between replicas on connection error; health worker rolls up replica statuses into the deployment-level status; dashboard exposes a toggle + `HA ×N` badge. Single-replica deployments unchanged. Operator guide: [docs/HA_TESTING.md](HA_TESTING.md).
 
 - [x] **Chunk 1** — `internal/crypto/SecretBox` (AES-256-GCM envelope) for HA storage credentials encrypted at rest
 - [x] **Chunk 2** — Postgres migrations 000004–000006: `deployment_storage` + `deployment_replicas` + `replica_id` on jobs + `upgrade_to_ha` job kind
@@ -88,8 +88,6 @@ PR #1 on 2026-04-29.
 ## v0.6 — "Auto-installer" ✅ DONE
 
 > **The installer is the single most important thing on the roadmap.** Synapse's reason to exist is to make self-hosting Convex painless. v0.6 ships every piece: foundation + lifecycle commands + `curl | sh` one-liner + browser first-run wizard. Tagged as `v0.6.3` on GitHub Releases.
-
-Full design + phased plan: **[docs/V0_6_INSTALLER_PLAN.md](V0_6_INSTALLER_PLAN.md)**.
 
 North star (achieved):
 
@@ -162,10 +160,8 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
   deployments (matches name / type / reference), status indicator
   dot on the pill (running / provisioning / failed / stopped),
   last-viewed timestamp under each item ("visited 5m ago") read
-  from localStorage stamped by the embed shell on mount. As-built
-  + cross-origin walls (the two ideas that hit them) documented in
-  [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md)
-  §Phase 3. Tests: +5 Playwright (46).
+  from localStorage stamped by the embed shell on mount. Tests: +5
+  Playwright (46).
 - [x] **Project-level RBAC (admin / member / viewer).** `project_members`
   table layered on top of `team_members` — overrides win, team is the
   fallback. Solves "I can't safely invite my team without per-project
@@ -194,10 +190,8 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
   credentials via the existing postMessage handshake. Zero fork of the
   upstream image, zero rushjs/Docker tax. Reserved
   `GET /v1/internal/list_deployments_for_dashboard?token=...` endpoint
-  for a future in-iframe Strategy B if we ever take that path. Decision
-  log + as-built notes in
-  [`docs/CONVEX_DASHBOARD_PICKER_PLAN.md`](CONVEX_DASHBOARD_PICKER_PLAN.md).
-  Tests: +7 Go integration (224), +4 Playwright (38). Real-VPS smoked.
+  for a future in-iframe Strategy B if we ever take that path. Tests:
+  +7 Go integration (224), +4 Playwright (38). Real-VPS smoked.
 - [x] **OpenAPI surface — 100% of self-hosted-relevant subset (v1.0).** Closes
   the gap that brought coverage from ~70% to "everything that makes sense
   for a self-hosted box". 12 new handlers + a structured `404

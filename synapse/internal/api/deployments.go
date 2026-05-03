@@ -1230,7 +1230,7 @@ type upgradeToHAReq struct {
 // Today the worker rejects upgrade_to_ha jobs with a clear error
 // instead of corrupting state mid-migration. That makes the API
 // surface stable so operators can wire it up; the heavy lifting is
-// scheduled for v0.5.1 (see docs/V0_5_PLAN.md).
+// deferred (see docs/ROADMAP.md "Deferred / out of scope").
 //
 // Validation refuses early when:
 //   - HA isn't enabled on this Synapse instance
@@ -1296,7 +1296,7 @@ func (h *DeploymentsHandler) upgradeToHA(w http.ResponseWriter, r *http.Request)
 	// flips to enqueueing an `upgrade_to_ha` job and returning 202.
 	writeError(w, http.StatusNotImplemented, "ha_upgrade_not_yet_implemented",
 		"upgrade_to_ha is in flight (snapshot_export → re-provision → snapshot_import → swap); "+
-			"see docs/V0_5_PLAN.md")
+			"see docs/ROADMAP.md 'Deferred / out of scope'")
 
 	// Audit the *attempt* even though we refused — operators trying to
 	// upgrade need a paper trail of who pinged the endpoint and when.
