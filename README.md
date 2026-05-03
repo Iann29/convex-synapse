@@ -119,15 +119,19 @@ without one, Synapse exposes plain HTTP on `:6790` (dashboard) and
 | OpenAPI parity | 100% of self-hosted-relevant subset; ~60 cloud-only paths return structured `404 not_supported_in_self_hosted` |
 | API stability | semver on the `/v1/...` surface; deprecation policy + change log in [`docs/API.md`](docs/API.md) |
 
-**Tests:** 238 Go integration tests + 46 Playwright e2e + 305 bats unit
+**Tests:** 264 Go integration tests + 46 Playwright e2e + 336 bats unit
 tests, all green in CI on every push.
 
 ## Releases
 
-Latest: [**v1.0.0** — "Safe to depend on"](https://github.com/Iann29/convex-synapse/releases/tag/v1.0.0)
-(2026-05-02).
+Latest: [**v1.1.1**](https://github.com/Iann29/convex-synapse/releases/tag/v1.1.1)
+(2026-05-03) — hotfix for the v1.1.0 dashboard auto-update flow
+(`ProtectHome=true` in the systemd unit was breaking docker buildx
+inside the daemon's sandbox). v1.1.0 introduced the click-to-upgrade
+banner; v1.0.x landed the wizard, deploy keys, and OpenAPI 100%.
 
-`./setup.sh --upgrade` queries
+Once you're on v1.1.1+, upgrades are a click in the dashboard. Before
+that, `./setup.sh --upgrade` queries
 [`/releases/latest`](https://github.com/Iann29/convex-synapse/releases/latest)
 to discover the target tag automatically and falls back via snapshot
 on failure. Versioning + deprecation policy lives in

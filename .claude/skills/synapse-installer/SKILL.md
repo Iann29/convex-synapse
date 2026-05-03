@@ -1,16 +1,21 @@
 ---
 name: synapse-installer
-description: Build and maintain the Synapse auto-installer (v0.6) — pure-bash setup.sh + supporting helpers + bats tests. Use when the user asks to "work on the installer", "improve setup.sh", "add a pre-flight check", "make installation easier", or anything under installer/ / setup.sh in the repo.
+description: Build and maintain the Synapse auto-installer — pure-bash setup.sh + supporting helpers + bats tests + the Python self-update daemon under installer/updater/. Use when the user asks to "work on the installer", "improve setup.sh", "add a pre-flight check", "fix the wizard", "touch the updater daemon", or anything under installer/ / setup.sh in the repo.
 ---
 
 # Working on the Synapse auto-installer
 
-The installer is v0.6's deliverable: a one-command flow that takes a
-fresh VPS to a running Synapse with TLS, secrets, and a registered
-admin user. Full design lives in
-[`docs/V0_6_INSTALLER_PLAN.md`](../../../docs/V0_6_INSTALLER_PLAN.md).
-**Read that first** before touching any installer file — it has the
-phased roadmap, file layout, anti-features, and decision rationale.
+The installer is the operator-facing one-command flow that takes a
+fresh VPS to a running Synapse with TLS, secrets, an admin user,
+**and** (since v1.1.0) a host-side daemon that runs future upgrades
+on a click from the dashboard. Original design lives in
+[`docs/V0_6_INSTALLER_PLAN.md`](../../../docs/V0_6_INSTALLER_PLAN.md);
+shipped milestones plus follow-ups (v1.0.1 wizard, v1.1.0 self-update
+daemon, etc) are tracked in
+[`docs/ROADMAP.md`](../../../docs/ROADMAP.md). The ground rules in
+[`AGENTS.md`](../../../AGENTS.md) v0.6 / v1.0 / v1.1+ sections capture
+the bug classes that bit each milestone — read those before adding a
+new feature on top.
 
 ## When to use this skill (vs. synapse-feature)
 
@@ -35,7 +40,7 @@ set -euo pipefail
 # triggers it.
 trap 'on_exit $?' EXIT
 
-readonly INSTALLER_VERSION="0.6.0"
+readonly INSTALLER_VERSION="1.1.1"   # bump on every release that ships installer changes
 readonly LOG_FILE="/var/log/synapse-install.log"
 
 # All sourced helpers live in installer/lib/, dot-included once at

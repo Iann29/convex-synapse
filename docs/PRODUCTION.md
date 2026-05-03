@@ -32,9 +32,12 @@ cd convex-synapse
 ./setup.sh --domain=synapse.yourdomain.com
 ```
 
-Hosted curl-pipe-shell (`curl -sf https://get.synapse.dev | sh`) is
-reserved for **v0.6.2** — it just needs a static script host pinned to
-a git tag.
+Hosted curl-pipe-shell shipped in v0.6.2 — `curl -sSf
+https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh
+| bash` boots the installer straight from GitHub. v1.0.1 added the
+zero-flag interactive wizard on top, so a brand-new operator can run
+that exact line and walk through 4 questions instead of memorising
+flags.
 
 What `setup.sh` does, in order:
 
@@ -64,8 +67,8 @@ re-runs (everything's cached).
 | `--skip-dns-check` | Proceed before the A-record propagates. Caddy will still fail to issue the cert until DNS lands; useful when you're only testing the install logic |
 | `--enable-ha` | Opt the install into HA-per-deployment mode. Requires `SYNAPSE_BACKEND_POSTGRES_URL` + `SYNAPSE_BACKEND_S3_*` preset in env. See [HA_TESTING.md](HA_TESTING.md). |
 | `--doctor` | Run preflight against an existing install. No mutations. Useful for "is my VPS still healthy?" or post-upgrade smoke-test |
-| `--upgrade` | Reserved for v0.6.1. Will run `git pull && docker compose pull && up -d --build` with rollback on health failure |
-| `--uninstall` | Reserved for v0.6.1. Will tear down compose + remove the Caddyfile block + optional `--volumes` |
+| `--upgrade` | Pulls the target ref (auto-detected via GitHub `/releases/latest`, override with `--ref=<tag\|branch>`), rsyncs the new tree, runs `docker compose up -d --build`, snapshots images for rollback on health failure. v1.1.0+ admins can do the same flow with one click in the dashboard banner |
+| `--uninstall` | Tears down compose, runs a mandatory pre-uninstall `--backup` first (skip with `--skip-backup`), wipes per-deployment volumes (keep with `--keep-volumes`), strips the host-Caddy managed block. Shipped in v0.6.1 |
 | `--install-dir=<path>` | Override `/opt/synapse` (rare; useful for side-by-side test installs) |
 | `--acme-email=<addr>` | Email for Let's Encrypt; defaults to `admin@<domain>` |
 
@@ -140,27 +143,38 @@ For the Convex backend data itself: the SQLite file lives in
 or use `npx convex export` against each deployment if you need
 portable dumps.
 
-`./setup.sh backup` and `./setup.sh restore` are reserved for v0.6.1
-and will package both into a single tarball.
+`./setup.sh --backup` and `./setup.sh --restore=<archive>` shipped
+in v0.6.1 and package the `.env`, `docker-compose.yml`, `pg_dump`,
+and per-deployment Convex volumes into a single tarball. Add
+`--to-s3=s3://bucket/path/` (v1.0 backup chunk) to upload after
+the local bundle.
 
 ## Upgrading
 
-For v0.6.0 (this milestone), the manual upgrade dance:
+**v1.1.0+ — one click from the dashboard.** When a new release
+ships, a yellow banner appears at the top of the dashboard for any
+team admin: "vX.Y.Z available". Click → modal with rendered release
+notes → **Upgrade now** dispatches `setup.sh --upgrade` via a
+host-side systemd daemon, streaming the build log to the modal. The
+synapse-api restarts mid-upgrade; the modal detects it and auto-
+reloads the page once health comes back.
+
+**Pre-1.1.0, or non-systemd hosts, or scripted/CI upgrades** — manual
+SSH upgrade still works the same:
 
 ```bash
-cd /opt/synapse
-git pull
-docker compose build synapse dashboard
-docker compose up -d synapse dashboard
+cd /opt/synapse && sudo ./setup.sh --upgrade
 ```
+
+`./setup.sh --upgrade` queries `/releases/latest`, snapshots image
+tags for rollback, rsyncs the new tree, runs `docker compose up -d
+--build`, waits for `/health` (60 s timeout), and stamps
+`SYNAPSE_VERSION` on success or rolls images back on failure.
+Override the target with `--ref=<tag|branch>` for testing or pinning.
 
 Embedded migrations apply on startup — operator never runs them
 manually. The provisioner queue + advisory locks keep an in-flight
 deploy from being lost during the restart.
-
-`./setup.sh --upgrade` (reserved for **v0.6.1**) will wrap this with a
-health-check-based rollback if the new version fails to come up healthy
-within 60 s.
 
 ## Common gotchas
 
@@ -174,12 +188,14 @@ within 60 s.
 
 ## What's NOT included today
 
-- Auto-renewing TLS for **per-deployment** custom domains (v1.0 — Caddy only terminates Synapse's own domain right now)
-- Multi-region replication (out of scope; lease design forbids it upstream — see V0_5_PLAN.md)
-- `./setup.sh --upgrade` / `--uninstall` / `--backup` (reserved for v0.6.1)
-- Hosted `curl -sf https://get.synapse.dev | sh` one-liner (reserved for v0.6.2)
-- Browser-driven first-run wizard (reserved for v0.6.3)
-- A K8s / Helm install path (v1.0)
+- Multi-region replication (out of scope — Convex's per-deployment lease design forbids active-active upstream; see [`V0_5_PLAN.md`](V0_5_PLAN.md))
+- A K8s / Helm install path (intentionally deferred — `setup.sh` covers the single-VPS case which is 95% of self-hosters)
+- Stripe / Orb billing, WorkOS / SAML SSO, Discord / Vercel / OAuth-app integrations (cloud-only Convex features; see [`ROADMAP.md`](ROADMAP.md) "Maybe never")
+
+For everything that *did* land — auto-installer, lifecycle commands,
+hosted `curl | bash` bootstrap, first-run wizard, custom domains,
+deploy keys, dashboard auto-update — see [`ROADMAP.md`](ROADMAP.md)
+"Shipped".
 
 ---
 

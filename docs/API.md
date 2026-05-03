@@ -431,9 +431,51 @@ npx convex dev --once
 npx convex deploy
 ```
 
-### `POST /v1/deployments/{name}/create_deploy_key` ✅ (admins only)
+### `POST /v1/deployments/{name}/deploy_keys` ✅ (admins only) — v1.0.3+
 
-Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
+Body: `{name}` (required, ≤64 chars, unique per active deploy key on
+this deployment). Mints a fresh admin key via the Convex backend's
+`generate_key` binary (signed by `INSTANCE_SECRET`, so multiple keys
+per deployment coexist).
+
+Returns the full key + paste-ready snippets exactly **once**:
+```json
+{
+  "id": "...",
+  "deploymentId": "...",
+  "name": "vercel",
+  "adminKey": "<deployment>|<hex>",
+  "prefix": "abc12def",
+  "createTime": "2026-05-03T...",
+  "envSnippet": "CONVEX_SELF_HOSTED_URL='...'\nCONVEX_SELF_HOSTED_ADMIN_KEY='...'",
+  "exportSnippet": "export CONVEX_SELF_HOSTED_URL='...'\nexport CONVEX_SELF_HOSTED_ADMIN_KEY='...'"
+}
+```
+
+The dashboard MUST surface the snippet immediately and never persist
+it — Synapse stores only `sha256(adminKey)` + the 8-char prefix
+(GitHub-PAT model).
+
+`409 name_in_use` when an active key already has that name; revoking
+frees the name.
+
+### `GET /v1/deployments/{name}/deploy_keys` ✅ — v1.0.3+
+
+Lists active (non-revoked) deploy keys with metadata only. The
+`adminKey` field is omitted; only `prefix` is exposed for the
+dashboard chip.
+
+### `POST /v1/deployments/{name}/deploy_keys/{id}/revoke` ✅ (admins only) — v1.0.3+
+
+Sets `revoked_at = now()`. The deployment_id guard catches cross-
+deployment revoke attempts as 404.
+
+**Important honesty**: revoke hides the row from the dashboard but
+does NOT immediately invalidate the credential on the backend.
+Admin keys are stateless on the Convex backend (verified by
+signature against `INSTANCE_SECRET`); per-key revoke would need
+Synapse to be in the request path. To actually disable a leaked
+key today, rotate the deployment as a whole.
 
 ### `POST /v1/deployments/{name}/access_tokens` ✅ (admins only)
 
@@ -604,6 +646,68 @@ Body: `{"id": "<token-uuid>"}`. Hard-deletes the token if it belongs to
 the caller. Returns `{"id": "…"}` on success, `404 token_not_found`
 otherwise. Subsequent auth attempts with that token will be rejected by
 the auth middleware.
+
+## Instance admin (v1.1.0+)
+
+`/v1/admin/*` endpoints cover instance-level operations: version
+check + auto-upgrade. All gated to **any user with team-admin role
+on at least one team** — Synapse has no global super-admin role; in
+single-tenant self-hosted, that proxy is good enough.
+
+### `GET /v1/admin/version_check` ✅
+
+Returns the running version vs. the latest GitHub release. The
+GitHub fetch is cached server-side for 15 min (well under the 60/h
+unauthenticated rate limit).
+
+```json
+{
+  "current": "1.1.1",
+  "latest":  "1.2.0",
+  "updateAvailable": true,
+  "releaseUrl":   "https://github.com/Iann29/convex-synapse/releases/tag/v1.2.0",
+  "releaseNotes": "...",
+  "publishedAt":  "2026-05-03T...",
+  "fetchedAt":    "2026-05-03T..."
+}
+```
+
+When GitHub is unreachable, `current` is still populated and `error`
+carries a short reason; `updateAvailable` is forced to `false` so
+the dashboard never claims a stale install when it can't verify.
+
+### `POST /v1/admin/upgrade` ✅ (team admins)
+
+Body: `{ref?}` (optional — defaults to `/releases/latest`). Forwards
+to the host-side `synapse-updater` daemon over a unix socket. Audit
+log: `upgradeStarted`. Returns the daemon's `{started, ref}` shape
+verbatim on 2xx; daemon errors get re-wrapped into the standard
+`{code, message}` envelope (e.g. `409 upgrade_in_progress` if the
+daemon is already running an upgrade).
+
+`503 updater_unavailable` when the host has no systemd / no python3
+/ no daemon running. Operators on those hosts upgrade via SSH:
+`./setup.sh --upgrade`.
+
+### `GET /v1/admin/upgrade/status` ✅
+
+Read-through to the daemon's `/status`:
+
+```json
+{
+  "state": "idle | running | success | failed | unavailable",
+  "ref": "v1.2.0",
+  "startedAt": "...",
+  "finishedAt": "...",
+  "exitCode": 0,
+  "logTail": ["[setup.sh] ...", "..."],
+  "logPath": "/var/log/synapse-updater/<utc>.log"
+}
+```
+
+The dashboard polls every 2.5s while the modal is open; when 3
+consecutive polls fail it assumes the synapse-api container is
+mid-restart and shifts to "page reloads in 90s" mode.
 
 ## Out of scope (cloud-only)
 

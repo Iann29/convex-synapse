@@ -263,6 +263,26 @@ deployments so attackers can't burn Let's Encrypt quota.
 - **Proxy.Handler dispatches by Host first, path fallback second.** When `baseDomain` is non-empty AND `r.Host` matches `<sub>.<base>`, route by leftmost label using `r.URL.Path` verbatim. Otherwise fall through to `/d/<name>/...` — internal compose-network calls keep working with the path form even when custom domains are enabled cluster-wide.
 - **`adopted` deployments keep their operator-supplied URL** even when BaseDomain is set. They live outside Synapse's DNS scope; rewriting would break the operator's existing setup.
 
+## v1.0+ ground rules (deploy keys, npx convex)
+
+- **The Convex CLI's `new URL("/api/...", baseUrl)` is host-anchored** — it discards the path component on the base. So a snippet pointing at `<host>:8080/d/<name>` resolves to `<host>:8080/api/get_config_hashes` and 404s. The `cliDeploymentURL` helper (separate from `publicDeploymentURL`) MUST emit a root URL: subdomain mode for BaseDomain installs, raw `<host>:<HostPort>` for path-proxy installs. Browsers keep using `publicDeploymentURL` for "Open URL" buttons. v1.0.2 fix.
+- **Deploy keys are admin-key aliases with audit, not real revocation.** The Convex backend authenticates admin keys by signature against `INSTANCE_SECRET` (stateless), so `revoked_at` hides the row from the dashboard but the credential still works on the backend until the operator rotates the deployment. Surface this gotcha in the UI (yellow banner + confirm dialog). Tier-2 (Synapse-in-the-path token validation) is deferred.
+- **Clipboard API is HTTPS/localhost only.** `dashboard/lib/clipboard.ts` falls back to `document.execCommand("copy")` for plain-HTTP installs (the wizard's "test on this IP" path lands here). Every Copy button MUST go through the helper.
+
+## v1.1+ ground rules (host-side updater + dashboard auto-upgrade)
+
+The updater daemon lives **outside docker compose** as a systemd
+unit. Its job is to recreate the compose stack — putting it inside
+compose would have it killing itself mid-upgrade. It listens on a
+unix socket (`/run/synapse/updater.sock`) so the synapse-api
+container can reach it via a bind-mount without ever exposing TCP.
+
+- **Never add `ProtectHome=true` to the unit.** It looks like clean hardening (the daemon doesn't read /root) but the daemon FORKS `setup.sh` → `docker compose up --build` → `docker buildx`, which insists on creating `/root/.docker/`. Read-only /root → buildx fails → upgrade fails → rollback. v1.1.0 shipped with this bug; v1.1.1 dropped it. Don't reintroduce. Same caveat for `LockPersonality` and `RestrictRealtime` — drop hardening that doesn't have a threat model.
+- **`SYNAPSE_UPDATER_NO_RESTART=1` is the self-update guard.** The daemon sets this in the env it passes to `setup.sh`. `phase_install_updater` honors it and skips the `systemctl restart synapse-updater` that would otherwise kill the running parent. Operators running `setup.sh` manually via SSH (env unset) get the restart for free; daemon-driven upgrades skip it and the operator restarts the daemon manually if the binary itself changed.
+- **Daemon binary refreshes are best-effort.** `phase_install_updater` writes the new file to disk but the running Python process keeps the old code in memory until `systemctl restart`. The daemon itself rarely changes between releases; if it does, the phase prints a hint about the manual restart.
+- **Three admin endpoints under `/v1/admin/`** (`version_check`, `upgrade`, `upgrade/status`). All gated to "any user with team-admin role on at least one team" — Synapse has no global super-admin; in single-tenant self-hosted that proxy is good enough. The `version_check` cache is 15min; GitHub's unauthenticated rate limit is 60/h.
+- **Mid-upgrade UX**: synapse-api is recreated by `docker compose up --build`. The dashboard modal polls `/upgrade/status`; on 3 consecutive failures it flips to "page reloads in 90s" and force-reloads. The new build's banner stamps the new version and the modal closes itself.
+
 ## URL rewrite contract (PR #10 + #24)
 
 Every endpoint that returns a `models.Deployment` (raw or wrapped)

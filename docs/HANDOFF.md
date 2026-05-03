@@ -1,5 +1,13 @@
 # HANDOFF — close the OpenAPI gap
 
+> **ARCHIVED** (2026-05-03). This was the session prompt that drove the
+> OpenAPI 100% push. That work shipped in v1.0.0; subsequent releases
+> (v1.0.1 wizard, v1.0.2 npx convex CLI fix, v1.0.3 deploy keys, v1.1.0
+> auto-update, v1.1.1 hotfix) are tracked in [`ROADMAP.md`](ROADMAP.md).
+> The test counts and "missing endpoints" lists below are frozen at the
+> time of the handoff and are no longer accurate. Kept for the
+> institutional memory of how the OpenAPI gap was scoped.
+
 You're stepping into a session where the previous agent shipped:
 
 - ✅ **v0.6 complete** — auto-installer, lifecycle commands, `curl | sh`, first-run wizard, tagged as `v0.6.3` on GitHub Releases.
