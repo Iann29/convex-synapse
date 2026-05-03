@@ -36,6 +36,19 @@ type DeploymentSpec struct {
 	// for the backend to become healthy. See config.HealthcheckViaNetwork.
 	HealthcheckViaNetwork bool
 
+	// Kind selects the runtime image. Empty / "convex" → the upstream
+	// Convex backend image (the only path before v1.1+). "aster" →
+	// provisions an Aster runner cell instead. The Aster path skips
+	// HostPort allocation and the SQLite/Postgres machinery; it spawns
+	// a brokerd container that listens on a Unix-domain socket inside
+	// a per-deployment Docker volume.
+	Kind string
+
+	// AsterImage overrides the brokerd image used when Kind == "aster".
+	// Empty falls back to the cluster default `aster-brokerd:0.3` (or
+	// whatever Synapse's config.AsterBrokerImage carries).
+	AsterImage string
+
 	// ReplicaIndex is the position of this replica within the deployment
 	// (0, 1, …). Ignored unless HAReplica=true.
 	ReplicaIndex int
@@ -148,6 +161,12 @@ func (c *Client) EnsureImage(ctx context.Context) error {
 // On failure, it best-effort removes any partially-created container so the
 // caller can retry without leaking resources.
 func (c *Client) Provision(ctx context.Context, spec DeploymentSpec) (*DeploymentInfo, error) {
+	// kind=aster takes a separate path: no host port, no SQLite volume,
+	// no Convex backend image. Provisions the brokerd container that
+	// listens on a Unix-domain socket inside a per-deployment volume.
+	if spec.Kind == "aster" {
+		return c.provisionAster(ctx, spec)
+	}
 	if spec.Name == "" || spec.InstanceSecret == "" || spec.HostPort == 0 {
 		return nil, errors.New("provision: name, instance secret, and host port required")
 	}

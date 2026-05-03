@@ -253,6 +253,11 @@ type claimedJob struct {
 	InstanceSecret        string
 	HealthcheckViaNetwork bool
 
+	// Kind selects which provisioning path the worker drives:
+	// "" / "convex" → existing Convex backend container; "aster" →
+	// Aster brokerd container (no host port, no SQLite/Postgres env).
+	Kind string
+
 	// Replica targeting (v0.5+). When ReplicaID is empty, this is a
 	// pre-v0.5 single-replica job; the worker treats it as
 	// replica_index=0 with no HA suffix. When set, the worker reads
@@ -309,7 +314,7 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 	var deploymentHostPort *int
 	err = tx.QueryRow(ctx, `
 		SELECT j.id, j.deployment_id, j.replica_id::text,
-		       d.name, d.host_port, d.instance_secret, d.ha_enabled,
+		       d.name, d.host_port, d.instance_secret, d.ha_enabled, d.kind,
 		       r.replica_index, r.host_port,
 		       j.healthcheck_via_network
 		  FROM provisioning_jobs j
@@ -320,7 +325,7 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 		 FOR UPDATE OF j SKIP LOCKED
 		 LIMIT 1
 	`).Scan(&j.JobID, &j.DeploymentID, &replicaIDStr,
-		&j.Name, &deploymentHostPort, &j.InstanceSecret, &j.HAEnabled,
+		&j.Name, &deploymentHostPort, &j.InstanceSecret, &j.HAEnabled, &j.Kind,
 		&replicaIndex, &replicaHostPort,
 		&j.HealthcheckViaNetwork)
 	_ = replicaID
@@ -542,6 +547,7 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		HealthcheckViaNetwork: j.HealthcheckViaNetwork,
 		HAReplica:             j.HAEnabled,
 		ReplicaIndex:          j.ReplicaIndex,
+		Kind:                  j.Kind,
 	}
 	if j.Storage != nil {
 		spec.Storage = &dockerprov.StorageEnv{

@@ -3,14 +3,15 @@ package synapsetest
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
-// TestDeployments_CreateAsterRegistersWithoutContainer is the load-bearing
-// test for the kind=aster path: the row exists with the right shape, the
-// FakeDocker provisioner was *not* called, no host port was allocated, and
-// no provisioning_jobs row was enqueued. This is the contract that lets
-// us model an Aster deployment in Synapse before the Aster image ships.
-func TestDeployments_CreateAsterRegistersWithoutContainer(t *testing.T) {
+// TestDeployments_CreateAsterEnqueuesProvisioning is the contract test
+// for the kind=aster path: the row is created in 'provisioning' state,
+// no host port is allocated, no admin key is generated, and a
+// provisioning_job is enqueued so the worker spawns the brokerd
+// container with spec.Kind="aster".
+func TestDeployments_CreateAsterEnqueuesProvisioning(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()
 	team := createTeam(t, h, owner.AccessToken, "Aster Co")
@@ -25,24 +26,46 @@ func TestDeployments_CreateAsterRegistersWithoutContainer(t *testing.T) {
 	if got.Kind != "aster" {
 		t.Errorf("kind: got %q want aster", got.Kind)
 	}
-	if got.Status != "running" {
-		t.Errorf("status: got %q want running (aster is not provisioned)", got.Status)
-	}
-	if got.DeploymentURL != "" {
-		t.Errorf("deploymentUrl: got %q want empty (no container behind kind=aster)", got.DeploymentURL)
+	if got.Status != "provisioning" {
+		t.Errorf("status: got %q want provisioning (worker hasn't run yet)", got.Status)
 	}
 	if got.Name == "" {
 		t.Fatal("expected a generated name")
 	}
 
-	// FakeDocker MUST NOT have been called for kind=aster.
-	if n := len(h.Docker.Provisioned); n != 0 {
-		t.Errorf("FakeDocker.Provisioned: got %d calls, want 0; specs=%+v",
-			n, h.Docker.Provisioned)
+	// Wait for the worker to flip to running. FakeDocker.Provision
+	// returns immediately with a fake-container id.
+	waitForStatus(t, h, got.Name, "running", 5*time.Second)
+
+	// FakeDocker SHOULD have been called exactly once with Kind="aster".
+	// host_port is zero (UDS, no TCP listener); InstanceSecret carries
+	// the seal-key seed for the brokerd's CapsuleSealKey.
+	if n := len(h.Docker.Provisioned); n != 1 {
+		t.Fatalf("FakeDocker.Provisioned: got %d calls, want 1", n)
+	}
+	spec := h.Docker.Provisioned[0]
+	if spec.Kind != "aster" {
+		t.Errorf("spec.Kind: got %q want aster", spec.Kind)
+	}
+	if spec.Name != got.Name {
+		t.Errorf("spec.Name: got %q want %q", spec.Name, got.Name)
+	}
+	if spec.HostPort != 0 {
+		t.Errorf("spec.HostPort: got %d want 0 (aster has no TCP port)", spec.HostPort)
+	}
+	if spec.HAReplica {
+		t.Errorf("spec.HAReplica: got true want false")
+	}
+	if spec.Storage != nil {
+		t.Errorf("spec.Storage: got non-nil; aster has no Postgres+S3 env")
+	}
+	if spec.InstanceSecret == "" {
+		t.Errorf("spec.InstanceSecret empty; broker needs the seal-key seed")
 	}
 
-	// DB row shape: kind='aster', container_id NULL, host_port NULL,
-	// admin_key empty.
+	// DB row shape after worker pass: kind=aster, status=running,
+	// container_id is the fake provisioner output. host_port stays
+	// NULL — there's no TCP listener.
 	var (
 		kind        string
 		status      string
@@ -63,30 +86,17 @@ func TestDeployments_CreateAsterRegistersWithoutContainer(t *testing.T) {
 	if status != "running" {
 		t.Errorf("DB status: got %q want running", status)
 	}
-	if containerID != nil {
-		t.Errorf("DB container_id: got %v want NULL", *containerID)
+	if containerID == nil || *containerID == "" {
+		t.Errorf("DB container_id: got nil/empty want fake-container-...")
 	}
 	if hostPort != nil {
-		t.Errorf("DB host_port: got %v want NULL", *hostPort)
+		t.Errorf("DB host_port: got %v want NULL (no TCP listener for aster)", *hostPort)
 	}
 	if adminKey != "" {
 		t.Errorf("DB admin_key: got %q want empty (aster has no admin key)", adminKey)
 	}
 
-	// No provisioning_jobs row should have been enqueued.
-	var jobCount int
-	err = h.DB.QueryRow(h.rootCtx,
-		`SELECT count(*) FROM provisioning_jobs WHERE deployment_id = $1`, got.ID).
-		Scan(&jobCount)
-	if err != nil {
-		t.Fatalf("count provisioning_jobs: %v", err)
-	}
-	if jobCount != 0 {
-		t.Errorf("provisioning_jobs: got %d, want 0 for kind=aster", jobCount)
-	}
-
-	// Synthetic replica row preserves the "every deployment has a
-	// replica" invariant. host_port and container_id are NULL.
+	// Replica row was flipped to 'running' by the worker too.
 	var (
 		replicaCount  int
 		replicaStatus string
@@ -133,7 +143,7 @@ func TestDeployments_CreateDefaultKindIsConvex(t *testing.T) {
 		t.Errorf("kind: got %q want convex (default)", got.Kind)
 	}
 	if got.Status != "provisioning" {
-		t.Errorf("status: got %q want provisioning (convex provisions a container)", got.Status)
+		t.Errorf("status: got %q want provisioning", got.Status)
 	}
 }
 
@@ -226,8 +236,7 @@ func TestDeployments_ListIncludesKind(t *testing.T) {
 }
 
 // TestDeployments_GetReturnsKind confirms the single-row endpoint also
-// surfaces kind. Same guarantee as the list — dashboards/CLIs branch UI
-// without an extra round-trip.
+// surfaces kind.
 func TestDeployments_GetReturnsKind(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()
@@ -239,11 +248,44 @@ func TestDeployments_GetReturnsKind(t *testing.T) {
 		owner.AccessToken,
 		map[string]any{"type": "dev", "kind": "aster"},
 		http.StatusCreated, &asterDep)
+	waitForStatus(t, h, asterDep.Name, "running", 5*time.Second)
 
 	var got deploymentResp
 	h.DoJSON(http.MethodGet, "/v1/deployments/"+asterDep.Name,
 		owner.AccessToken, nil, http.StatusOK, &got)
 	if got.Kind != "aster" {
 		t.Errorf("kind: got %q want aster", got.Kind)
+	}
+}
+
+// TestDeployments_DeleteAsterRoutesToDestroyAster — the delete handler
+// must dispatch on Kind, not blindly call Destroy. A Convex Destroy on
+// an aster row would try to remove a non-existent convex-{name} container
+// and would not clean up the aster broker volume.
+func TestDeployments_DeleteAsterRoutesToDestroyAster(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Del Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "DelProj")
+
+	var asterDep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken,
+		map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &asterDep)
+	waitForStatus(t, h, asterDep.Name, "running", 5*time.Second)
+
+	// Reset destroy logs so the assertion below is unambiguous.
+	h.Docker.Destroyed = nil
+	h.Docker.DestroyedAster = nil
+
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+asterDep.Name+"/delete",
+		owner.AccessToken, nil, http.StatusOK, nil)
+
+	if got := len(h.Docker.Destroyed); got != 0 {
+		t.Errorf("Docker.Destroyed (Convex path) called %d times for aster row; want 0", got)
+	}
+	if got := len(h.Docker.DestroyedAster); got != 1 || h.Docker.DestroyedAster[0] != asterDep.Name {
+		t.Errorf("Docker.DestroyedAster = %v, want exactly [%s]", h.Docker.DestroyedAster, asterDep.Name)
 	}
 }
