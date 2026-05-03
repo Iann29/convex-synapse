@@ -188,7 +188,7 @@ deploy from being lost during the restart.
 
 ## What's NOT included today
 
-- Multi-region replication (out of scope — Convex's per-deployment lease design forbids active-active upstream; see [`V0_5_PLAN.md`](V0_5_PLAN.md))
+- Multi-region replication (out of scope — Convex's per-deployment lease design forbids active-active upstream; see [`ROADMAP.md`](ROADMAP.md) "Deferred / out of scope")
 - A K8s / Helm install path (intentionally deferred — `setup.sh` covers the single-VPS case which is 95% of self-hosters)
 - Stripe / Orb billing, WorkOS / SAML SSO, Discord / Vercel / OAuth-app integrations (cloud-only Convex features; see [`ROADMAP.md`](ROADMAP.md) "Maybe never")
 

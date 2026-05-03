@@ -40,13 +40,15 @@ synapse/                Go backend (chi, pgx, docker SDK)
 
 dashboard/              Next.js 16 + Tailwind 4 + Playwright
 docs/                   Architecture, roadmap, design, quickstart, API,
-                        V0_5_PLAN.md (HA scoping), HA_TESTING.md (operator setup)
+                        HA_TESTING.md (operator setup), PRODUCTION.md (operator guide)
 docker-compose.yml      Local stack + optional `ha` profile (backend-postgres + minio)
 ```
 
 Read `docs/ARCHITECTURE.md`, `docs/DESIGN.md`, and (for HA work)
-`docs/V0_5_PLAN.md` end-to-end before making non-trivial changes — the
+`docs/HA_TESTING.md` end-to-end before making non-trivial changes — the
 trade-offs are explained there and not always re-stated in the code.
+Shipped-feature design rationale lives in `docs/ROADMAP.md` (each
+"Shipped" row carries the as-built notes).
 
 ## Multi-node ground rules
 

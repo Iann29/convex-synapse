@@ -8,11 +8,9 @@ description: Build and maintain the Synapse auto-installer — pure-bash setup.s
 The installer is the operator-facing one-command flow that takes a
 fresh VPS to a running Synapse with TLS, secrets, an admin user,
 **and** (since v1.1.0) a host-side daemon that runs future upgrades
-on a click from the dashboard. Original design lives in
-[`docs/V0_6_INSTALLER_PLAN.md`](../../../docs/V0_6_INSTALLER_PLAN.md);
-shipped milestones plus follow-ups (v1.0.1 wizard, v1.1.0 self-update
-daemon, etc) are tracked in
-[`docs/ROADMAP.md`](../../../docs/ROADMAP.md). The ground rules in
+on a click from the dashboard. Shipped milestones + design rationale
+live in [`docs/ROADMAP.md`](../../../docs/ROADMAP.md) (each "Shipped"
+row carries the as-built notes). The ground rules in
 [`AGENTS.md`](../../../AGENTS.md) v0.6 / v1.0 / v1.1+ sections capture
 the bug classes that bit each milestone — read those before adding a
 new feature on top.
@@ -452,8 +450,10 @@ free resets for exactly this reason.
 
 ## When you're stuck
 
-1. Read `docs/V0_6_INSTALLER_PLAN.md` again — most "where do I put X?"
-   questions are answered there.
+1. Re-read `docs/ROADMAP.md` v0.6 / v1.0 / v1.1 shipped sections + the
+   matching `AGENTS.md` ground-rules section — most "where do I put X?"
+   questions are answered there, distilled from the original milestone
+   plans.
 2. Check what Coolify did for the equivalent feature:
    https://github.com/coollabsio/coolify/blob/main/scripts/install.sh
 3. Run `shellcheck` early and often — it catches half the bugs before
@@ -472,6 +472,6 @@ A v0.6 ticket is done when:
 - [ ] bats tests cover the new logic
 - [ ] CI's installer job is green (lint + bats)
 - [ ] **Real-VPS smoke** passes for any setup.sh / compose / handler-URL change (`ssh synapse-vps` workflow above)
-- [ ] `docs/V0_6_INSTALLER_PLAN.md` updated if the design changed
+- [ ] `docs/ROADMAP.md` shipped row + `AGENTS.md` ground rules updated if the design changed
 - [ ] README's Quickstart still reflects reality after each phase
 - [ ] Commit message body lists the test fixture(s) you ran against

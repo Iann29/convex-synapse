@@ -107,5 +107,5 @@ until explicitly stopped.
 - Operator must pre-create S3 buckets (Synapse does not currently
   call `CreateBucket`). Document this in your runbook.
 - Lease-takeover budget: 15-60 seconds of degraded writes during
-  failover. Documented in `docs/V0_5_PLAN.md`. "HA" here means "no
-  operator intervention", not "zero downtime".
+  failover. "HA" here means "no operator intervention", not "zero
+  downtime".

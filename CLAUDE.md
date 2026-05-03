@@ -42,7 +42,7 @@ talks to Synapse with the same shape Cloud uses.
 | `installer/updater/` | Self-update daemon bundle — `synapse-updater` (Python 3 HTTP server on a unix socket) + `synapse-updater.service` (systemd unit). Lives on the host, not in docker compose, so it survives the upgrades it orchestrates |
 | `installer/templates/` | env.tmpl + caddy.fragment + caddy.standalone — rendered with `{{KEY}}` substitution from exported env vars |
 | `installer/test/` | bats unit tests (327 cases) + Dockerfile that adds jq+curl to bats/bats:latest |
-| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, V0_5_PLAN, V0_6_INSTALLER_PLAN, HA_TESTING, PRODUCTION, HANDOFF |
+| `docs/` | ARCHITECTURE, ROADMAP, QUICKSTART, API, DESIGN, HA_TESTING, PRODUCTION, SCREENSHOTS |
 | `docker-compose.yml` | Local dev stack: postgres + synapse + dashboard. Optional `ha` profile (backend-postgres + minio) and `caddy` profile (TLS reverse proxy) |
 | `.env.example` | Every config var the backend reads, including the `SYNAPSE_HA_*` and `SYNAPSE_BACKEND_*` knobs |
 | `.vps/` | **gitignored** — synapse-test VPS credentials + private SSH key. NEVER commit |

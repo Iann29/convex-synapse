@@ -544,7 +544,7 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
               <p className="text-xs text-neutral-500">
                 Requires <code className="text-neutral-300">SYNAPSE_HA_ENABLED=true</code> on
                 the cluster plus <code className="text-neutral-300">SYNAPSE_BACKEND_*</code>
-                {" "}credentials. See <code className="text-neutral-300">docs/V0_5_PLAN.md</code>.
+                {" "}credentials. See <code className="text-neutral-300">docs/HA_TESTING.md</code>.
               </p>
             )}
           </div>
