@@ -19,10 +19,13 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   brokerd container. The proxy returns `501 aster_not_proxied` because
   the request path isn't wired yet. Dashboard renders an amber badge.
 - **Aster:** broker reads from real Postgres. V8 cell speaks
-  `Convex.asyncSyscall("1.0/get")`. Both tested in isolation.
+  `Convex.asyncSyscall("1.0/get")`. The IDv6 codec + `_tables`-backed
+  mapping cache + `ConvexValue` JSON wrappers are landed; an IDv6
+  string a JS bundle hands to `db.get(id)` resolves end-to-end against
+  the broker's Postgres reader. Both tested in isolation.
 - **What's missing for "run real Convex app":** cell-on-demand spawn
-  (Synapse), IDv6 ↔ DocumentId mapping (Aster), Convex module loader
-  (Aster). All three are open work; none is research-grade unknown.
+  (Synapse), Convex module loader + storage adapter (Aster). All open
+  work; none is research-grade unknown.
 
 ## What landed in Synapse (PRs #49-54)
 
@@ -48,7 +51,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   in the body.
 - `TestDeployments_CreateRejectsAsterPlusHA` — combination is `400 invalid_combination`.
 
-## What landed in Aster (PRs #1-8 in Iann29/aster)
+## What landed in Aster (PRs #1-13 in Iann29/aster)
 
 | PR | What |
 |---|---|
@@ -60,16 +63,22 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #6 | CI `postgres-it` lane with `postgres:16` service container |
 | #7 | Real SQL: `snapshot_ts`, `read_point` (DISTINCT ON id), `read_prefix`. 8 integration tests against postgres:16 |
 | #8 | `Convex.asyncSyscall("1.0/get")` JS API on the v8cell global. `PendingTrap` enum (AsterRead | ConvexSyscall). Document `_raw` bytes round-trip through `JSON.parse` on the JS side |
+| #9 | Docs refresh — README + POSTGRES_ADAPTER_PLAN to v0.4 |
+| #10 | `ASTER_STORE` env dispatch on brokerd: `memory` (default, MvccStore) vs `postgres` (PostgresCapsuleStore + ASTER_DB_URL_FILE / ASTER_DB_URL). 3-container postgres smoke harness (`docker/smoke-postgres.sh`) |
+| #11 | New `crates/convex-codec/` (std-only) with `DocumentIdV6` + Crockford lowercase base32. Verbatim port of `convex-backend@main:crates/value/src/{id_v6,base32}.rs`. 11 tests (7 IDv6 + 4 base32) |
+| #12 | `_tables`-backed table-mapping cache in `aster-store-postgres`. `read_point` accepts both legacy `<table_hex>/<id_hex>` and Convex IDv6 strings — IDv6 path decodes, looks up `table_number → tablet_uuid` via the `_tables` system tablet (refresh-on-miss), then runs the same SQL. Hidden / Deleting rows skipped so reused numbers can't shadow live tablets. 9 unit + 3 integration tests |
+| #13 | `ConvexValue` codec in `aster-convex-codec`. `from_json` / `to_json` for the discriminated wire shape Convex apps emit (`{"$integer": ...}`, `{"$float": ...}`, `{"$bytes": ...}`). Sorted-Object semantics matching upstream's `BTreeMap`. Reserved-key rejection. 15 tests including wire-shape lock + special-float discrimination + bad-payload errors |
 
-**Test coverage (Aster side, all green):** 28 workspace tests + 8 Postgres
+**Test coverage (Aster side, all green):** 56 workspace tests + 11 Postgres
 integration tests + 1 cross-process E2E (brokerd + v8cell over UDS in
-two real Docker containers).
+two real Docker containers) + 1 brokerd-postgres smoke (3 containers).
 
 ## What still doesn't work (the gap)
 
 Today: `kind=aster` deployment exists, brokerd is up, you can create + delete
 through the Synapse API + dashboard. The Aster repo can read real Convex
-`documents` rows from Postgres, and the v8cell can run JS that calls
+`documents` rows from Postgres, decode IDv6 strings + resolve them via the
+`_tables` mapping cache, and the v8cell can run JS that calls
 `Convex.asyncSyscall("1.0/get", ...)` and gets the document back.
 
 What's NOT yet wired end-to-end:
@@ -80,25 +89,25 @@ What's NOT yet wired end-to-end:
    socket. The proxy's `501 aster_not_proxied` is the placeholder; this
    is where it eventually becomes "spawn a v8cell, collect stdout, return
    to caller".
-2. **IDv6 ↔ Aster DocumentId (Aster).** `Convex.asyncSyscall("1.0/get")`
-   accepts `{id}` where `id` is a string. Today the v8cell parses it
-   directly as `<table_hex>/<id_hex>` (Aster's encoding). The real
-   Convex CLI hands a base32-encoded IDv6; the broker needs to decode
-   it via the table mapping (`_tables` system tablet) before the SQL
-   read can happen.
-3. **Convex module loader (Aster).** Today the v8cell runs an `async
+2. **Convex module loader (Aster).** Today the v8cell runs an `async
    function main()` defined in a single source string. A real Convex
    module is `npx convex deploy`-bundled with `_generated/server.ts`,
    schema, multiple exports, etc. The cell needs to drive the same
    `module.<funcName>.invokeQuery(JSON.stringify(args))` shape Convex's
    own runner does (see `crates/isolate/src/environment/udf/mod.rs`
-   in the upstream backend).
+   in the upstream backend). Three sub-pieces:
+     - read `_modules` to list paths + `source_package_id`
+     - read `_source_packages` to resolve `storage_key`
+     - pull bundle bytes from the Convex `Storage` layer (S3 or local
+       FS) — this is the new code, since Aster doesn't speak storage
+       yet (only `documents` reads through Postgres).
 
-The "Convex JS runtime research" memo from the Aster PR #8 trail
-(reproduced in Aster's `docs/CONVEX_POSTGRES_REFERENCE.md` companion
-notes) identifies (3) as the largest remaining piece, but (2) is the
-shortest in calendar time and would let an operator manually deploy
-a Convex app and test by hand — useful as a milestone before (3).
+(2) is the largest remaining piece — multi-PR effort. (1) is a Synapse-
+side one-shot HTTP handler that the existing PR #50 helpers already
+make tractable. The minimum viable "run a real Convex app" needs both,
+plus an HTTP frontend that maps `POST /api/query/<module>:<fn>` to
+"spawn cell, decode args via `ConvexValue::from_json` (PR #13), invoke,
+encode return via `to_json`, ship bytes back".
 
 ## Operator runbook (today)
 
@@ -141,11 +150,13 @@ If you're picking up Aster work:
   `aster-v8cell:0.3` against the existing brokerd's volume, collects
   stdout, returns it. `internal/docker/aster.go` is where the helpers
   for the new container go.
-- **Aster-side:** the `docs/CONVEX_POSTGRES_REFERENCE.md` memo lays
-  out the IDv6 codec verbatim (`crates/value/src/id_v6.rs` upstream).
-  The broker's table-mapping cache lives in `crates/store-postgres/src/lib.rs`;
-  it currently reads `documents` directly without resolving the
-  tablet UUID, which is the next correctness gap.
+- **Aster-side:** the IDv6 codec (`crates/convex-codec/src/idv6.rs`)
+  + table-mapping cache (`crates/store-postgres/src/table_mapping.rs`)
+  + ConvexValue JSON wrappers (`crates/convex-codec/src/value.rs`)
+  are landed. The next-largest piece is the **module loader** —
+  `_modules` + `_source_packages` reads + a `Storage` adapter for the
+  bundle bytes. Once the cell can pull bundled JS by module path the
+  v8cell can drop its hand-written-`main()` shim.
 - **Real-VPS smoke:** the `aster-e2e-fixture/` recipe walks through
   deploying a Convex app to a `kind=convex` deployment so we can
   inspect raw Postgres rows. Once cell-on-demand lands, the same
