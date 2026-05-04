@@ -56,12 +56,13 @@ curl -s "$CONVEX_SELF_HOSTED_URL/api/query" \
 
 ## Where Aster comes in
 
-Once the v8cell speaks `Convex.asyncSyscall("1.0/get", ...)` instead of
-the toy `Aster.read("key", "field")`, the same `getById` query can be
-served by Aster's v8cell talking to the Postgres-backed broker — same
-backend, same row, different execution plane.
+The v8cell already speaks `Convex.asyncSyscall("1.0/get", ...)`, and
+Aster's Postgres store already accepts both `<table_hex>/<id_hex>` and
+Convex IDv6 strings. This fixture is the shared-row smoke target: deploy
+it through a normal Convex backend, seed one message, then invoke a
+`kind=aster` cell against the same Postgres storage and ask for that ID.
 
-The Postgres reads are already wired (see Aster's
-`crates/store-postgres/`). The remaining pieces are the JS-runtime
-syscall handler and IDv6 ↔ `<table_hex>/<id_hex>` translation. See
-`Convex JS runtime research` memo handed off alongside this fixture.
+The current gap is not the syscall or ID codec. The next successful smoke
+needs shared Postgres/modules storage wired into brokerd, then the larger
+cell-side module loader + Convex-shaped HTTP frontend so the fixture can run
+as `messages:getById` instead of hand-written raw JS.

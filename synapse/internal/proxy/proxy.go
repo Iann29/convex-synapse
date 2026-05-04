@@ -66,8 +66,8 @@ type cacheEntry struct {
 // the Aster IPC protocol over a Unix-domain socket. The proxy maps this
 // to a typed 501 so the dashboard can render an "Aster — execution
 // path not yet wired" panel instead of pretending the deployment is
-// broken. Once the cell-on-demand request path lands, this sentinel
-// becomes the trigger for spawning a v8cell rather than the 501.
+// broken. Raw-JS cell invocation already lives on the control API; this
+// sentinel remains until the Convex-shaped HTTP frontend lands.
 var ErrAsterNotProxied = errors.New("kind=aster deployments do not expose an HTTP proxy yet")
 
 // ErrNoReplicas signals that a deployment has no live replicas. Distinct
@@ -357,7 +357,7 @@ func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Ha
 		if errors.Is(err, ErrAsterNotProxied) {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{
 				"code":    "aster_not_proxied",
-				"message": "kind=aster deployments are reachable through the Aster IPC protocol, not HTTP. Use the dashboard to inspect; programmatic access lands when the cell-on-demand request path ships.",
+				"message": "kind=aster deployments are reachable through the Aster IPC protocol, not HTTP. Use POST /v1/deployments/{name}/aster/invoke for raw-JS smokes; Convex-shaped HTTP access lands with the module-loader frontend.",
 				"kind":    "aster",
 			})
 			return

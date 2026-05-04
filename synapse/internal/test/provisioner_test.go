@@ -47,22 +47,22 @@ func TestProvisioner_EnqueueAndExecute(t *testing.T) {
 		t.Errorf("Provision spec name: got %q want pq-cat-1234", h.Docker.Provisioned[0].Name)
 	}
 
-	// Verify deployment row flipped to running and job to done.
+	// Verify both rows settle. The worker flips deployment.status and
+	// provisioning_jobs.status in separate statements, so wait for the
+	// pair instead of treating deployment=running as proof the job row is
+	// already marked done.
 	deadline = time.Now().Add(3 * time.Second)
+	var depStatus, jobStatus string
 	for time.Now().Before(deadline) {
-		var status string
 		_ = h.DB.QueryRow(context.Background(),
-			`SELECT status FROM deployments WHERE id = $1`, depID).Scan(&status)
-		if status == "running" {
+			`SELECT status FROM deployments WHERE id = $1`, depID).Scan(&depStatus)
+		_ = h.DB.QueryRow(context.Background(),
+			`SELECT status FROM provisioning_jobs WHERE deployment_id = $1`, depID).Scan(&jobStatus)
+		if depStatus == "running" && jobStatus == "done" {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	var depStatus, jobStatus string
-	_ = h.DB.QueryRow(context.Background(),
-		`SELECT status FROM deployments WHERE id = $1`, depID).Scan(&depStatus)
-	_ = h.DB.QueryRow(context.Background(),
-		`SELECT status FROM provisioning_jobs WHERE deployment_id = $1`, depID).Scan(&jobStatus)
 	if depStatus != "running" {
 		t.Errorf("deployment status: got %q want running", depStatus)
 	}

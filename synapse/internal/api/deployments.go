@@ -62,14 +62,14 @@ type Provisioner interface {
 // a Docker container), list, get, delete, plus the dashboard-auth endpoint
 // that returns the deployment URL + admin key for the calling user.
 type DeploymentsHandler struct {
-	DB                    *pgxpool.Pool
-	Docker                Provisioner
+	DB     *pgxpool.Pool
+	Docker Provisioner
 	// Tokens is wired by router.go so deployment-scoped access-token
 	// endpoints under /v1/deployments/{name}/access_tokens can reuse the
 	// AccessTokensHandler insert/list path. Optional: a nil value 500s the
 	// scoped-token routes (we never ship a router without it, so this is
 	// strictly defensive).
-	Tokens *AccessTokensHandler
+	Tokens                *AccessTokensHandler
 	PortRangeMin          int
 	PortRangeMax          int
 	HealthcheckViaNetwork bool
@@ -604,14 +604,13 @@ func (h *DeploymentsHandler) allocateDeploymentName(ctx context.Context) (string
 // ---------- POST /v1/projects/{id}/create_deployment ----------
 
 type createDeploymentReq struct {
-	Type      string `json:"type"`               // dev | prod | preview | custom
+	Type      string `json:"type"` // dev | prod | preview | custom
 	Reference string `json:"reference,omitempty"`
 	IsDefault bool   `json:"isDefault,omitempty"`
 
 	// Kind selects the runtime: "convex" (default) provisions a Convex
-	// backend container; "aster" registers an Aster runner cell row
-	// without provisioning anything (the production Aster image isn't
-	// released yet — see github.com/Iann29/aster). Empty == "convex".
+	// backend container; "aster" provisions an Aster brokerd container
+	// with no Convex admin key or HTTP deployment URL. Empty == "convex".
 	Kind string `json:"kind,omitempty"`
 
 	// HA, if true, provisions the deployment with replica_count=2 backed
@@ -700,10 +699,10 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if req.Kind == models.DeploymentKindAster {
-		// kind=aster bypasses the entire provisioning pipeline: no port,
-		// no admin key, no replica row, no provisioning job — just record
-		// the metadata and return. publicDeploymentURL stays empty until
-		// an Aster image is wired in.
+		// kind=aster uses the same durable provisioning queue, but its
+		// docker branch starts brokerd over a Unix-domain socket instead
+		// of a TCP-backed Convex runtime. publicDeploymentURL stays empty
+		// until the Convex-shaped HTTP frontend lands.
 		h.createAsterDeployment(w, r, projectID, teamID, uid, req)
 		return
 	}
@@ -893,16 +892,14 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 }
 
 // createAsterDeployment is the kind=aster branch of createDeployment. It
-// inserts the deployment row plus a placeholder replica row but does
-// NOT allocate a host port, generate an admin key, enqueue a
-// provisioning job, or call Docker.Provision. The Aster image is not
-// released yet; this endpoint exists so Synapse can already model an
-// "Aster deployment" the same way it models a Convex one — name, RBAC,
-// audit log — while we ship the runtime behind it.
+// inserts the deployment row plus a provisioning replica row and enqueues
+// the normal durable worker job. The worker reads d.kind from the join and
+// calls Docker.Provision's Aster branch, which starts brokerd instead of a
+// Convex backend.
 //
-// The replica row is synthetic (host_port NULL, container_id NULL,
-// status='running'). Keeping it preserves the "every deployment has at
-// least one replica row" invariant the rest of the codebase assumes.
+// Aster keeps host_port NULL because brokerd exposes only a Unix-domain
+// socket. It also stores admin_key=” because Aster cells use capsule
+// seals + cell identity, not Convex-style bearer admin keys.
 func (h *DeploymentsHandler) createAsterDeployment(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -1210,7 +1207,7 @@ func (h *DeploymentsHandler) adoptDeployment(w http.ResponseWriter, r *http.Requ
 			// Audit the *original* operator-supplied URL, not the
 			// rewritten one — the audit log should record what the
 			// caller actually adopted.
-			"deploymentUrl":  d.DeploymentURL,
+			"deploymentUrl": d.DeploymentURL,
 		},
 	})
 	// Adopted deployments keep d.DeploymentURL by design (see
@@ -1281,7 +1278,6 @@ func probeAdoptedBackend(ctx context.Context, baseURL, adminKey string) error {
 			"deploymentUrl /api/check_admin_key returned HTTP " + http.StatusText(resp.StatusCode)}
 	}
 }
-
 
 // ---------- GET /v1/projects/{id}/deployment ----------
 

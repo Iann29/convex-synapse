@@ -101,7 +101,7 @@ Today: `kind=aster` deployment exists, brokerd is up, you can create
 API. The Aster repo can read real Convex `documents` rows from
 Postgres, decode IDv6 strings + resolve them via the `_tables`
 mapping cache, find a deployed module's storage_key (PR #15) +
-read its bundle bytes from local FS (PR #17, in flight), and the
+read its bundle bytes from local FS (PR #17), and the
 v8cell can run JS that calls `Convex.asyncSyscall("1.0/get", ...)`.
 
 What's NOT yet wired end-to-end:
@@ -112,12 +112,11 @@ What's NOT yet wired end-to-end:
    `<path>.js` entry, set up V8 module imports / Convex shims
    (`convex/server`, `convex/values`, `_generated/api`), nor route
    `module:fn(args)` to the right export. Lands as fatia 3 of #98.
-2. **Synapse: pass `modules_dir` mount + brokerd env.** PR #17 gives
-   `PostgresCapsuleStore` a knob, but the brokerd binary still has
-   to read `ASTER_MODULES_DIR` and Synapse has to volume-mount the
-   Convex storage dir into the brokerd container. Small wiring PR
-   that gates on (1) being far enough along to make the mount
-   useful.
+2. **Module bundle path into brokerd/cells.** PR #17 gives
+   `PostgresCapsuleStore` a local-FS modules knob, but brokerd still
+   needs an IPC verb for "load bundle by module path", `ASTER_MODULES_DIR`
+   env wiring, and a Synapse bind mount from the Convex storage dir into
+   the brokerd container.
 3. **HTTP frontend (`/api/query/<module>:<fn>`).** Today the only
    way in is `POST /aster/invoke` with raw JS. To accept real
    Convex CLI / client traffic, Synapse needs a request router
@@ -125,17 +124,16 @@ What's NOT yet wired end-to-end:
    parsing args via the ConvexValue codec (PR #13), spawning the
    cell with module-loader-aware envs.
 
-(2) is the largest remaining piece — multi-PR effort. (1) is a Synapse-
-side one-shot HTTP handler that the existing PR #50 helpers already
-make tractable. The minimum viable "run a real Convex app" needs both,
-plus an HTTP frontend that maps `POST /api/query/<module>:<fn>` to
+(1) is the largest remaining piece — multi-PR effort. The minimum viable
+"run a real Convex app" needs that loader, the module bundle plumbing in
+(2), plus an HTTP frontend that maps `POST /api/query/<module>:<fn>` to
 "spawn cell, decode args via `ConvexValue::from_json` (PR #13), invoke,
 encode return via `to_json`, ship bytes back".
 
 ## Operator runbook (today)
 
 **Spinning up a kind=aster deployment** (registers metadata + brokerd
-container; nothing executes yet):
+container; raw-JS execution uses `/aster/invoke`, not the deployment proxy):
 
 ```bash
 TOKEN=$(curl -sS -X POST "$SYNAPSE_URL/v1/auth/login" \
@@ -159,7 +157,10 @@ Aster repo's CI builds and smokes the images but does not publish them to a
 registry yet. The setup.sh doesn't pull them automatically yet. The
 2026-05-04 VPS smoke validated both images plus the Synapse raw-JS invoke
 path; the fixture-backed `Convex.asyncSyscall("1.0/get")` smoke remains
-open.
+open. The first fixture-backed attempt proved the Convex fixture deploy +
+control query path, then returned `output:null` from Aster because the VPS was
+non-HA SQLite storage and brokerd was not configured with `ASTER_STORE=postgres`;
+see `docs/ASTER_VPS_SMOKE.md`.
 
 **Reaching the deployment over HTTP:** `/d/{name}/*` returns 501 with
 `code: "aster_not_proxied"` and a structured message — that's the
@@ -182,8 +183,8 @@ If you're picking up Aster work:
   bundle bytes. Once the cell can pull bundled JS by module path the
   v8cell can drop its hand-written-`main()` shim.
 - **Real-VPS smoke:** `docs/ASTER_VPS_SMOKE.md` captures the raw-JS
-  `0.4` image smoke. The `aster-e2e-fixture/` recipe walks through
-  deploying a Convex app to a `kind=convex` deployment so we can
-  inspect raw Postgres rows. The next end-to-end validation is using
-  the same fixture plus `Convex.asyncSyscall("1.0/get")` from the
-  Aster cell.
+  `0.4` image smoke and the first fixture-backed attempt. The
+  `aster-e2e-fixture/` deploy/control-read path works, but the current VPS
+  run did not seed Postgres because the test install was non-HA. The next
+  end-to-end validation needs a shared Postgres-backed Convex deployment before
+  invoking `Convex.asyncSyscall("1.0/get")` from the Aster cell.

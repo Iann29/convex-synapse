@@ -342,6 +342,19 @@ the version mismatch between `aster-brokerd:0.3` and
 > bash and Go tests are green; that does not mean the operator's
 > happy path works on Hetzner.
 
+**Status 2026-05-04:** attempted and documented in
+`docs/ASTER_VPS_SMOKE.md`. The fixture deploy + `seedIan` + Convex
+`messages:getById` control read succeeded, producing IDv6
+`j570c3a2vfz8js99c3t12b68hh863egz` and `{name:"ian", body:"hello"}`.
+The Aster invoke against the same ID executed (`exitCode=0`, `traps:1`)
+but returned `output:null`. Root cause was environmental, not a JS
+payload issue: `synapse-vps` was still `SYNAPSE_HA_ENABLED=false`, so
+the Convex deployment used SQLite volume storage, while `provisionAster`
+started brokerd without `ASTER_STORE=postgres` / `ASTER_DB_URL`. Do not
+repeat Task 5.2 on the current non-HA VPS expecting success; first enable
+shared Postgres storage for the fixture or wire Aster to an existing
+Convex deployment's Postgres/modules storage.
+
 **Goal.** A documented, reproducible run of: provision an Aster
 deployment, invoke it with a `Convex.asyncSyscall("1.0/get")`-using
 JS, get the right document back. Capture the exact commands +

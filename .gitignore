@@ -56,3 +56,9 @@ synapse/bin/
 
 # Playwright artefacts (root-level when running tests from CWD other than dashboard/)
 test-results/
+
+# Local agent scratch / generated caches
+.claude/scheduled_tasks.lock
+docs/search/
+__pycache__/
+*.py[cod]
