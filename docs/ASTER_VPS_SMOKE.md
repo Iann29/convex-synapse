@@ -250,3 +250,66 @@ needs a real shared Postgres source of truth: either enable HA storage on the
 VPS and create the Convex fixture deployment with `ha:true`, or add the planned
 Synapse wiring that lets `kind=aster` point at an existing Convex deployment's
 Postgres/modules storage.
+
+## 2026-05-04 — PR #59 Aster bridge config upgrade smoke
+
+Scope: Synapse PR #59. This validates the real installer/compose path for the
+new optional Aster runtime bridge env vars, without resetting the VPS.
+
+Upgrade command:
+
+```bash
+cd /opt/synapse-test
+bash setup.sh --upgrade \
+  --ref=feat/aster-modules-dir-wiring \
+  --force \
+  --install-dir=/opt/synapse-test \
+  --non-interactive
+```
+
+Captured outcome:
+
+```text
+Upgrade complete: 1.1.1 → feat-aster-modules-dir-wiring
+health={"status":"ok","version":"1.1.1","database":"ok","proxyEnabled":true}
+```
+
+The running `synapse-api` container had the new compose pass-through envs:
+
+```text
+SYNAPSE_ASTER_DB_SCHEMA=public
+SYNAPSE_ASTER_MODULES_DIR=
+SYNAPSE_ASTER_POSTGRES_URL=
+```
+
+The empty values are intentional for this smoke: they prove the new vars are
+present while preserving the existing memory-store raw-JS path. A follow-up
+fixture smoke should fill them with a real shared Convex Postgres database and
+modules host path after the cell-side module loader lands.
+
+Regression flow:
+
+```bash
+API=http://127.0.0.1:8080
+# register user, create team/project, create {"type":"dev","kind":"aster"}
+curl -fsS -X POST "$API/v1/deployments/$DEPLOYMENT/aster/invoke" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"js":"globalThis.main = async () => 59;"}'
+```
+
+Captured result:
+
+```text
+exitCode=0 output=59 traps=0
+```
+
+Cleanup:
+
+```bash
+curl -fsS -X POST "$API/v1/deployments/$DEPLOYMENT/delete" \
+  -H "Authorization: Bearer $TOKEN"
+docker ps -a --filter label=synapse.kind=aster
+```
+
+No managed Aster containers remained after cleanup.
