@@ -35,7 +35,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   `/api/query/<module>:<fn>` to a cell invocation. All open work;
   none is research-grade unknown.
 
-## What landed in Synapse (PRs #49-54)
+## What landed in Synapse (PRs #49-57)
 
 | PR | What |
 |---|---|
@@ -46,7 +46,8 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #53 | `CLAUDE.md` updated to reference the four PRs |
 | #54 | `aster-e2e-fixture/` Convex app (1 table, 1 query, 1 mutation) used to drive a future end-to-end |
 | #55 | Comprehensive integration sweep — `docs/ASTER_INTEGRATION.md` consolidated, CLAUDE.md updated, README pointer landed |
-| #56 | **Cell on-demand spawn endpoint** — `POST /v1/deployments/{name}/aster/invoke` takes `{js, snapshotTs, prewarm, ...}`, validates kind=aster, spawns `aster-v8cell:0.4` against the brokerd's UDS volume with `ASTER_JS_INLINE` env (requires Iann29/aster#16), waits, returns `{stdout, stderr, exitCode}`. Synapse clears `ASTER_JS=` before setting inline JS so file-based image defaults cannot collide with the mutually-exclusive source modes. Cell never sees Postgres credentials. 64 KiB JS cap (Docker env-var ceiling), 30s host-side timeout. |
+| #56 | **Cell on-demand spawn endpoint** — `POST /v1/deployments/{name}/aster/invoke` takes `{js, snapshotTs, prewarm, ...}`, validates kind=aster, spawns a one-shot v8cell against the brokerd's UDS volume with `ASTER_JS_INLINE` env (requires Iann29/aster#16), waits, returns `{stdout, stderr, exitCode}`. Cell never sees Postgres credentials. 64 KiB JS cap (Docker env-var ceiling), 30s host-side timeout. |
+| #57 | **Aster images 0.4 + VPS smoke** — Synapse pins `aster-brokerd:0.4` and `aster-v8cell:0.4` through `AsterImageTag`, clears `ASTER_JS=` before setting inline JS so file-based image defaults cannot collide with the mutually-exclusive source modes, and documents the raw-JS real-VPS smoke in `docs/ASTER_VPS_SMOKE.md`. |
 
 **Test coverage (Synapse side, all green in CI):**
 

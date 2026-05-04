@@ -282,6 +282,7 @@ module loader and Convex-shaped HTTP frontend are the open work. See
   images were shipped with `docker save | scp | docker load`, and
   `synapse-vps` validated create → broker `0.4` ready → v8cell over
   UDS → `output:1` → delete. Captured in `docs/ASTER_VPS_SMOKE.md`.
+  (PR #57)
 - [x] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
   upstream `crates/value/src/id_v6.rs`. Required before a Convex CLI-
   bundled module can call `db.get(id)` against an Aster cell.
