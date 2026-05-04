@@ -45,3 +45,53 @@ func TestAsterCellEnvClearsFileSource(t *testing.T) {
 		t.Fatal("env missing comma-joined ASTER_PREWARM")
 	}
 }
+
+func TestAsterBrokerEnvAndBindsIncludePostgresModules(t *testing.T) {
+	spec := DeploymentSpec{
+		Name:                 "dep",
+		InstanceSecret:       "secret",
+		AsterPostgresURL:     "postgres://convex:convex@pg:5432/convex_dep?sslmode=disable",
+		AsterDBSchema:        "convex_dev",
+		AsterModulesHostPath: "/srv/convex/data/modules",
+	}
+
+	env := buildAsterBrokerEnv(spec)
+	for _, want := range []string{
+		"ASTER_STORE=postgres",
+		"ASTER_DB_URL=postgres://convex:convex@pg:5432/convex_dep?sslmode=disable",
+		"ASTER_DB_SCHEMA=convex_dev",
+		"ASTER_MODULES_DIR=" + AsterModulesContainerPath,
+	} {
+		if !containsEnv(env, want) {
+			t.Fatalf("broker env missing %q in %v", want, env)
+		}
+	}
+
+	binds := buildAsterBrokerBinds(spec, "synapse-aster-dep")
+	wantBind := "/srv/convex/data/modules:" + AsterModulesContainerPath + ":ro"
+	if len(binds) != 2 || binds[1] != wantBind {
+		t.Fatalf("broker binds = %v, want socket volume plus %q", binds, wantBind)
+	}
+}
+
+func TestAsterBrokerEnvDefaultsToMemoryStore(t *testing.T) {
+	env := buildAsterBrokerEnv(DeploymentSpec{
+		Name:           "dep",
+		InstanceSecret: "secret",
+	})
+
+	for _, item := range env {
+		if strings.HasPrefix(item, "ASTER_STORE=") || strings.HasPrefix(item, "ASTER_DB_URL=") {
+			t.Fatalf("memory-store broker env should not include postgres settings: %v", env)
+		}
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, item := range env {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}

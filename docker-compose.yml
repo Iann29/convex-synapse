@@ -86,6 +86,13 @@ services:
       # IP/port can still call the API.
       SYNAPSE_ALLOWED_ORIGINS: ${SYNAPSE_ALLOWED_ORIGINS:-*}
       SYNAPSE_LOG_LEVEL: ${SYNAPSE_LOG_LEVEL:-info}
+      # Optional Aster runtime bridge. When SYNAPSE_ASTER_POSTGRES_URL is set,
+      # kind=aster brokerds run ASTER_STORE=postgres against that database.
+      # SYNAPSE_ASTER_MODULES_DIR must be a Docker-host path to Convex's
+      # modules directory (`.../modules`), mounted read-only into brokerd.
+      SYNAPSE_ASTER_POSTGRES_URL: ${SYNAPSE_ASTER_POSTGRES_URL:-}
+      SYNAPSE_ASTER_DB_SCHEMA: ${SYNAPSE_ASTER_DB_SCHEMA:-public}
+      SYNAPSE_ASTER_MODULES_DIR: ${SYNAPSE_ASTER_MODULES_DIR:-}
     volumes:
       # Synapse provisions sibling containers via the host docker daemon.
       # This mount is unavoidable for the v0 architecture; the alternative is

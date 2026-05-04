@@ -128,6 +128,42 @@ func TestDeployments_CreateAsterEnqueuesProvisioning(t *testing.T) {
 	}
 }
 
+func TestDeployments_CreateAsterPassesRuntimeConfigToWorker(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		AsterPostgresURL:     "postgres://convex:convex@pg:5432/convex_dep?sslmode=disable",
+		AsterDBSchema:        "convex_dev",
+		AsterModulesHostPath: "/srv/convex/data/modules",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Aster Runtime Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "AsterRuntimeProj")
+
+	var got deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken,
+		map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &got)
+
+	waitForStatus(t, h, got.Name, "running", 5*time.Second)
+
+	if n := len(h.Docker.Provisioned); n != 1 {
+		t.Fatalf("FakeDocker.Provisioned: got %d calls, want 1", n)
+	}
+	spec := h.Docker.Provisioned[0]
+	if spec.Kind != "aster" {
+		t.Fatalf("spec.Kind: got %q want aster", spec.Kind)
+	}
+	if spec.AsterPostgresURL != "postgres://convex:convex@pg:5432/convex_dep?sslmode=disable" {
+		t.Errorf("spec.AsterPostgresURL: got %q", spec.AsterPostgresURL)
+	}
+	if spec.AsterDBSchema != "convex_dev" {
+		t.Errorf("spec.AsterDBSchema: got %q want convex_dev", spec.AsterDBSchema)
+	}
+	if spec.AsterModulesHostPath != "/srv/convex/data/modules" {
+		t.Errorf("spec.AsterModulesHostPath: got %q", spec.AsterModulesHostPath)
+	}
+}
+
 // TestDeployments_CreateDefaultKindIsConvex confirms that an old client
 // not yet aware of `kind` keeps getting Convex deployments.
 func TestDeployments_CreateDefaultKindIsConvex(t *testing.T) {
@@ -416,4 +452,3 @@ func TestDeployments_InvokeAsterCellRejectsEmptyJS(t *testing.T) {
 		t.Errorf("InvokedAsterCells: got %d, want 0", n)
 	}
 }
-

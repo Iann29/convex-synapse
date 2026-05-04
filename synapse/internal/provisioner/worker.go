@@ -65,6 +65,12 @@ type Config struct {
 	// HealthcheckViaNetwork mirrors api.RouterDeps.HealthcheckViaNetwork —
 	// the worker passes it through to dockerprov.DeploymentSpec.
 	HealthcheckViaNetwork bool
+
+	// Optional Aster runtime wiring. Empty keeps kind=aster brokerds on the
+	// memory-store smoke path; set by SYNAPSE_ASTER_* process config.
+	AsterPostgresURL     string
+	AsterDBSchema        string
+	AsterModulesHostPath string
 }
 
 func (c Config) sane() Config {
@@ -275,17 +281,17 @@ type claimedJob struct {
 // gets pushed into the container as env vars. Decrypted from
 // deployment_storage by claimNext using the configured SecretBox.
 type Storage struct {
-	PostgresURL       string
-	DoNotRequireSSL   bool
-	S3Endpoint        string
-	S3Region          string
-	S3AccessKey       string
-	S3SecretKey       string
-	BucketFiles       string
-	BucketModules     string
-	BucketSearch      string
-	BucketExports     string
-	BucketSnapshots   string
+	PostgresURL     string
+	DoNotRequireSSL bool
+	S3Endpoint      string
+	S3Region        string
+	S3AccessKey     string
+	S3SecretKey     string
+	BucketFiles     string
+	BucketModules   string
+	BucketSearch    string
+	BucketExports   string
+	BucketSnapshots string
 }
 
 // claimNext pulls the oldest pending job, atomically marks it 'claimed',
@@ -548,6 +554,11 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		HAReplica:             j.HAEnabled,
 		ReplicaIndex:          j.ReplicaIndex,
 		Kind:                  j.Kind,
+	}
+	if j.Kind == models.DeploymentKindAster {
+		spec.AsterPostgresURL = w.Config.AsterPostgresURL
+		spec.AsterDBSchema = w.Config.AsterDBSchema
+		spec.AsterModulesHostPath = w.Config.AsterModulesHostPath
 	}
 	if j.Storage != nil {
 		spec.Storage = &dockerprov.StorageEnv{

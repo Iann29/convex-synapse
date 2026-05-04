@@ -49,6 +49,18 @@ type DeploymentSpec struct {
 	// whatever Synapse's config.AsterBrokerImage carries).
 	AsterImage string
 
+	// AsterPostgresURL switches a kind=aster brokerd from the memory-store
+	// smoke path to ASTER_STORE=postgres. The URL should point at the same
+	// Convex Postgres database the target app wrote to.
+	AsterPostgresURL string
+	// AsterDBSchema is passed as ASTER_DB_SCHEMA when AsterPostgresURL is set.
+	// Empty leaves brokerd's default ("public") intact.
+	AsterDBSchema string
+	// AsterModulesHostPath is a Docker-host path to Convex's modules storage
+	// directory (`.../modules`, not the storage root). Synapse bind-mounts it
+	// read-only into the brokerd container for module bundle IPC.
+	AsterModulesHostPath string
+
 	// ReplicaIndex is the position of this replica within the deployment
 	// (0, 1, …). Ignored unless HAReplica=true.
 	ReplicaIndex int

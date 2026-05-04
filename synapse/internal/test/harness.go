@@ -124,6 +124,11 @@ type SetupOpts struct {
 	// GitHub. Production wiring leaves both empty (defaults apply).
 	GitHubRepo    string
 	GitHubAPIBase string
+	// Aster runtime fields mirror provisioner.Config and let tests assert
+	// SYNAPSE_ASTER_* propagation without a real Docker daemon.
+	AsterPostgresURL     string
+	AsterDBSchema        string
+	AsterModulesHostPath string
 }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
@@ -245,9 +250,12 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		DB:     pool,
 		Docker: fake,
 		Config: provisioner.Config{
-			PollInterval: 50 * time.Millisecond,
-			JobTimeout:   30 * time.Second,
-			NodeID:       "test-" + dbName,
+			PollInterval:         50 * time.Millisecond,
+			JobTimeout:           30 * time.Second,
+			NodeID:               "test-" + dbName,
+			AsterPostgresURL:     opts.AsterPostgresURL,
+			AsterDBSchema:        opts.AsterDBSchema,
+			AsterModulesHostPath: opts.AsterModulesHostPath,
 		},
 		Logger: logger,
 	}
