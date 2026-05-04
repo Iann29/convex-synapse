@@ -12,7 +12,15 @@ below keeps changes consistent and tested.
 > **Working on the auto-installer (v0.6) instead?** Don't follow this
 > recipe. Bash + bats + the operator-facing CLI live in
 > `installer/` and `setup.sh` — see the **synapse-installer** skill
-> (and `docs/V0_6_INSTALLER_PLAN.md`) for the right conventions.
+> for the right conventions.
+>
+> **Working on Aster integration?** Read [`docs/ASTER_INTEGRATION.md`](../../docs/ASTER_INTEGRATION.md)
+> first. The `kind=aster` deployment kind is wired through the same
+> `Docker.Provision` / `health` / `proxy` paths Convex deployments use,
+> just with a different branch — adding a new field there means
+> threading it through `models.Deployment.Kind` → `DeploymentSpec.Kind`
+> → `Docker.provisionAster` (don't add parallel `if kind == "aster"`
+> ladders in the API handlers; dispatch happens at the Docker layer).
 
 ## The order to do things
 

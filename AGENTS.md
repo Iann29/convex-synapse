@@ -263,6 +263,22 @@ deployments so attackers can't burn Let's Encrypt quota.
 - **Proxy.Handler dispatches by Host first, path fallback second.** When `baseDomain` is non-empty AND `r.Host` matches `<sub>.<base>`, route by leftmost label using `r.URL.Path` verbatim. Otherwise fall through to `/d/<name>/...` — internal compose-network calls keep working with the path form even when custom domains are enabled cluster-wide.
 - **`adopted` deployments keep their operator-supplied URL** even when BaseDomain is set. They live outside Synapse's DNS scope; rewriting would break the operator's existing setup.
 
+## v1.1 ground rules (Aster runtime kind)
+
+`kind=aster` deployments register an [Aster runner cell](https://github.com/Iann29/aster)
+instead of a Convex backend container. The plumbing is in (PRs #49-54) but
+the **execution path** is still under construction; treat anything in
+`docs/ASTER_INTEGRATION.md` as the authoritative status.
+
+- **The contract is `kind` flows through `models.Deployment` → `DeploymentSpec` → `Docker.Provision` → response.** New deployment-returning endpoints carry it for free if they `Scan` into `models.Deployment`. Don't add a parallel `if kind == "aster"` ladder in API handlers — the dispatch happens at the Docker layer.
+- **`Docker.Provision` branches at the top:** `spec.Kind == "aster"` → `provisionAster` (in `internal/docker/aster.go`). The Convex path is the default; new spec fields default to the Convex meaning so existing tests don't change.
+- **kind=aster + ha=true is rejected** with `400 invalid_combination`. HA semantics are tied to the Convex backend image (Postgres + S3 dual replicas); Aster's horizontal story is its own thing tracked upstream.
+- **`Docker.DestroyAster` / `StatusAster`** are public siblings of Destroy/Status. Delete-handler routes by `d.Kind`. Don't blindly call Destroy on a kind=aster row — there's no `convex-{name}` container to remove.
+- **Proxy `/d/{name}/*`** returns `501 aster_not_proxied` for kind=aster (HTTP path lands when cell-on-demand ships). Dashboard surfaces this as the amber "aster" badge with Open-Dashboard disabled.
+- **Health worker dispatches by kind.** kind=aster probes the brokerd container via `StatusAster`; doesn't try `/version` (no HTTP runtime).
+- **Aster image expectations:** `aster-brokerd:0.3` and `aster-v8cell:0.3` must be present on the host before `kind=aster` `create_deployment`. The setup.sh doesn't pull them yet — operator either `docker save` + scp or manually `docker pull` from a registry. This will tighten when the image is published; for now real-VPS smoke documents `mellow-whale-1337` as the canonical test deployment name.
+- **Out of scope here, in scope upstream:** the cell-on-demand request path (Synapse spawning `aster-v8cell` per invocation), the IDv6 ↔ Aster DocumentId mapping, and the Convex module loader. All three live in [Iann29/aster](https://github.com/Iann29/aster) and the Aster `docs/POSTGRES_ADAPTER_PLAN.md` + `docs/CONVEX_POSTGRES_REFERENCE.md`.
+
 ## URL rewrite contract (PR #10 + #24)
 
 Every endpoint that returns a `models.Deployment` (raw or wrapped)
