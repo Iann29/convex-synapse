@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,6 +52,10 @@ type Provisioner interface {
 	// StatusAster reports the brokerd container's docker state. Empty
 	// string + nil error means "container not found".
 	StatusAster(ctx context.Context, deploymentName string) (string, error)
+	// InvokeAsterCell runs a one-shot v8cell against the deployment's
+	// brokerd. The cell receives JS source via env, executes against
+	// the broker's UDS, prints a JSON envelope on stdout, exits.
+	InvokeAsterCell(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -207,6 +213,12 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/deploy_keys", h.createDeployKey)
 		r.Get("/deploy_keys", h.listDeployKeys)
 		r.Post("/deploy_keys/{id}/revoke", h.revokeDeployKey)
+		// Aster cell on-demand spawn (v1.1+). Only valid on
+		// kind=aster deployments; rejects with 409 on the others.
+		// The handler parses the JS source + args from the body,
+		// spawns a one-shot aster-v8cell container against the
+		// deployment's brokerd, and returns the cell's stdout.
+		r.Post("/aster/invoke", h.invokeAsterCell)
 	})
 	return r
 }
@@ -1900,4 +1912,124 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 		},
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------- POST /v1/deployments/{name}/aster/invoke -----------------
+
+// invokeAsterCellReq is the body shape for a one-shot cell run.
+// Bound to the docker-side `InvokeAsterRequest` 1:1 except we don't
+// expose `InstanceSecret` (the handler reads it from the deployment
+// row) or the host-side `Timeout` (capped server-side).
+type invokeAsterCellReq struct {
+	// JS is the literal JavaScript the cell executes. Required.
+	// Capped at 64 KiB to fit in a Docker env var; bigger bundles
+	// land via the module loader (#98 in Iann29/aster).
+	JS string `json:"js"`
+
+	// SnapshotTS pins the read snapshot. 0 = let the broker decide.
+	SnapshotTS uint64 `json:"snapshotTs,omitempty"`
+
+	// CellID identifies this invocation in the broker's per-cell
+	// rate-limit / lease tracking. Server generates one when absent.
+	CellID string `json:"cellId,omitempty"`
+
+	// LeaseEpoch monotonically increases per cell to invalidate stale
+	// capsules. Defaults to 1 server-side.
+	LeaseEpoch uint64 `json:"leaseEpoch,omitempty"`
+
+	// Prewarm is a list of document IDs (Aster wire form
+	// `<table_hex>/<id_hex>` OR Convex IDv6) the broker hydrates
+	// before the cell starts.
+	Prewarm []string `json:"prewarm,omitempty"`
+
+	// MaxTraps caps trap continuations per invocation. Defaults to
+	// 64 server-side.
+	MaxTraps int `json:"maxTraps,omitempty"`
+}
+
+type invokeAsterCellResp struct {
+	// Stdout is the cell binary's raw stdout — typically a one-line
+	// JSON envelope `{"output":..,"traps":..,"capsule_hash":..}`.
+	// Pass-through verbatim so clients can choose whether to parse.
+	Stdout string `json:"stdout"`
+	// Stderr is whatever the cell printed to stderr (rare on the
+	// success path; useful for debugging).
+	Stderr string `json:"stderr,omitempty"`
+	// ExitCode is the cell's process exit. 0 means the cell ran to
+	// completion; non-zero means a runtime error (look at Stderr).
+	ExitCode int64 `json:"exitCode"`
+}
+
+// asterInvokeMaxJSBytes mirrors the docker-side cap. 64 KiB fits
+// comfortably in the per-env-var limit Docker enforces (~128 KiB on
+// Linux) with headroom for the rest of the env block.
+const asterInvokeMaxJSBytes = 64 * 1024
+
+// asterInvokeTimeout is the host-side ceiling on a single cell run.
+// 30s is generous for read-only smoke (typical run is <1s) and tight
+// enough that a wedged cell doesn't pin a Docker daemon slot forever.
+const asterInvokeTimeout = 30 * time.Second
+
+func (h *DeploymentsHandler) invokeAsterCell(w http.ResponseWriter, r *http.Request) {
+	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if d.Kind != models.DeploymentKindAster {
+		writeError(w, http.StatusConflict, "wrong_kind",
+			"This endpoint only applies to kind=aster deployments")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, asterInvokeMaxJSBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read_body", "Could not read request body")
+		return
+	}
+	defer r.Body.Close()
+	if len(body) > asterInvokeMaxJSBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "js_too_large",
+			fmt.Sprintf("JS source exceeds %d-byte cap; use the module loader for full bundles",
+				asterInvokeMaxJSBytes))
+		return
+	}
+
+	var req invokeAsterCellReq
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", "Body must be JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.JS) == "" {
+		writeError(w, http.StatusBadRequest, "missing_js", "Field 'js' is required and non-empty")
+		return
+	}
+
+	dockerReq := dockerprov.InvokeAsterRequest{
+		DeploymentName: d.Name,
+		InstanceSecret: d.InstanceSecret,
+		JSSource:       req.JS,
+		SnapshotTS:     req.SnapshotTS,
+		CellID:         req.CellID,
+		LeaseEpoch:     req.LeaseEpoch,
+		Prewarm:        req.Prewarm,
+		MaxTraps:       req.MaxTraps,
+		Timeout:        asterInvokeTimeout,
+	}
+	result, err := h.Docker.InvokeAsterCell(r.Context(), dockerReq)
+	if err != nil {
+		// The docker layer wraps all transport / config / spawn errors
+		// in a generic Go error. Surface as 502 — the brokerd /
+		// daemon is "downstream" from the operator's perspective.
+		writeError(w, http.StatusBadGateway, "cell_spawn_failed", err.Error())
+		return
+	}
+
+	resp := invokeAsterCellResp{
+		Stdout:   result.Stdout,
+		Stderr:   result.Stderr,
+		ExitCode: result.ExitCode,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
