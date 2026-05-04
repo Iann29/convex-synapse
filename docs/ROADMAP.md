@@ -290,8 +290,11 @@ module loader and Convex-shaped HTTP frontend are the open work. See
   `module.<funcName>.invokeQuery(JSON.stringify(args))` shape Convex's
   own runner uses (see upstream `crates/isolate/src/environment/udf/mod.rs`).
 - [ ] **VPS smoke with the e2e fixture** — deploy `aster-e2e-fixture`
-  against a `kind=aster` deployment + drive a query through the cell-on-demand
-  endpoint. The end-to-end demo.
+  against a shared Postgres-backed Convex deployment, then drive the same IDv6
+  through a `kind=aster` cell-on-demand invocation. First VPS attempt
+  documented in `docs/ASTER_VPS_SMOKE.md`: fixture deploy/control query worked,
+  but Aster returned `output:null` because the test stack was non-HA SQLite and
+  brokerd had no `ASTER_STORE=postgres` wiring.
 - [ ] **OS sandboxing on the v8cell container** — cgroups v2,
   seccomp, read-only rootfs, per-tenant UID. Required before a
   hostile multi-tenant operator can put unrelated workloads on the

@@ -159,7 +159,10 @@ Aster repo's CI builds and smokes the images but does not publish them to a
 registry yet. The setup.sh doesn't pull them automatically yet. The
 2026-05-04 VPS smoke validated both images plus the Synapse raw-JS invoke
 path; the fixture-backed `Convex.asyncSyscall("1.0/get")` smoke remains
-open.
+open. The first fixture-backed attempt proved the Convex fixture deploy +
+control query path, then returned `output:null` from Aster because the VPS was
+non-HA SQLite storage and brokerd was not configured with `ASTER_STORE=postgres`;
+see `docs/ASTER_VPS_SMOKE.md`.
 
 **Reaching the deployment over HTTP:** `/d/{name}/*` returns 501 with
 `code: "aster_not_proxied"` and a structured message — that's the
@@ -182,8 +185,8 @@ If you're picking up Aster work:
   bundle bytes. Once the cell can pull bundled JS by module path the
   v8cell can drop its hand-written-`main()` shim.
 - **Real-VPS smoke:** `docs/ASTER_VPS_SMOKE.md` captures the raw-JS
-  `0.4` image smoke. The `aster-e2e-fixture/` recipe walks through
-  deploying a Convex app to a `kind=convex` deployment so we can
-  inspect raw Postgres rows. The next end-to-end validation is using
-  the same fixture plus `Convex.asyncSyscall("1.0/get")` from the
-  Aster cell.
+  `0.4` image smoke and the first fixture-backed attempt. The
+  `aster-e2e-fixture/` deploy/control-read path works, but the current VPS
+  run did not seed Postgres because the test install was non-HA. The next
+  end-to-end validation needs a shared Postgres-backed Convex deployment before
+  invoking `Convex.asyncSyscall("1.0/get")` from the Aster cell.
