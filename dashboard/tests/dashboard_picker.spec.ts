@@ -60,11 +60,18 @@ async function lookupProjectId(slug: string): Promise<string> {
   const c = new Client({ connectionString: DB_URL });
   await c.connect();
   try {
-    const r = await c.query<{ id: string }>(
-      `SELECT id FROM projects WHERE slug = $1 LIMIT 1`,
-      [slug],
-    );
-    return r.rows[0].id;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const r = await c.query<{ id: string }>(
+        `SELECT id FROM projects WHERE slug = $1 LIMIT 1`,
+        [slug],
+      );
+      if (r.rows[0]) {
+        return r.rows[0].id;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`project ${slug} was not created within 3s`);
   } finally {
     await c.end();
   }
