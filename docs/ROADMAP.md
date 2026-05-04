@@ -248,6 +248,55 @@ focus on RBAC + API stability + picker polish:
   chart depends on it. Both deferred until there's a documented
   k8s-only operator asking.
 
+## v1.1+ — Aster runtime kind (in progress)
+
+[Aster](https://github.com/Iann29/aster) is an open-source execution
+plane that runs tenant JS in V8 cells **without database credentials**.
+Synapse can already provision an Aster runner cell as a first-class
+deployment kind; the request path (cell-on-demand, IDv6 mapping,
+Convex module loader) is the open work. See
+[`docs/ASTER_INTEGRATION.md`](ASTER_INTEGRATION.md) for the full status.
+
+- [x] **Schema + API field** — `kind: "convex" | "aster"` on
+  `create_deployment`, `list_deployments`, `get_deployment`. Migration
+  000010 backfills existing rows to `convex`. (PR #49)
+- [x] **Real provisioning for kind=aster** — `Docker.Provision` spawns
+  the `aster-brokerd:0.3` container with a per-deployment volume for
+  the Unix-domain socket. `DestroyAster` + `StatusAster` siblings of
+  the existing helpers; delete-handler routes by kind. Worker carries
+  `Kind` from the row to the spec. Health worker dispatches by kind.
+  (PR #50)
+- [x] **Proxy honesty** — `/d/{name}/*` returns `501 aster_not_proxied`
+  for kind=aster with structured JSON the dashboard branches on.
+  (PR #51)
+- [x] **Dashboard badge + disabled Open Dashboard** for kind=aster.
+  (PR #52)
+- [x] **End-to-end fixture** — `aster-e2e-fixture/` mini Convex app
+  (1 table, 1 query, 1 mutation) ready for the Aster execution path.
+  (PR #54)
+- [ ] **Cell-on-demand** — `POST /v1/deployments/{name}/aster/invoke`
+  spawns `aster-v8cell:0.3` against the existing brokerd's volume,
+  collects stdout, returns to caller. The natural next slice; see
+  `docs/ASTER_INTEGRATION.md` for design pointers.
+- [ ] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
+  upstream `crates/value/src/id_v6.rs`. Required before a Convex CLI-
+  bundled module can call `db.get(id)` against an Aster cell.
+- [ ] **Module loader (Aster repo)** — drive the same
+  `module.<funcName>.invokeQuery(JSON.stringify(args))` shape Convex's
+  own runner uses (see upstream `crates/isolate/src/environment/udf/mod.rs`).
+- [ ] **VPS smoke with the e2e fixture** — deploy `aster-e2e-fixture`
+  against a `kind=aster` deployment + drive a query through the cell-on-demand
+  endpoint. The end-to-end demo.
+- [ ] **OS sandboxing on the v8cell container** — cgroups v2,
+  seccomp, read-only rootfs, per-tenant UID. Required before a
+  hostile multi-tenant operator can put unrelated workloads on the
+  same VPS.
+
+The Aster repo's [`docs/POSTGRES_ADAPTER_PLAN.md`](https://github.com/Iann29/aster/blob/main/docs/POSTGRES_ADAPTER_PLAN.md)
++ [`docs/CONVEX_POSTGRES_REFERENCE.md`](https://github.com/Iann29/aster/blob/main/docs/CONVEX_POSTGRES_REFERENCE.md)
+carry the Rust-side design and the Convex schema gotchas; this entry
+tracks Synapse-side wiring.
+
 ## Maybe never
 
 - Full Stripe/Orb billing parity (irrelevant for self-hosted)

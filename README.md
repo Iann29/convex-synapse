@@ -109,6 +109,7 @@ without one, Synapse exposes plain HTTP on `:6790` (dashboard) and
 | Scoped access tokens (v1.0+) | user / team / project / app / deployment scope; bearer enforced at every load*ForRequest |
 | Deploy keys (v1.0.3+) | named per-deployment admin keys for CI integrations (Vercel, GitHub Actions, etc) — create from the deployment row, revoke from the dashboard, audit trail per credential |
 | Auto-update from the dashboard (v1.1.0+) | yellow "v1.X.Y available" banner polls GitHub releases hourly; one-click upgrade dispatches `setup.sh --upgrade` via a host-side systemd daemon (unix socket, no TCP exposure), streaming logs back to the modal — no SSH needed for routine upgrades |
+| **Aster runtime kind (v1.1+, preview)** | deployments can be created with `kind: "aster"` to register an [Aster runner cell](https://github.com/Iann29/aster) — capability-narrowed execution plane that runs tenant JS in a V8 cell with **no database credentials**. Synapse provisions the brokerd container, the proxy returns typed `501 aster_not_proxied` (HTTP path lands when cell-on-demand ships), the dashboard renders an amber "aster" badge. Postgres adapter, Convex `db.get` syscall, and the v8cell are all wired and tested in the Aster repo (36 tests, 8 against `postgres:16`); end-to-end integration is the open work — see [`aster-e2e-fixture/`](aster-e2e-fixture/README.md). |
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
 | Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
@@ -195,6 +196,7 @@ For everything else (custom Caddy/nginx, HA cluster setup, the
 | `setup.sh` + `installer/` | Pure-bash auto-installer + bats tests |
 | `docs/` | Architecture, roadmap, production guide, design notes |
 | `docker-compose.yml` | Local stack + optional `ha` / `caddy` profiles |
+| `aster-e2e-fixture/` | Minimal Convex app used to validate the Aster runtime kind end-to-end (see [Iann29/aster](https://github.com/Iann29/aster)) |
 
 ## Tests
 
