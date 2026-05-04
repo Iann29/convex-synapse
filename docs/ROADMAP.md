@@ -253,15 +253,15 @@ focus on RBAC + API stability + picker polish:
 [Aster](https://github.com/Iann29/aster) is an open-source execution
 plane that runs tenant JS in V8 cells **without database credentials**.
 Synapse can already provision an Aster runner cell as a first-class
-deployment kind; the request path (cell-on-demand, IDv6 mapping,
-Convex module loader) is the open work. See
+deployment kind and invoke raw JS through a real v8cell; the Convex
+module loader and Convex-shaped HTTP frontend are the open work. See
 [`docs/ASTER_INTEGRATION.md`](ASTER_INTEGRATION.md) for the full status.
 
 - [x] **Schema + API field** — `kind: "convex" | "aster"` on
   `create_deployment`, `list_deployments`, `get_deployment`. Migration
   000010 backfills existing rows to `convex`. (PR #49)
 - [x] **Real provisioning for kind=aster** — `Docker.Provision` spawns
-  the `aster-brokerd:0.3` container with a per-deployment volume for
+  the `aster-brokerd:0.4` container with a per-deployment volume for
   the Unix-domain socket. `DestroyAster` + `StatusAster` siblings of
   the existing helpers; delete-handler routes by kind. Worker carries
   `Kind` from the row to the spec. Health worker dispatches by kind.
@@ -274,11 +274,15 @@ Convex module loader) is the open work. See
 - [x] **End-to-end fixture** — `aster-e2e-fixture/` mini Convex app
   (1 table, 1 query, 1 mutation) ready for the Aster execution path.
   (PR #54)
-- [ ] **Cell-on-demand** — `POST /v1/deployments/{name}/aster/invoke`
-  spawns `aster-v8cell:0.3` against the existing brokerd's volume,
-  collects stdout, returns to caller. The natural next slice; see
-  `docs/ASTER_INTEGRATION.md` for design pointers.
-- [ ] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
+- [x] **Cell-on-demand** — `POST /v1/deployments/{name}/aster/invoke`
+  spawns `aster-v8cell:0.4` against the existing brokerd's volume,
+  collects stdout, returns to caller. Raw-JS entrypoint only; real
+  Convex bundles still wait on the module loader.
+- [x] **Aster image `0.4` VPS smoke** — local Docker smokes passed,
+  images were shipped with `docker save | scp | docker load`, and
+  `synapse-vps` validated create → broker `0.4` ready → v8cell over
+  UDS → `output:1` → delete. Captured in `docs/ASTER_VPS_SMOKE.md`.
+- [x] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
   upstream `crates/value/src/id_v6.rs`. Required before a Convex CLI-
   bundled module can call `db.get(id)` against an Aster cell.
 - [ ] **Module loader (Aster repo)** — drive the same

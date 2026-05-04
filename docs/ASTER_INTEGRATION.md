@@ -20,6 +20,8 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   `POST /v1/deployments/{name}/aster/invoke` (#56). Operator hands JS
   source as a body field, gets stdout back. Dashboard renders an amber
   badge; the path-form proxy still returns `501 aster_not_proxied`.
+  The raw-JS path was VPS-smoked with `aster-brokerd:0.4` +
+  `aster-v8cell:0.4` on 2026-05-04; see `docs/ASTER_VPS_SMOKE.md`.
 - **Aster:** broker reads from real Postgres + decodes IDv6 + resolves
   via `_tables` cache. The v8cell speaks `Convex.asyncSyscall("1.0/get")`
   and accepts JS via `ASTER_JS_INLINE` env (#16). The module index +
@@ -38,13 +40,13 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | PR | What |
 |---|---|
 | #49 | `kind` column on `deployments` (migration 000010), API field on `create_deployment`, validation, `list_deployments` + `get_deployment` echo it |
-| #50 | `Docker.Provision` branches on `spec.Kind == "aster"` → `provisionAster` (creates `synapse-aster-{name}` volume + `aster-brokerd:0.3` container). `DestroyAster` + `StatusAster` siblings. Delete-handler routes by kind. Worker carries `Kind` from the deployments row to the spec. Health worker dispatches by kind. |
+| #50 | `Docker.Provision` branches on `spec.Kind == "aster"` → `provisionAster` (creates `synapse-aster-{name}` volume + `aster-brokerd:0.4` container). `DestroyAster` + `StatusAster` siblings. Delete-handler routes by kind. Worker carries `Kind` from the deployments row to the spec. Health worker dispatches by kind. |
 | #51 | Proxy `/d/{name}/*` returns `501 aster_not_proxied` with structured JSON for kind=aster, instead of falling through to a 502 |
 | #52 | Dashboard amber "aster" badge + Open-Dashboard button disabled with tooltip |
 | #53 | `CLAUDE.md` updated to reference the four PRs |
 | #54 | `aster-e2e-fixture/` Convex app (1 table, 1 query, 1 mutation) used to drive a future end-to-end |
 | #55 | Comprehensive integration sweep — `docs/ASTER_INTEGRATION.md` consolidated, CLAUDE.md updated, README pointer landed |
-| #56 | **Cell on-demand spawn endpoint** — `POST /v1/deployments/{name}/aster/invoke` takes `{js, snapshotTs, prewarm, ...}`, validates kind=aster, spawns `aster-v8cell:0.3` against the brokerd's UDS volume with `ASTER_JS_INLINE` env (requires Iann29/aster#16), waits, returns `{stdout, stderr, exitCode}`. Cell never sees Postgres credentials. 64 KiB JS cap (Docker env-var ceiling), 30s host-side timeout. |
+| #56 | **Cell on-demand spawn endpoint** — `POST /v1/deployments/{name}/aster/invoke` takes `{js, snapshotTs, prewarm, ...}`, validates kind=aster, spawns `aster-v8cell:0.4` against the brokerd's UDS volume with `ASTER_JS_INLINE` env (requires Iann29/aster#16), waits, returns `{stdout, stderr, exitCode}`. Synapse clears `ASTER_JS=` before setting inline JS so file-based image defaults cannot collide with the mutually-exclusive source modes. Cell never sees Postgres credentials. 64 KiB JS cap (Docker env-var ceiling), 30s host-side timeout. |
 
 **Test coverage (Synapse side, all green in CI):**
 
@@ -65,7 +67,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 - `TestDeployments_InvokeAsterCellRejectsEmptyJS` — empty `js` → 400
   `missing_js`, docker untouched.
 
-## What landed in Aster (PRs #1-13 in Iann29/aster)
+## What landed in Aster (PRs #1-17 in Iann29/aster)
 
 | PR | What |
 |---|---|
@@ -85,7 +87,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #14 | Docs refresh to v0.5 — README + crate metadata names all three convex-codec modules + the new "module loader is the next gap" framing |
 | #15 | **Module index** — `_modules` × `_source_packages` join via the table-mapping cache's new `lookup_by_name` path. New `find_module(path)` / `list_modules()` on `PostgresCapsuleStore` return a `ModuleDescriptor` with `{path, source_package_internal_id, storage_key, environment, sha256s, unzipped_size}` ready for the storage adapter (next slice). Reuses ConvexValue codec to parse the `$bytes`/`$integer`-wrapped source-package body |
 | #16 | **`ASTER_JS_INLINE` on v8cell** — sibling of `ASTER_JS=<path>`; lets a caller pass JS source via env without ferrying a file across the docker-out-of-docker boundary. Required by Synapse's `aster/invoke` endpoint. Mutually exclusive with `ASTER_JS` (typed error if both set) |
-| #17 (in flight) | **Modules storage adapter (local FS)** — `PostgresConfig.modules_dir`; `load_module_bundle(path)` joins `find_module` + on-disk read at `<modules_dir>/<storage_key>.blob` + sha256 verify. Trait shape lets S3 land later. Inline SHA-256 (FIPS 180-4) keeps the production graph small; tests use the `sha2` dev-dep |
+| #17 | **Modules storage adapter (local FS)** — `PostgresConfig.modules_dir`; `load_module_bundle(path)` joins `find_module` + on-disk read at `<modules_dir>/<storage_key>.blob` + sha256 verify. Trait shape lets S3 land later. Inline SHA-256 (FIPS 180-4) keeps the production graph small; tests use the `sha2` dev-dep |
 
 **Test coverage (Aster side, all green):** 79 workspace tests + 19 Postgres
 integration tests + 1 cross-process E2E (brokerd + v8cell over UDS in
@@ -149,10 +151,14 @@ curl -sS -X POST "$SYNAPSE_URL/v1/projects/$PROJECT_ID/create_deployment" \
 Wait ~2s for the worker to flip status to `running`; the brokerd container
 becomes visible as `aster-broker-<name>` in `docker ps`.
 
-**Image expectations:** `aster-brokerd:0.3` and `aster-v8cell:0.3` must
+**Image expectations:** `aster-brokerd:0.4` and `aster-v8cell:0.4` must
 exist on the host. Today they're built from the [Aster repo](https://github.com/Iann29/aster)
-and either pushed to a registry or `docker save | scp | docker load` to the
-target host. The setup.sh doesn't pull them automatically yet.
+and copied with `docker save | scp | docker load` to the target host; the
+Aster repo's CI builds and smokes the images but does not publish them to a
+registry yet. The setup.sh doesn't pull them automatically yet. The
+2026-05-04 VPS smoke validated both images plus the Synapse raw-JS invoke
+path; the fixture-backed `Convex.asyncSyscall("1.0/get")` smoke remains
+open.
 
 **Reaching the deployment over HTTP:** `/d/{name}/*` returns 501 with
 `code: "aster_not_proxied"` and a structured message — that's the
@@ -163,13 +169,10 @@ disables Open Dashboard with a tooltip explaining the same thing.
 
 If you're picking up Aster work:
 
-- **Synapse-side:** the natural next slice is the cell-on-demand
-  endpoint. `synapse/internal/api/deployments.go` already has the
-  `kind=aster` branch in `createDeployment`; mirror it as a
-  `POST /v1/deployments/{name}/aster/invoke` that spawns
-  `aster-v8cell:0.3` against the existing brokerd's volume, collects
-  stdout, returns it. `internal/docker/aster.go` is where the helpers
-  for the new container go.
+- **Synapse-side:** raw-JS cell-on-demand is in place via
+  `POST /v1/deployments/{name}/aster/invoke`; the next Synapse slices
+  are mounting the Convex modules directory into brokerd, and the Convex-shaped
+  `/api/query/<module>:<fn>` frontend once the cell-side loader exists.
 - **Aster-side:** the IDv6 codec (`crates/convex-codec/src/idv6.rs`)
   + table-mapping cache (`crates/store-postgres/src/table_mapping.rs`)
   + ConvexValue JSON wrappers (`crates/convex-codec/src/value.rs`)
@@ -177,8 +180,9 @@ If you're picking up Aster work:
   `_modules` + `_source_packages` reads + a `Storage` adapter for the
   bundle bytes. Once the cell can pull bundled JS by module path the
   v8cell can drop its hand-written-`main()` shim.
-- **Real-VPS smoke:** the `aster-e2e-fixture/` recipe walks through
+- **Real-VPS smoke:** `docs/ASTER_VPS_SMOKE.md` captures the raw-JS
+  `0.4` image smoke. The `aster-e2e-fixture/` recipe walks through
   deploying a Convex app to a `kind=convex` deployment so we can
-  inspect raw Postgres rows. Once cell-on-demand lands, the same
-  fixture deployed to a `kind=aster` deployment is the end-to-end
-  validation.
+  inspect raw Postgres rows. The next end-to-end validation is using
+  the same fixture plus `Convex.asyncSyscall("1.0/get")` from the
+  Aster cell.
