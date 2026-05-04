@@ -36,13 +36,13 @@ type TeamMember struct {
 }
 
 type Project struct {
-	ID         string    `json:"id"`
-	TeamID     string    `json:"teamId"`
-	TeamSlug   string    `json:"teamSlug,omitempty"`
-	Name       string    `json:"name"`
-	Slug       string    `json:"slug"`
-	IsDemo     bool      `json:"isDemo"`
-	CreatedAt  time.Time `json:"createTime"`
+	ID        string    `json:"id"`
+	TeamID    string    `json:"teamId"`
+	TeamSlug  string    `json:"teamSlug,omitempty"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	IsDemo    bool      `json:"isDemo"`
+	CreatedAt time.Time `json:"createTime"`
 }
 
 type ProjectEnvVar struct {
@@ -68,9 +68,9 @@ const (
 
 	// Kind selects the runtime backing the deployment. "convex" provisions
 	// the upstream Convex backend container (every deployment before v1.1).
-	// "aster" registers a placeholder for an Aster runner cell — Synapse
-	// owns the metadata + RBAC, but no container is provisioned and no
-	// proxy is wired yet (the Aster image is not released).
+	// "aster" provisions an Aster brokerd container and supports raw-JS
+	// cell invocation through the control API. It intentionally has no
+	// HTTP deployment URL until the Convex-shaped Aster frontend lands.
 	DeploymentKindConvex = "convex"
 	DeploymentKindAster  = "aster"
 )
@@ -82,23 +82,23 @@ const (
 // Optional timestamps use *time.Time so JSON marshalling emits null instead
 // of the Go zero value ("0001-01-01T00:00:00Z").
 type Deployment struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"projectId"`
-	Name           string     `json:"name"`
-	DeploymentType string     `json:"deploymentType"`
+	ID             string `json:"id"`
+	ProjectID      string `json:"projectId"`
+	Name           string `json:"name"`
+	DeploymentType string `json:"deploymentType"`
 	// Kind is "convex" (default) or "aster". See the DeploymentKind*
 	// constants. Always emitted so dashboards/CLIs can branch UI without
 	// a second round-trip.
-	Kind   string `json:"kind"`
-	Status string `json:"status"`
-	ContainerID    string     `json:"-"`
-	HostPort       int        `json:"-"`
-	DeploymentURL  string     `json:"deploymentUrl,omitempty"`
-	AdminKey       string     `json:"-"`
-	InstanceSecret string     `json:"-"`
-	IsDefault      bool       `json:"isDefault"`
-	Reference      string     `json:"reference,omitempty"`
-	CreatorUserID  string     `json:"creator,omitempty"`
+	Kind           string `json:"kind"`
+	Status         string `json:"status"`
+	ContainerID    string `json:"-"`
+	HostPort       int    `json:"-"`
+	DeploymentURL  string `json:"deploymentUrl,omitempty"`
+	AdminKey       string `json:"-"`
+	InstanceSecret string `json:"-"`
+	IsDefault      bool   `json:"isDefault"`
+	Reference      string `json:"reference,omitempty"`
+	CreatorUserID  string `json:"creator,omitempty"`
 	// Adopted deployments are external backends registered into Synapse
 	// (rather than provisioned by it). Lifecycle hooks like delete skip
 	// Docker calls for these rows; the operator manages the container.

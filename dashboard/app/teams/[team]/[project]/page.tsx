@@ -460,7 +460,7 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                       // The Convex dashboard iframe expects an HTTP backend;
                       // kind=aster runs on a Unix-domain socket so the
                       // existing handshake doesn't apply yet. Disable until
-                      // the cell-on-demand request path lands.
+                      // the Convex-shaped HTTP frontend lands.
                       disabled={
                         openingName === d.name || d.kind === "aster"
                       }
