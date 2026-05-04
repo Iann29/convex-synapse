@@ -45,7 +45,7 @@ type DeploymentSpec struct {
 	Kind string
 
 	// AsterImage overrides the brokerd image used when Kind == "aster".
-	// Empty falls back to the cluster default `aster-brokerd:0.3` (or
+	// Empty falls back to the cluster default `aster-brokerd:<AsterImageTag>` (or
 	// whatever Synapse's config.AsterBrokerImage carries).
 	AsterImage string
 
@@ -78,15 +78,15 @@ type StorageEnv struct {
 
 	// S3 (or S3-compatible like MinIO) connection material. The backend
 	// writes file/module/search/export/snapshot blobs to these buckets.
-	S3Endpoint        string
-	S3Region          string
-	S3AccessKey       string
-	S3SecretKey       string
-	BucketFiles       string
-	BucketModules     string
-	BucketSearch      string
-	BucketExports     string
-	BucketSnapshots   string
+	S3Endpoint      string
+	S3Region        string
+	S3AccessKey     string
+	S3SecretKey     string
+	BucketFiles     string
+	BucketModules   string
+	BucketSearch    string
+	BucketExports   string
+	BucketSnapshots string
 }
 
 // DeploymentInfo is what the provisioner returns once a container is up.

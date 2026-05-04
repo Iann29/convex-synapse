@@ -274,10 +274,10 @@ the **execution path** is still under construction; treat anything in
 - **`Docker.Provision` branches at the top:** `spec.Kind == "aster"` → `provisionAster` (in `internal/docker/aster.go`). The Convex path is the default; new spec fields default to the Convex meaning so existing tests don't change.
 - **kind=aster + ha=true is rejected** with `400 invalid_combination`. HA semantics are tied to the Convex backend image (Postgres + S3 dual replicas); Aster's horizontal story is its own thing tracked upstream.
 - **`Docker.DestroyAster` / `StatusAster`** are public siblings of Destroy/Status. Delete-handler routes by `d.Kind`. Don't blindly call Destroy on a kind=aster row — there's no `convex-{name}` container to remove.
-- **Proxy `/d/{name}/*`** returns `501 aster_not_proxied` for kind=aster (HTTP path lands when cell-on-demand ships). Dashboard surfaces this as the amber "aster" badge with Open-Dashboard disabled.
+- **Proxy `/d/{name}/*`** returns `501 aster_not_proxied` for kind=aster until the Convex-shaped HTTP frontend lands. Dashboard surfaces this as the amber "aster" badge with Open-Dashboard disabled.
 - **Health worker dispatches by kind.** kind=aster probes the brokerd container via `StatusAster`; doesn't try `/version` (no HTTP runtime).
-- **Aster image expectations:** `aster-brokerd:0.3` and `aster-v8cell:0.3` must be present on the host before `kind=aster` `create_deployment`. The setup.sh doesn't pull them yet — operator either `docker save` + scp or manually `docker pull` from a registry. This will tighten when the image is published; for now real-VPS smoke documents `mellow-whale-1337` as the canonical test deployment name.
-- **Out of scope here, in scope upstream:** the cell-on-demand request path (Synapse spawning `aster-v8cell` per invocation), the IDv6 ↔ Aster DocumentId mapping, and the Convex module loader. All three live in [Iann29/aster](https://github.com/Iann29/aster) and the Aster `docs/POSTGRES_ADAPTER_PLAN.md` + `docs/CONVEX_POSTGRES_REFERENCE.md`.
+- **Aster image expectations:** `aster-brokerd:0.4` and `aster-v8cell:0.4` must be present on the host before `kind=aster` `create_deployment` / `aster/invoke`. The setup.sh doesn't pull them yet — operator either `docker save` + scp or manually `docker pull` from a registry. Real-VPS raw-JS smoke is documented in `docs/ASTER_VPS_SMOKE.md`.
+- **Out of scope here, in scope upstream:** the Convex module loader and the deeper IDv6 / module-bundle execution path live in [Iann29/aster](https://github.com/Iann29/aster) and the Aster `docs/POSTGRES_ADAPTER_PLAN.md` + `docs/CONVEX_POSTGRES_REFERENCE.md`. Synapse still owns the modules-dir mount and Convex-shaped HTTP frontend once that loader exists.
 
 ## URL rewrite contract (PR #10 + #24)
 

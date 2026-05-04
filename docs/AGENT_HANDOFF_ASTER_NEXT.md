@@ -101,11 +101,11 @@ What is **partially wired** and may trip you up:
   surface does not yet expose this to cells**. Today cells only have
   `HydratePoint`/`InitialCapsule`/`Shutdown`. Adding a
   `LoadModuleBundle` IPC variant is part of your work.
-- Synapse has `aster-v8cell:0.3` baked in as a constant. After PR
-  #16 (`ASTER_JS_INLINE`) merged, **the v8cell image needs a rebuild
-  + version bump** before the new `aster/invoke` endpoint actually
-  works against a real cell. Either bump to `0.4` or just rebuild
-  `0.3` and force a re-pull. Document the choice.
+- Synapse now pins `aster-brokerd:0.4` + `aster-v8cell:0.4` through
+  `AsterImageTag`. The images were rebuilt and VPS-smoked on
+  2026-05-04; see `docs/ASTER_VPS_SMOKE.md`. There is still no
+  registry publish workflow in `Iann29/aster`, so the operator path
+  remains `docker save | scp | docker load`.
 
 ---
 
@@ -275,6 +275,15 @@ the JS to something that reads from Postgres via
 > `ASTER_JS_INLINE`. The pre-PR-#16 image silently ignores it and
 > will fail with "missing required env ASTER_JS". Without this
 > rebuild, the rest of the pipeline cannot be smoke-tested.
+
+**Status 2026-05-04:** done as a tarball-shipping slice, not a
+registry-publish slice. Both Aster Docker smokes passed with tag `0.4`,
+Synapse pins both broker and cell through `AsterImageTag`, and the VPS
+raw-JS invoke returned `output:1`. The smoke also found and fixed an
+image/default-env edge: `aster-v8cell` must not carry an image-level
+`ASTER_JS` when Synapse invokes through `ASTER_JS_INLINE`; Synapse now
+also clears `ASTER_JS=` defensively. Details live in
+`docs/ASTER_VPS_SMOKE.md`.
 
 **Goal.** Have a registry-pullable (or `docker save | scp`-able)
 image whose v8cell binary supports `ASTER_JS_INLINE`. Bump the tag

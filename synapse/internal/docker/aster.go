@@ -13,15 +13,20 @@ import (
 	"github.com/docker/docker/api/types/volume"
 )
 
+// AsterImageTag pins the Aster broker/cell pair Synapse expects.
+// Both images come from the same Aster workspace build; keeping one tag
+// avoids accidentally pairing a broker and cell built from different IPC.
+const AsterImageTag = "0.4"
+
 // AsterBrokerImage is the default image tag the provisioner uses when
 // `spec.AsterImage` is empty. Operators can override per-deployment via
 // the spec field, or globally via the synapse process config (TODO:
 // wire SYNAPSE_ASTER_BROKER_IMAGE through Config in the next slice).
-const AsterBrokerImage = "aster-brokerd:0.3"
+const AsterBrokerImage = "aster-brokerd:" + AsterImageTag
 
 // AsterCellImage is the v8cell counterpart used by InvokeAsterCell.
 // Same versioning story as AsterBrokerImage.
-const AsterCellImage = "aster-v8cell:0.3"
+const AsterCellImage = "aster-v8cell:" + AsterImageTag
 
 // AsterContainerName returns the deterministic Docker container name
 // for an Aster brokerd instance backing a deployment. Mirrors the
@@ -285,22 +290,7 @@ func (c *Client) InvokeAsterCell(ctx context.Context, req InvokeAsterRequest) (*
 	if maxTraps <= 0 {
 		maxTraps = 64
 	}
-	prewarm := strings.Join(req.Prewarm, ",")
-
-	env := []string{
-		"ASTER_BROKER_SOCK=/run/aster/broker.sock",
-		"ASTER_TENANT=" + req.DeploymentName,
-		"ASTER_DEPLOYMENT=" + req.DeploymentName,
-		"ASTER_SEAL_SEED=" + req.InstanceSecret,
-		fmt.Sprintf("ASTER_SNAPSHOT_TS=%d", req.SnapshotTS),
-		"ASTER_CELL_ID=" + cellID,
-		fmt.Sprintf("ASTER_LEASE_EPOCH=%d", leaseEpoch),
-		"ASTER_PREWARM=" + prewarm,
-		fmt.Sprintf("ASTER_MAX_TRAPS=%d", maxTraps),
-		// The whole point of this slice — the cell binary now reads
-		// the JS source from this env (Iann29/aster#16).
-		"ASTER_JS_INLINE=" + req.JSSource,
-	}
+	env := buildAsterCellEnv(req, cellID, leaseEpoch, maxTraps)
 
 	cfg := &container.Config{
 		Image: AsterCellImage,
@@ -395,6 +385,27 @@ func (c *Client) InvokeAsterCell(ctx context.Context, req InvokeAsterRequest) (*
 		Stderr:   string(stderrClean),
 		ExitCode: exitCode,
 	}, nil
+}
+
+func buildAsterCellEnv(req InvokeAsterRequest, cellID string, leaseEpoch uint64, maxTraps int) []string {
+	prewarm := strings.Join(req.Prewarm, ",")
+	return []string{
+		"ASTER_BROKER_SOCK=/run/aster/broker.sock",
+		"ASTER_TENANT=" + req.DeploymentName,
+		"ASTER_DEPLOYMENT=" + req.DeploymentName,
+		"ASTER_SEAL_SEED=" + req.InstanceSecret,
+		fmt.Sprintf("ASTER_SNAPSHOT_TS=%d", req.SnapshotTS),
+		"ASTER_CELL_ID=" + cellID,
+		fmt.Sprintf("ASTER_LEASE_EPOCH=%d", leaseEpoch),
+		"ASTER_PREWARM=" + prewarm,
+		fmt.Sprintf("ASTER_MAX_TRAPS=%d", maxTraps),
+		// Clear any file-based image default: ASTER_JS and
+		// ASTER_JS_INLINE are mutually exclusive in aster_v8cell.
+		"ASTER_JS=",
+		// The whole point of this slice — the cell binary now reads
+		// the JS source from this env (Iann29/aster#16).
+		"ASTER_JS_INLINE=" + req.JSSource,
+	}
 }
 
 func (req *InvokeAsterRequest) validate() error {
