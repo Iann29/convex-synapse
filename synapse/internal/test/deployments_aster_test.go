@@ -1,9 +1,12 @@
 package synapsetest
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
+
+	dockerprov "github.com/Iann29/synapse/internal/docker"
 )
 
 // TestDeployments_CreateAsterEnqueuesProvisioning is the contract test
@@ -289,3 +292,128 @@ func TestDeployments_DeleteAsterRoutesToDestroyAster(t *testing.T) {
 		t.Errorf("Docker.DestroyedAster = %v, want exactly [%s]", h.Docker.DestroyedAster, asterDep.Name)
 	}
 }
+
+// ---------- POST /v1/deployments/{name}/aster/invoke -----------------
+
+type invokeAsterReq struct {
+	JS         string   `json:"js"`
+	SnapshotTS uint64   `json:"snapshotTs,omitempty"`
+	CellID     string   `json:"cellId,omitempty"`
+	LeaseEpoch uint64   `json:"leaseEpoch,omitempty"`
+	Prewarm    []string `json:"prewarm,omitempty"`
+	MaxTraps   int      `json:"maxTraps,omitempty"`
+}
+
+type invokeAsterResp struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int64  `json:"exitCode"`
+}
+
+// TestDeployments_InvokeAsterCellHappyPath ships a JS source through
+// the API, asserts the docker layer was called with the right env
+// (JSSource + InstanceSecret + DeploymentName), and that the cell's
+// stdout flows back to the client.
+func TestDeployments_InvokeAsterCellHappyPath(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Invoke Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "InvokeProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	customStdout := `{"output":"ian","traps":1,"capsule_hash":"abc"}`
+	h.Docker.InvokeAsterCellFn = func(_ context.Context, _ dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error) {
+		return &dockerprov.InvokeAsterResult{
+			Stdout:   customStdout,
+			Stderr:   "",
+			ExitCode: 0,
+		}, nil
+	}
+
+	var resp invokeAsterResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+		owner.AccessToken,
+		invokeAsterReq{JS: "globalThis.main = async () => 'ian';"},
+		http.StatusOK, &resp)
+
+	if resp.Stdout != customStdout {
+		t.Errorf("Stdout: got %q, want %q", resp.Stdout, customStdout)
+	}
+	if resp.ExitCode != 0 {
+		t.Errorf("ExitCode: got %d, want 0", resp.ExitCode)
+	}
+
+	// FakeDocker should have recorded exactly one invocation with the
+	// JS source verbatim and the deployment's instance secret.
+	if n := len(h.Docker.InvokedAsterCells); n != 1 {
+		t.Fatalf("InvokedAsterCells: got %d calls, want 1", n)
+	}
+	got := h.Docker.InvokedAsterCells[0]
+	if got.DeploymentName != dep.Name {
+		t.Errorf("DeploymentName: got %q, want %q", got.DeploymentName, dep.Name)
+	}
+	if got.JSSource != "globalThis.main = async () => 'ian';" {
+		t.Errorf("JSSource not passed through: got %q", got.JSSource)
+	}
+	if got.InstanceSecret == "" {
+		t.Errorf("InstanceSecret empty; cell can't seal-decrypt without it")
+	}
+}
+
+// TestDeployments_InvokeAsterCellRejectsNonAster locks the kind=aster
+// gate. A kind=convex deployment must NOT be reachable through the
+// invoke endpoint — that would silently spawn a v8cell against a
+// brokerd that doesn't exist.
+func TestDeployments_InvokeAsterCellRejectsNonAster(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Reject Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "RejectProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev"}, // default kind = convex
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	env := h.AssertStatus(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+		owner.AccessToken, invokeAsterReq{JS: "globalThis.main = async () => 1;"},
+		http.StatusConflict)
+	if env.Code != "wrong_kind" {
+		t.Errorf("error code: got %q, want %q", env.Code, "wrong_kind")
+	}
+	if n := len(h.Docker.InvokedAsterCells); n != 0 {
+		t.Errorf("InvokedAsterCells: got %d, want 0 (request must not reach docker)", n)
+	}
+}
+
+// TestDeployments_InvokeAsterCellRejectsEmptyJS locks the validation:
+// empty `js` field is a 400 with a clear code, not a 500 from docker.
+func TestDeployments_InvokeAsterCellRejectsEmptyJS(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Empty Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "EmptyProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	// Empty JS field — docker layer should never be called.
+	env := h.AssertStatus(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+		owner.AccessToken, invokeAsterReq{JS: ""}, http.StatusBadRequest)
+	if env.Code != "missing_js" {
+		t.Errorf("error code: got %q, want missing_js", env.Code)
+	}
+	if n := len(h.Docker.InvokedAsterCells); n != 0 {
+		t.Errorf("InvokedAsterCells: got %d, want 0", n)
+	}
+}
+

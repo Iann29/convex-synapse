@@ -480,10 +480,12 @@ type FakeDocker struct {
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 	DestroyAsterFn     func(ctx context.Context, name string) error
 	StatusAsterFn      func(ctx context.Context, name string) (string, error)
+	InvokeAsterCellFn  func(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error)
 
-	Provisioned        []dockerprov.DeploymentSpec
-	Destroyed          []string
-	DestroyedAster     []string
+	Provisioned       []dockerprov.DeploymentSpec
+	Destroyed         []string
+	DestroyedAster    []string
+	InvokedAsterCells []dockerprov.InvokeAsterRequest
 }
 
 func NewFakeDocker() *FakeDocker {
@@ -556,6 +558,23 @@ func (f *FakeDocker) StatusAster(ctx context.Context, name string) (string, erro
 		return f.StatusAsterFn(ctx, name)
 	}
 	return "running", nil
+}
+
+// InvokeAsterCell records the request and delegates to InvokeAsterCellFn
+// when present. Default returns a deterministic stdout that exercises the
+// full handler → docker → response wiring without spinning up real
+// containers. Tests that want to assert on env / deployment / JS shape
+// inspect the recorded `InvokedAsterCells` slice.
+func (f *FakeDocker) InvokeAsterCell(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error) {
+	f.InvokedAsterCells = append(f.InvokedAsterCells, req)
+	if f.InvokeAsterCellFn != nil {
+		return f.InvokeAsterCellFn(ctx, req)
+	}
+	return &dockerprov.InvokeAsterResult{
+		Stdout:   `{"output":42,"traps":0,"capsule_hash":"fake-hash"}`,
+		Stderr:   "",
+		ExitCode: 0,
+	}, nil
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising
