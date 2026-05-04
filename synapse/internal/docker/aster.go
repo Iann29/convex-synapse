@@ -28,6 +28,11 @@ const AsterBrokerImage = "aster-brokerd:" + AsterImageTag
 // Same versioning story as AsterBrokerImage.
 const AsterCellImage = "aster-v8cell:" + AsterImageTag
 
+// AsterModulesContainerPath is where Synapse mounts the operator-provided
+// Convex modules directory inside brokerd. The Aster store expects this path
+// to contain `<storage_key>.blob` files directly.
+const AsterModulesContainerPath = "/run/aster/modules"
+
 // AsterContainerName returns the deterministic Docker container name
 // for an Aster brokerd instance backing a deployment. Mirrors the
 // Convex `convex-{name}` pattern so operators can grep one rule for
@@ -50,9 +55,9 @@ func AsterVolumeName(deploymentName string) string {
 // Differences from the Convex path:
 //   - No host port, no exposed TCP port. Communication is Unix-domain
 //     socket only, mounted via a per-deployment Docker volume.
-//   - No SQLite volume / no Postgres+S3 env vars. The broker holds the
-//     seal key, not a database connection (yet — Postgres integration
-//     is the next slice).
+//   - No SQLite volume. Optional Aster-only Postgres/modules envs point the
+//     broker at an existing Convex database + modules directory when the
+//     operator has configured SYNAPSE_ASTER_*.
 //   - Image is `aster-brokerd:<tag>` (not the Convex backend).
 //   - Health check is just "container is running"; the broker prints a
 //     ready line on stderr but doesn't expose an HTTP endpoint.
@@ -64,7 +69,7 @@ func (c *Client) provisionAster(ctx context.Context, spec DeploymentSpec) (*Depl
 		return nil, errors.New("provision aster: HA replicas not supported")
 	}
 	if spec.Storage != nil {
-		return nil, errors.New("provision aster: storage env not supported (broker owns DB authority directly)")
+		return nil, errors.New("provision aster: Convex HA storage env not supported; use AsterPostgresURL/AsterModulesHostPath")
 	}
 
 	imageRef := spec.AsterImage
@@ -88,23 +93,7 @@ func (c *Client) provisionAster(ctx context.Context, spec DeploymentSpec) (*Depl
 		return nil, fmt.Errorf("create aster volume: %w", err)
 	}
 
-	// The instance secret doubles as the BLAKE3 seal-key seed for the
-	// broker. v0.3 uses CapsuleSealKey::derive_for_tests on it; in
-	// production this becomes a separately-rotated KMS-backed key.
-	env := []string{
-		"ASTER_BROKER_SOCK=/run/aster/broker.sock",
-		"ASTER_TENANT=" + spec.Name,
-		"ASTER_DEPLOYMENT=" + spec.Name,
-		"ASTER_SEAL_SEED=" + spec.InstanceSecret,
-		// Empty seeds — the broker boots with no documents yet. Once
-		// the Postgres integration lands, this env var goes away and
-		// the broker reads MVCC at request time.
-		"ASTER_SEED_I64=",
-		"ASTER_SNAPSHOT_TS=0",
-	}
-	for k, v := range spec.EnvVars {
-		env = append(env, k+"="+v)
-	}
+	env := buildAsterBrokerEnv(spec)
 
 	labels := map[string]string{
 		"synapse.managed":    "true",
@@ -119,9 +108,7 @@ func (c *Client) provisionAster(ctx context.Context, spec DeploymentSpec) (*Depl
 		Labels: labels,
 	}
 	hostCfg := &container.HostConfig{
-		Binds: []string{
-			volName + ":/run/aster",
-		},
+		Binds: buildAsterBrokerBinds(spec, volName),
 		RestartPolicy: container.RestartPolicy{
 			Name:              container.RestartPolicyUnlessStopped,
 			MaximumRetryCount: 0,
@@ -154,6 +141,44 @@ func (c *Client) provisionAster(ctx context.Context, spec DeploymentSpec) (*Depl
 		HostPort:      0,  // No TCP listener — UDS only.
 		DeploymentURL: "", // No HTTP URL — proxy decides what to surface.
 	}, nil
+}
+
+func buildAsterBrokerEnv(spec DeploymentSpec) []string {
+	// The instance secret doubles as the BLAKE3 seal-key seed for the
+	// broker. v0.3 uses CapsuleSealKey::derive_for_tests on it; in
+	// production this becomes a separately-rotated KMS-backed key.
+	env := []string{
+		"ASTER_BROKER_SOCK=/run/aster/broker.sock",
+		"ASTER_TENANT=" + spec.Name,
+		"ASTER_DEPLOYMENT=" + spec.Name,
+		"ASTER_SEAL_SEED=" + spec.InstanceSecret,
+		"ASTER_SEED_I64=",
+		"ASTER_SNAPSHOT_TS=0",
+	}
+	if spec.AsterPostgresURL != "" {
+		env = append(env,
+			"ASTER_STORE=postgres",
+			"ASTER_DB_URL="+spec.AsterPostgresURL,
+		)
+		if spec.AsterDBSchema != "" {
+			env = append(env, "ASTER_DB_SCHEMA="+spec.AsterDBSchema)
+		}
+	}
+	if spec.AsterModulesHostPath != "" {
+		env = append(env, "ASTER_MODULES_DIR="+AsterModulesContainerPath)
+	}
+	for k, v := range spec.EnvVars {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+func buildAsterBrokerBinds(spec DeploymentSpec, volumeName string) []string {
+	binds := []string{volumeName + ":/run/aster"}
+	if spec.AsterModulesHostPath != "" {
+		binds = append(binds, spec.AsterModulesHostPath+":"+AsterModulesContainerPath+":ro")
+	}
+	return binds
 }
 
 // DestroyAster removes the brokerd container + its volume for a

@@ -88,7 +88,9 @@ What is **already wired** (verify with `git log` on each repo):
 
 - Layers 1, 2, 4, 7, 8 are done.
 - Layers 3a (raw-JS endpoint) and 5a (broker can answer "give me bytes
-  for path") in pieces — see *gaps* below.
+  for path") are now wired at the broker/container boundary: Aster
+  #19 adds `LoadModuleBundle`, and Synapse #59 passes optional
+  Postgres/modules config into brokerd.
 - Layer 5b (cell-side unzip + ESM compile + shims) is **not** done.
   It is the largest open piece.
 - Layer 6 (function-call routing inside the cell) is **not** done.
@@ -96,11 +98,13 @@ What is **already wired** (verify with `git log` on each repo):
 
 What is **partially wired** and may trip you up:
 
-- The broker can compute "give me the bundle bytes for path X" via
-  `PostgresCapsuleStore::load_module_bundle`, but **brokerd's IPC
-  surface does not yet expose this to cells**. Today cells only have
-  `HydratePoint`/`InitialCapsule`/`Shutdown`. Adding a
-  `LoadModuleBundle` IPC variant is part of your work.
+- The broker can compute and serve "give me the bundle bytes for path X"
+  via `PostgresCapsuleStore::load_module_bundle` + `LoadModuleBundle`
+  IPC, but **the v8cell does not consume it yet**. It still runs a
+  single JS source string from `ASTER_JS` / `ASTER_JS_INLINE`.
+- Synapse #59's source wiring is process-level config, not the final
+  product model. It is enough for fixture smoke work, but production
+  still needs a durable per-deployment source relationship.
 - Synapse now pins `aster-brokerd:0.4` + `aster-v8cell:0.4` through
   `AsterImageTag`. The images were rebuilt and VPS-smoked on
   2026-05-04; see `docs/ASTER_VPS_SMOKE.md`. There is still no
@@ -587,6 +591,13 @@ return value.
   Recommendation: path-direct for v0.5; barrel comes later.
 
 ### Task 5.5 — Synapse: mount modules dir into brokerd container
+
+**Status update (Synapse #59).** The config/spec/Docker wiring exists:
+`SYNAPSE_ASTER_POSTGRES_URL`, `SYNAPSE_ASTER_DB_SCHEMA`, and
+`SYNAPSE_ASTER_MODULES_DIR` flow into kind=aster brokerd containers,
+with the modules dir mounted read-only at `/run/aster/modules`. The
+remaining acceptance criteria that say "JS triggers a module load" still
+depend on the cell-side loader in Task 5.4.
 
 > **Why.** PR #17 made the modules dir a `PostgresCapsuleStore`
 > config knob. PR #15 wired the index. Task 5.3 will add the

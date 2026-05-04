@@ -26,16 +26,16 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   via `_tables` cache. The v8cell speaks `Convex.asyncSyscall("1.0/get")`
   and accepts JS via `ASTER_JS_INLINE` env (#16). The module index +
   storage adapter (#15, #17) resolve `module path → storage_key →
-  bundle bytes` — but the cell can't yet *consume* those bytes (no
-  ZIP unzip + ESM module instantiation). All landed pieces tested in
-  isolation; the cross-piece wiring is next.
+  bundle bytes`; #19 exposes those bytes over broker IPC. The cell
+  still can't *consume* bundle bytes yet (no ZIP unzip + ESM module
+  instantiation).
 - **What's missing for "run real Convex app":** cell-side module
-  loader (parse ZIP, ESM compile, Convex shims), brokerd-side mount
-  of `ASTER_MODULES_DIR`, and an HTTP frontend that maps
-  `/api/query/<module>:<fn>` to a cell invocation. All open work;
-  none is research-grade unknown.
+  loader (parse ZIP, ESM compile, Convex shims), a real source model
+  that points Aster at the correct Convex Postgres/modules storage,
+  and an HTTP frontend that maps `/api/query/<module>:<fn>` to a
+  cell invocation. All open work; none is research-grade unknown.
 
-## What landed in Synapse (PRs #49-57)
+## What landed in Synapse (PRs #49-59)
 
 | PR | What |
 |---|---|
@@ -48,6 +48,8 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #55 | Comprehensive integration sweep — `docs/ASTER_INTEGRATION.md` consolidated, CLAUDE.md updated, README pointer landed |
 | #56 | **Cell on-demand spawn endpoint** — `POST /v1/deployments/{name}/aster/invoke` takes `{js, snapshotTs, prewarm, ...}`, validates kind=aster, spawns a one-shot v8cell against the brokerd's UDS volume with `ASTER_JS_INLINE` env (requires Iann29/aster#16), waits, returns `{stdout, stderr, exitCode}`. Cell never sees Postgres credentials. 64 KiB JS cap (Docker env-var ceiling), 30s host-side timeout. |
 | #57 | **Aster images 0.4 + VPS smoke** — Synapse pins `aster-brokerd:0.4` and `aster-v8cell:0.4` through `AsterImageTag`, clears `ASTER_JS=` before setting inline JS so file-based image defaults cannot collide with the mutually-exclusive source modes, and documents the raw-JS real-VPS smoke in `docs/ASTER_VPS_SMOKE.md`. |
+| #58 | Docs/test cleanup after the VPS smoke: Aster runtime status docs stopped claiming cell-on-demand was pending, and flaky provisioner/dashboard waits were tightened. |
+| #59 | **Aster Postgres/modules bridge config** — optional `SYNAPSE_ASTER_POSTGRES_URL`, `SYNAPSE_ASTER_DB_SCHEMA`, and `SYNAPSE_ASTER_MODULES_DIR` pass through compose/env template → config → provisioning worker → brokerd container. When configured, brokerd runs `ASTER_STORE=postgres` and gets a read-only bind mount at `/run/aster/modules`; empty config preserves the memory-store raw-JS smoke path. Requires a broker image with Iann29/aster#19 for module bundle IPC. |
 
 **Test coverage (Synapse side, all green in CI):**
 
@@ -67,8 +69,10 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   → 409 `wrong_kind`, docker untouched.
 - `TestDeployments_InvokeAsterCellRejectsEmptyJS` — empty `js` → 400
   `missing_js`, docker untouched.
+- `TestDeployments_CreateAsterPassesRuntimeConfigToWorker` —
+  `SYNAPSE_ASTER_*`-equivalent harness config reaches the docker spec.
 
-## What landed in Aster (PRs #1-17 in Iann29/aster)
+## What landed in Aster (PRs #1-19 in Iann29/aster)
 
 | PR | What |
 |---|---|
@@ -89,8 +93,10 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #15 | **Module index** — `_modules` × `_source_packages` join via the table-mapping cache's new `lookup_by_name` path. New `find_module(path)` / `list_modules()` on `PostgresCapsuleStore` return a `ModuleDescriptor` with `{path, source_package_internal_id, storage_key, environment, sha256s, unzipped_size}` ready for the storage adapter (next slice). Reuses ConvexValue codec to parse the `$bytes`/`$integer`-wrapped source-package body |
 | #16 | **`ASTER_JS_INLINE` on v8cell** — sibling of `ASTER_JS=<path>`; lets a caller pass JS source via env without ferrying a file across the docker-out-of-docker boundary. Required by Synapse's `aster/invoke` endpoint. Mutually exclusive with `ASTER_JS` (typed error if both set) |
 | #17 | **Modules storage adapter (local FS)** — `PostgresConfig.modules_dir`; `load_module_bundle(path)` joins `find_module` + on-disk read at `<modules_dir>/<storage_key>.blob` + sha256 verify. Trait shape lets S3 land later. Inline SHA-256 (FIPS 180-4) keeps the production graph small; tests use the `sha2` dev-dep |
+| #18 | Aster image metadata/docs refresh to `aster-brokerd:0.4` + `aster-v8cell:0.4`, matching the Synapse raw-JS VPS smoke. |
+| #19 | **Module bundle IPC** — `LoadModuleBundle { context, capsule, path }` over UDS, base64 payload on the JSON wire, broker-side capsule/context verification before serving bytes, and `ASTER_MODULES_DIR` wired into `PostgresConfig.modules_dir`. |
 
-**Test coverage (Aster side, all green):** 79 workspace tests + 19 Postgres
+**Test coverage (Aster side, all green):** 82 workspace tests + 19 Postgres
 integration tests + 1 cross-process E2E (brokerd + v8cell over UDS in
 two real Docker containers) + 1 brokerd-postgres smoke (3 containers).
 
@@ -101,7 +107,7 @@ Today: `kind=aster` deployment exists, brokerd is up, you can create
 API. The Aster repo can read real Convex `documents` rows from
 Postgres, decode IDv6 strings + resolve them via the `_tables`
 mapping cache, find a deployed module's storage_key (PR #15) +
-read its bundle bytes from local FS (PR #17), and the
+read its bundle bytes from local FS / broker IPC (PRs #17, #19), and the
 v8cell can run JS that calls `Convex.asyncSyscall("1.0/get", ...)`.
 
 What's NOT yet wired end-to-end:
@@ -112,11 +118,12 @@ What's NOT yet wired end-to-end:
    `<path>.js` entry, set up V8 module imports / Convex shims
    (`convex/server`, `convex/values`, `_generated/api`), nor route
    `module:fn(args)` to the right export. Lands as fatia 3 of #98.
-2. **Module bundle path into brokerd/cells.** PR #17 gives
-   `PostgresCapsuleStore` a local-FS modules knob, but brokerd still
-   needs an IPC verb for "load bundle by module path", `ASTER_MODULES_DIR`
-   env wiring, and a Synapse bind mount from the Convex storage dir into
-   the brokerd container.
+2. **Source-storage selection.** Aster #19 can serve bundle bytes over
+   broker IPC, and Synapse #59 can point brokerd at a process-level
+   Postgres URL + modules host path. What is still missing is a durable
+   per-deployment source model: e.g. "this kind=aster deployment mirrors
+   that kind=convex deployment's Postgres/modules storage" without relying
+   on global operator env for all Aster deployments.
 3. **HTTP frontend (`/api/query/<module>:<fn>`).** Today the only
    way in is `POST /aster/invoke` with raw JS. To accept real
    Convex CLI / client traffic, Synapse needs a request router
@@ -129,6 +136,29 @@ What's NOT yet wired end-to-end:
 (2), plus an HTTP frontend that maps `POST /api/query/<module>:<fn>` to
 "spawn cell, decode args via `ConvexValue::from_json` (PR #13), invoke,
 encode return via `to_json`, ship bytes back".
+
+## Aster runtime bridge config
+
+`kind=aster` keeps working with no extra config: brokerd boots the memory
+store and `/aster/invoke` can run handwritten JS that does not need real
+Convex rows. To point brokerd at an existing Convex Postgres/modules source,
+operators can set:
+
+```bash
+SYNAPSE_ASTER_POSTGRES_URL=postgres://...
+SYNAPSE_ASTER_DB_SCHEMA=public
+SYNAPSE_ASTER_MODULES_DIR=/host/path/to/convex/storage/modules
+```
+
+Important details:
+
+- `SYNAPSE_ASTER_MODULES_DIR` is a Docker-host path because Synapse talks to
+  the host Docker daemon. It is mounted read-only into brokerd at
+  `/run/aster/modules`.
+- The path is the `modules` directory itself. Aster expects
+  `/run/aster/modules/<storage_key>.blob`.
+- This is a bridge knob, not the final product model. It is enough for
+  fixture/VPS work, but production needs per-deployment source selection.
 
 ## Operator runbook (today)
 
@@ -172,9 +202,10 @@ disables Open Dashboard with a tooltip explaining the same thing.
 If you're picking up Aster work:
 
 - **Synapse-side:** raw-JS cell-on-demand is in place via
-  `POST /v1/deployments/{name}/aster/invoke`; the next Synapse slices
-  are mounting the Convex modules directory into brokerd, and the Convex-shaped
-  `/api/query/<module>:<fn>` frontend once the cell-side loader exists.
+  `POST /v1/deployments/{name}/aster/invoke`; the Postgres/modules bridge
+  config exists via #59. The next Synapse slices are per-deployment source
+  selection and the Convex-shaped `/api/query/<module>:<fn>` frontend once
+  the cell-side loader exists.
 - **Aster-side:** the IDv6 codec (`crates/convex-codec/src/idv6.rs`)
   + table-mapping cache (`crates/store-postgres/src/table_mapping.rs`)
   + ConvexValue JSON wrappers (`crates/convex-codec/src/value.rs`)
