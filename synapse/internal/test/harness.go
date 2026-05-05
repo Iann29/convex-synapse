@@ -124,11 +124,6 @@ type SetupOpts struct {
 	// GitHub. Production wiring leaves both empty (defaults apply).
 	GitHubRepo    string
 	GitHubAPIBase string
-	// Aster runtime fields mirror provisioner.Config and let tests assert
-	// SYNAPSE_ASTER_* propagation without a real Docker daemon.
-	AsterPostgresURL     string
-	AsterDBSchema        string
-	AsterModulesHostPath string
 }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
@@ -250,12 +245,9 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		DB:     pool,
 		Docker: fake,
 		Config: provisioner.Config{
-			PollInterval:         50 * time.Millisecond,
-			JobTimeout:           30 * time.Second,
-			NodeID:               "test-" + dbName,
-			AsterPostgresURL:     opts.AsterPostgresURL,
-			AsterDBSchema:        opts.AsterDBSchema,
-			AsterModulesHostPath: opts.AsterModulesHostPath,
+			PollInterval: 50 * time.Millisecond,
+			JobTimeout:   30 * time.Second,
+			NodeID:       "test-" + dbName,
 		},
 		Logger: logger,
 	}
@@ -486,14 +478,9 @@ type FakeDocker struct {
 	StatusFn           func(ctx context.Context, name string) (string, error)
 	StatusReplicaFn    func(ctx context.Context, name string, replicaIndex int) (string, error)
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
-	DestroyAsterFn     func(ctx context.Context, name string) error
-	StatusAsterFn      func(ctx context.Context, name string) (string, error)
-	InvokeAsterCellFn  func(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error)
 
-	Provisioned       []dockerprov.DeploymentSpec
-	Destroyed         []string
-	DestroyedAster    []string
-	InvokedAsterCells []dockerprov.InvokeAsterRequest
+	Provisioned []dockerprov.DeploymentSpec
+	Destroyed   []string
 }
 
 func NewFakeDocker() *FakeDocker {
@@ -547,42 +534,6 @@ func (f *FakeDocker) GenerateAdminKey(ctx context.Context, name, secret string) 
 		return f.GenerateAdminKeyFn(ctx, name, secret)
 	}
 	return "fake-admin-key-" + name, nil
-}
-
-// DestroyAster mirrors Destroy but for kind=aster deployments. Default
-// records the name in DestroyedAster and returns nil; tests can override
-// to simulate failures.
-func (f *FakeDocker) DestroyAster(ctx context.Context, name string) error {
-	f.DestroyedAster = append(f.DestroyedAster, name)
-	if f.DestroyAsterFn != nil {
-		return f.DestroyAsterFn(ctx, name)
-	}
-	return nil
-}
-
-// StatusAster mirrors Status but for the brokerd container.
-func (f *FakeDocker) StatusAster(ctx context.Context, name string) (string, error) {
-	if f.StatusAsterFn != nil {
-		return f.StatusAsterFn(ctx, name)
-	}
-	return "running", nil
-}
-
-// InvokeAsterCell records the request and delegates to InvokeAsterCellFn
-// when present. Default returns a deterministic stdout that exercises the
-// full handler → docker → response wiring without spinning up real
-// containers. Tests that want to assert on env / deployment / JS shape
-// inspect the recorded `InvokedAsterCells` slice.
-func (f *FakeDocker) InvokeAsterCell(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error) {
-	f.InvokedAsterCells = append(f.InvokedAsterCells, req)
-	if f.InvokeAsterCellFn != nil {
-		return f.InvokeAsterCellFn(ctx, req)
-	}
-	return &dockerprov.InvokeAsterResult{
-		Stdout:   `{"output":42,"traps":0,"capsule_hash":"fake-hash"}`,
-		Stderr:   "",
-		ExitCode: 0,
-	}, nil
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising

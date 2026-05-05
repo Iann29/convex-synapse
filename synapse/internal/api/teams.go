@@ -999,7 +999,7 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if cursor == "" {
 		rows, err = h.DB.Query(r.Context(), `
-			SELECT d.id, d.project_id, d.name, d.deployment_type, d.kind, d.status,
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at,
 			       d.adopted
 			  FROM deployments d
@@ -1029,7 +1029,7 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rows, err = h.DB.Query(r.Context(), `
-			SELECT d.id, d.project_id, d.name, d.deployment_type, d.kind, d.status,
+			SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 			       d.deployment_url, d.is_default, d.reference, d.creator_user_id, d.created_at,
 			       d.adopted
 			  FROM deployments d
@@ -1052,7 +1052,7 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Kind, &d.Status,
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt, &d.Adopted); err != nil {
 			logErr("scan deployment", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan deployments")

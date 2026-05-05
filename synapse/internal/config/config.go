@@ -110,15 +110,6 @@ type Config struct {
 	BackendS3SecretKey    string
 	BackendS3BucketPrefix string
 
-	// Aster runtime knobs (v1.1+). Optional: leaving these empty keeps
-	// kind=aster brokerds on the memory-store smoke path. Setting
-	// AsterPostgresURL switches brokerd to ASTER_STORE=postgres; setting
-	// AsterModulesDir bind-mounts the host's Convex modules directory into
-	// brokerd so the Aster module loader can fetch bundle bytes over IPC.
-	AsterPostgresURL string
-	AsterDBSchema    string
-	AsterModulesDir  string
-
 	// Self-update daemon (v1.1.0+).
 	// UpdaterSocket: unix socket path the synapse-updater systemd
 	// daemon listens on. Default mounted at /run/synapse/updater.sock.
@@ -197,10 +188,6 @@ func Load() (*Config, error) {
 		BackendS3AccessKey:    os.Getenv("SYNAPSE_BACKEND_S3_ACCESS_KEY"),
 		BackendS3SecretKey:    os.Getenv("SYNAPSE_BACKEND_S3_SECRET_KEY"),
 		BackendS3BucketPrefix: getEnvDefault("SYNAPSE_BACKEND_S3_BUCKET_PREFIX", "convex"),
-
-		AsterPostgresURL: os.Getenv("SYNAPSE_ASTER_POSTGRES_URL"),
-		AsterDBSchema:    getEnvDefault("SYNAPSE_ASTER_DB_SCHEMA", "public"),
-		AsterModulesDir:  strings.TrimSpace(os.Getenv("SYNAPSE_ASTER_MODULES_DIR")),
 
 		UpdaterSocket: getEnvDefault("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"),
 		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),

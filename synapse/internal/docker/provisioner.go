@@ -36,31 +36,6 @@ type DeploymentSpec struct {
 	// for the backend to become healthy. See config.HealthcheckViaNetwork.
 	HealthcheckViaNetwork bool
 
-	// Kind selects the runtime image. Empty / "convex" → the upstream
-	// Convex backend image (the only path before v1.1+). "aster" →
-	// provisions an Aster runner cell instead. The Aster path skips
-	// HostPort allocation and the SQLite/Postgres machinery; it spawns
-	// a brokerd container that listens on a Unix-domain socket inside
-	// a per-deployment Docker volume.
-	Kind string
-
-	// AsterImage overrides the brokerd image used when Kind == "aster".
-	// Empty falls back to the cluster default `aster-brokerd:<AsterImageTag>` (or
-	// whatever Synapse's config.AsterBrokerImage carries).
-	AsterImage string
-
-	// AsterPostgresURL switches a kind=aster brokerd from the memory-store
-	// smoke path to ASTER_STORE=postgres. The URL should point at the same
-	// Convex Postgres database the target app wrote to.
-	AsterPostgresURL string
-	// AsterDBSchema is passed as ASTER_DB_SCHEMA when AsterPostgresURL is set.
-	// Empty leaves brokerd's default ("public") intact.
-	AsterDBSchema string
-	// AsterModulesHostPath is a Docker-host path to Convex's modules storage
-	// directory (`.../modules`, not the storage root). Synapse bind-mounts it
-	// read-only into the brokerd container for module bundle IPC.
-	AsterModulesHostPath string
-
 	// ReplicaIndex is the position of this replica within the deployment
 	// (0, 1, …). Ignored unless HAReplica=true.
 	ReplicaIndex int
@@ -173,12 +148,6 @@ func (c *Client) EnsureImage(ctx context.Context) error {
 // On failure, it best-effort removes any partially-created container so the
 // caller can retry without leaking resources.
 func (c *Client) Provision(ctx context.Context, spec DeploymentSpec) (*DeploymentInfo, error) {
-	// kind=aster takes a separate path: no host port, no SQLite volume,
-	// no Convex backend image. Provisions the brokerd container that
-	// listens on a Unix-domain socket inside a per-deployment volume.
-	if spec.Kind == "aster" {
-		return c.provisionAster(ctx, spec)
-	}
 	if spec.Name == "" || spec.InstanceSecret == "" || spec.HostPort == 0 {
 		return nil, errors.New("provision: name, instance secret, and host port required")
 	}
