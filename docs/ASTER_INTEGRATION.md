@@ -26,14 +26,19 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   via `_tables` cache. The v8cell speaks `Convex.asyncSyscall("1.0/get")`
   and accepts JS via `ASTER_JS_INLINE` env (#16). The module index +
   storage adapter (#15, #17) resolve `module path → storage_key →
-  bundle bytes`; #19 exposes those bytes over broker IPC. The cell
-  still can't *consume* bundle bytes yet (no ZIP unzip + ESM module
-  instantiation).
-- **What's missing for "run real Convex app":** cell-side module
-  loader (parse ZIP, ESM compile, Convex shims), a real source model
-  that points Aster at the correct Convex Postgres/modules storage,
-  and an HTTP frontend that maps `/api/query/<module>:<fn>` to a
-  cell invocation. All open work; none is research-grade unknown.
+  bundle bytes`; #19 exposes those bytes over broker IPC; #20 makes
+  the v8cell consume that IPC, unzip the bundle, and pick the entry
+  for `<module_path>` (or `<module_path>.js`). Bundles whose entry
+  sets `globalThis.main = async () => {...}` execute end-to-end
+  today; arbitrary `npx convex deploy` bundles still hit a missing
+  V8 ESM compile + Convex shims layer.
+- **What's missing for "run real Convex app":** the V8 ESM compile +
+  Convex shims (`convex/server`, `convex/values`, `_generated/api`)
+  + function-call routing inside the cell, a per-deployment source
+  model that durably points Aster at the matching Convex Postgres /
+  modules directory (today the source is process-level), and an
+  HTTP frontend that maps `/api/query/<module>:<fn>` to a cell
+  invocation. All open work; none is research-grade unknown.
 
 ## What landed in Synapse (PRs #49-59)
 
@@ -72,7 +77,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 - `TestDeployments_CreateAsterPassesRuntimeConfigToWorker` —
   `SYNAPSE_ASTER_*`-equivalent harness config reaches the docker spec.
 
-## What landed in Aster (PRs #1-19 in Iann29/aster)
+## What landed in Aster (PRs #1-20 in Iann29/aster)
 
 | PR | What |
 |---|---|
@@ -95,8 +100,9 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #17 | **Modules storage adapter (local FS)** — `PostgresConfig.modules_dir`; `load_module_bundle(path)` joins `find_module` + on-disk read at `<modules_dir>/<storage_key>.blob` + sha256 verify. Trait shape lets S3 land later. Inline SHA-256 (FIPS 180-4) keeps the production graph small; tests use the `sha2` dev-dep |
 | #18 | Aster image metadata/docs refresh to `aster-brokerd:0.4` + `aster-v8cell:0.4`, matching the Synapse raw-JS VPS smoke. |
 | #19 | **Module bundle IPC** — `LoadModuleBundle { context, capsule, path }` over UDS, base64 payload on the JSON wire, broker-side capsule/context verification before serving bytes, and `ASTER_MODULES_DIR` wired into `PostgresConfig.modules_dir`. |
+| #20 | **Cell-side bundle ingestion** — v8cell binary's new `ASTER_MODULE_PATH` env (mutually exclusive with `ASTER_JS` / `ASTER_JS_INLINE`) bootstraps a sealed capsule, calls `LoadModuleBundle`, unzips the response, picks `<path>` or `<path>.js` entry. New `aster-ipc::bundle::extract_module_source` with 8 unit tests covering happy path, suffix policy, missing-entry diagnostic, non-ZIP / non-UTF-8 rejection, nested paths. Bundles whose entry sets `globalThis.main` run end-to-end today; arbitrary `npx convex deploy` bundles still wait on V8 ESM compile + Convex shims (next slice). |
 
-**Test coverage (Aster side, all green):** 82 workspace tests + 19 Postgres
+**Test coverage (Aster side, all green):** 90 workspace tests + 19 Postgres
 integration tests + 1 cross-process E2E (brokerd + v8cell over UDS in
 two real Docker containers) + 1 brokerd-postgres smoke (3 containers).
 

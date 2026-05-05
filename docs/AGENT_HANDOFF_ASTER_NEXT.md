@@ -87,21 +87,28 @@ The end-to-end story we are building, broken into the layers it crosses:
 What is **already wired** (verify with `git log` on each repo):
 
 - Layers 1, 2, 4, 7, 8 are done.
-- Layers 3a (raw-JS endpoint) and 5a (broker can answer "give me bytes
-  for path") are now wired at the broker/container boundary: Aster
-  #19 adds `LoadModuleBundle`, and Synapse #59 passes optional
-  Postgres/modules config into brokerd.
-- Layer 5b (cell-side unzip + ESM compile + shims) is **not** done.
-  It is the largest open piece.
+- Layer 3a (raw-JS endpoint) and Layer 5a (broker serves bundle bytes
+  for a path) are wired at the broker/container boundary: Aster #19
+  adds `LoadModuleBundle`, Synapse #59 passes optional Postgres/modules
+  config into brokerd.
+- Layer 5a is **also consumed** by the cell now: Aster #20 added
+  `ASTER_MODULE_PATH` to the v8cell binary, which fetches the bundle
+  ZIP via `LoadModuleBundle`, unzips, picks `<path>` or `<path>.js`,
+  and feeds the entry to the existing V8 path.
+- Layer 5b (V8 ESM compile + Convex shims `convex/server`,
+  `convex/values`, `_generated/api`) is **not** done. It is the
+  largest open piece — until it lands, only bundles whose entry sets
+  `globalThis.main = async () => {...}` execute end-to-end.
 - Layer 6 (function-call routing inside the cell) is **not** done.
 - Layer 3b (Convex-shaped HTTP frontend) is **not** done.
 
 What is **partially wired** and may trip you up:
 
-- The broker can compute and serve "give me the bundle bytes for path X"
-  via `PostgresCapsuleStore::load_module_bundle` + `LoadModuleBundle`
-  IPC, but **the v8cell does not consume it yet**. It still runs a
-  single JS source string from `ASTER_JS` / `ASTER_JS_INLINE`.
+- The cell consumes `LoadModuleBundle` + unzip (Aster #20), but the
+  V8 host still expects the entry source to define `globalThis.main`.
+  Real `npx convex deploy` bundles export `query`/`mutation` factories
+  via `convex/server`, not a `main`. They will load and unzip cleanly
+  but fail at execute time until 5.4.b lands.
 - Synapse #59's source wiring is process-level config, not the final
   product model. It is enough for fixture smoke work, but production
   still needs a durable per-deployment source relationship.
@@ -109,7 +116,9 @@ What is **partially wired** and may trip you up:
   `AsterImageTag`. The images were rebuilt and VPS-smoked on
   2026-05-04; see `docs/ASTER_VPS_SMOKE.md`. There is still no
   registry publish workflow in `Iann29/aster`, so the operator path
-  remains `docker save | scp | docker load`.
+  remains `docker save | scp | docker load`. Note: real-VPS smoke for
+  the new `ASTER_MODULE_PATH` path requires a fresh image rebuild
+  (the published 0.4 tarball predates Aster #20).
 
 ---
 
