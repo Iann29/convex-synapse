@@ -6,7 +6,7 @@
 [![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 [![Next.js](https://img.shields.io/badge/next.js-16-000?logo=next.js)](https://nextjs.org/)
 
-**The complete self-hosted [Convex](https://www.convex.dev/) platform.** Teams, projects, custom domains with auto-TLS, RBAC, S3 backups, audit trail, the official Convex Dashboard embedded with an in-iframe deployment picker — and a separate execution plane ([Aster](https://github.com/Iann29/aster)) that lets you run tenant code without giving it your database credentials. **One curl, three minutes, fully working.**
+**The complete self-hosted [Convex](https://www.convex.dev/) platform.** Teams, projects, custom domains with auto-TLS, RBAC, S3 backups, audit trail, the official Convex Dashboard embedded with an in-iframe deployment picker. **One curl, three minutes, fully working.**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh | bash
@@ -35,10 +35,6 @@ With a domain you get TLS via Caddy + Let's Encrypt automatically; without one, 
 ## What you can do with this
 
 **Run a personal Convex backend, properly.** Sign up, create a team, spin up dev / preview / prod deployments, point your `npx convex` at them, watch the embedded official Convex Dashboard reflect every function call, every row, every log line — same UI Convex Cloud ships, on infrastructure you own.
-
-**Host Convex apps for other people, safely.** Each deployment can be `kind="aster"` instead of the default `kind="convex"`. Aster (open-source, in [Iann29/aster](https://github.com/Iann29/aster)) is a capability-narrowed execution plane: tenant code lives in a V8 cell that has **no database credentials**. A separate broker process owns Postgres; the cell only sees sealed snapshot capsules over a Unix-domain socket. Even a CVE-class V8 escape leaves the attacker with an empty isolate. **Real `npx convex deploy` bundles execute end-to-end** — proven by `aster-runner/docker/smoke-bundle.sh` and a real-VPS smoke captured in [`docs/ASTER_VPS_SMOKE.md`](docs/ASTER_VPS_SMOKE.md). This is the killer differentiator: nobody else lets you run customer Convex code on shared infrastructure with this isolation guarantee.
-
-**Use Convex in regulated industries.** "How do you guarantee the application code can't reach data outside its scope?" is a question your auditor asks. With Synapse + Aster, the answer is *the code physically does not have credentials. Every read passes through a sealed capsule with a per-invocation context.* That's an auditable property, not a code-review-and-pinky-swear.
 
 **Replace your Cloud account without losing functionality.** Custom domains with on-demand TLS, scoped access tokens, deploy keys for CI integrations, project-level RBAC, audit log with Cloud-vocabulary action names, OpenAPI parity with the upstream dashboard's management API. The `npx convex` CLI talks to Synapse with the same shape it talks to Cloud. Migrate without rewriting client code.
 
@@ -104,7 +100,6 @@ With a domain you get TLS via Caddy + Let's Encrypt automatically; without one, 
 | Scoped access tokens (v1.0+) | user / team / project / app / deployment scope; bearer enforced at every load*ForRequest |
 | Deploy keys (v1.0.3+) | named per-deployment admin keys for CI integrations (Vercel, GitHub Actions, etc) — create from the deployment row, revoke from the dashboard, audit trail per credential |
 | Auto-update from the dashboard (v1.1.0+) | yellow "v1.X.Y available" banner polls GitHub releases hourly; one-click upgrade dispatches `setup.sh --upgrade` via a host-side systemd daemon (unix socket, no TCP exposure), streaming logs back to the modal — no SSH needed for routine upgrades |
-| **Aster runtime kind (v1.1+, real Convex queries run end-to-end)** | deployments can be created with `kind: "aster"` to register an [Aster runner cell](https://github.com/Iann29/aster) — capability-narrowed execution plane that runs tenant JS in a V8 cell with **no database credentials**. Synapse provisions the brokerd container, ships per-deployment Postgres / modules-dir config (`SYNAPSE_ASTER_*`), and spawns a v8cell via `POST /v1/deployments/{name}/aster/invoke`. **The cell now compiles a real `npx convex deploy` ZIP as ESM, finds the named export, and dispatches `<export>.invokeQuery(args)` — proven by both a library test and a docker end-to-end smoke (`aster-runner/docker/smoke-bundle.sh`) that runs against real Postgres and returns the seeded document.** The deployment proxy still returns `501 aster_not_proxied` until the Convex-shaped HTTP frontend (`/api/query/<module>:<fn>`) lands. v0.6 is read-only on purpose; mutations / actions get a typed rejection. Full status: [`docs/ASTER_INTEGRATION.md`](docs/ASTER_INTEGRATION.md). |
 | Audit log | Cloud-vocabulary action names, admin-only read |
 | Multi-node hygiene | retry-on-conflict, advisory-lock workers, `SELECT FOR UPDATE SKIP LOCKED` queue |
 | Auto-installer | `./setup.sh` or `curl \| bash` one-liner brings up the whole stack on a fresh VPS in ~3 min |
@@ -191,7 +186,6 @@ For everything else (custom Caddy/nginx, HA cluster setup, the
 | `setup.sh` + `installer/` | Pure-bash auto-installer + bats tests |
 | `docs/` | Architecture, roadmap, production guide, design notes |
 | `docker-compose.yml` | Local stack + optional `ha` / `caddy` profiles |
-| `aster-e2e-fixture/` | Minimal Convex app used to validate the Aster runtime kind end-to-end (see [Iann29/aster](https://github.com/Iann29/aster)) |
 
 ## Tests
 

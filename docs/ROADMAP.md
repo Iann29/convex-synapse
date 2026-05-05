@@ -248,59 +248,6 @@ focus on RBAC + API stability + picker polish:
   chart depends on it. Both deferred until there's a documented
   k8s-only operator asking.
 
-## v1.1+ — Aster runtime kind (in progress)
-
-[Aster](https://github.com/Iann29/aster) is an open-source execution
-plane that runs tenant JS in V8 cells **without database credentials**.
-Synapse can already provision an Aster runner cell as a first-class
-deployment kind and invoke raw JS through a real v8cell; the Convex
-module loader and Convex-shaped HTTP frontend are the open work. See
-[`docs/ASTER_INTEGRATION.md`](ASTER_INTEGRATION.md) for the full status.
-
-- [x] **Schema + API field** — `kind: "convex" | "aster"` on
-  `create_deployment`, `list_deployments`, `get_deployment`. Migration
-  000010 backfills existing rows to `convex`. (PR #49)
-- [x] **Real provisioning for kind=aster** — `Docker.Provision` spawns
-  the `aster-brokerd:0.4` container with a per-deployment volume for
-  the Unix-domain socket. `DestroyAster` + `StatusAster` siblings of
-  the existing helpers; delete-handler routes by kind. Worker carries
-  `Kind` from the row to the spec. Health worker dispatches by kind.
-  (PR #50)
-- [x] **Proxy honesty** — `/d/{name}/*` returns `501 aster_not_proxied`
-  for kind=aster with structured JSON the dashboard branches on.
-  (PR #51)
-- [x] **Dashboard badge + disabled Open Dashboard** for kind=aster.
-  (PR #52)
-- [x] **End-to-end fixture** — `aster-e2e-fixture/` mini Convex app
-  (1 table, 1 query, 1 mutation) ready for the Aster execution path.
-  (PR #54)
-- [x] **Cell-on-demand** — `POST /v1/deployments/{name}/aster/invoke`
-  spawns `aster-v8cell:0.4` against the existing brokerd's volume,
-  collects stdout, returns to caller. Raw-JS entrypoint only; real
-  Convex bundles still wait on the module loader.
-- [x] **Aster image `0.4` VPS smoke** — local Docker smokes passed,
-  images were shipped with `docker save | scp | docker load`, and
-  `synapse-vps` validated create → broker `0.4` ready → v8cell over
-  UDS → `output:1` → delete. Captured in `docs/ASTER_VPS_SMOKE.md`.
-  (PR #57)
-- [x] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
-  upstream `crates/value/src/id_v6.rs`. Required before a Convex CLI-
-  bundled module can call `db.get(id)` against an Aster cell.
-- [x] **Module loader (Aster repo)** — `crates/v8cell::execute_module_query_with_broker` compiles a real `npx convex deploy` bundle as a V8 ES module, asserts `isQuery`, dispatches `<export>.invokeQuery(args_json)`, drives the `Convex.asyncSyscall("1.0/get")` trap loop. Locked by `crates/v8cell/tests/module_loader.rs` (lib) + `docker/smoke-bundle.sh` (binaries + Postgres). Real Convex queries execute end-to-end. (Iann29/aster #15, #17, #19–24)
-- [ ] **VPS smoke through Synapse with module-mode** — extend `synapse-vps`'s `aster/invoke` flow with the new `ASTER_FUNCTION_NAME` + `ASTER_ARGS_JSON` envs (Aster #23) and a real Convex deployment whose `_source_packages.blob` Aster mounts. The local docker smoke passes (`docker/smoke-bundle.sh` in Iann29/aster); Synapse-driven VPS replication is the remaining integration step. The first VPS attempt's `output:null` is now traced to: non-HA SQLite for the Convex side + no `ASTER_STORE=postgres` wiring at the time. Synapse #59 closed the wiring; the SQLite/Postgres source pairing still needs operator setup.
-- [ ] **Convex-shaped HTTP frontend (Synapse)** — `/api/query/<module>:<fn>` → cell invocation. The module-mode binary path exists (Aster #23); Synapse's `aster/invoke` still takes raw JS. Map Convex's request shape (path + args + format) to the new envs.
-- [ ] **Per-deployment Aster source binding (Synapse)** — today `SYNAPSE_ASTER_POSTGRES_URL` + `SYNAPSE_ASTER_MODULES_DIR` are process-level; production needs `aster_deployments(deployment_id, source_convex_deployment_id, postgres_url, modules_dir)` so each Aster mirror points at its specific Convex source.
-- [ ] **Aster mutations / actions** — v0.6 cell explicitly rejects non-queries (typed error). Commit / OCC story lands separately so its review surface stays isolated.
-- [ ] **OS sandboxing on the v8cell container** — cgroups v2,
-  seccomp, read-only rootfs, per-tenant UID. Required before a
-  hostile multi-tenant operator can put unrelated workloads on the
-  same VPS.
-
-The Aster repo's [`docs/POSTGRES_ADAPTER_PLAN.md`](https://github.com/Iann29/aster/blob/main/docs/POSTGRES_ADAPTER_PLAN.md)
-+ [`docs/CONVEX_POSTGRES_REFERENCE.md`](https://github.com/Iann29/aster/blob/main/docs/CONVEX_POSTGRES_REFERENCE.md)
-carry the Rust-side design and the Convex schema gotchas; this entry
-tracks Synapse-side wiring.
-
 ## Maybe never
 
 - Full Stripe/Orb billing parity (irrelevant for self-hosted)
