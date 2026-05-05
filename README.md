@@ -6,32 +6,17 @@
 [![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 [![Next.js](https://img.shields.io/badge/next.js-16-000?logo=next.js)](https://nextjs.org/)
 
-**Open-source control plane for self-hosted [Convex](https://www.convex.dev/) deployments.**
-
-Convex's official self-hosted backend is great — but their dashboard
-only talks to one instance via a hardcoded admin key. No teams, no
-projects, no provisioning. Synapse is the management layer that fills
-that gap: teams, projects, multi-deployment, **custom domains with
-auto-TLS**, **project-level RBAC** (admin / member / viewer), S3
-backups, audit log, `npx convex` auth, and an embedded Convex
-Dashboard with an **in-iframe deployment picker** — all behind a
-one-line installer.
-
-**No flags, no docs, no idea what you're doing — just run:**
+**The complete self-hosted [Convex](https://www.convex.dev/) platform.** Teams, projects, custom domains with auto-TLS, RBAC, S3 backups, audit trail, the official Convex Dashboard embedded with an in-iframe deployment picker — and a separate execution plane ([Aster](https://github.com/Iann29/aster)) that lets you run tenant code without giving it your database credentials. **One curl, three minutes, fully working.**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh | bash
 ```
 
-A small interactive wizard asks four questions (domain or plain HTTP,
-HA mode, install location, auto-install missing deps), shows a summary
-box, then handles everything else — Docker auto-installed if absent,
-stack built and brought up, admin path tested end-to-end. Three
-minutes later you open `https://<your-domain>` (or `http://<vps-ip>:6790`
-if you skipped TLS) and register your admin user.
+The installer asks four questions (domain or HTTP, HA mode, install dir, auto-deps), then handles Docker, the stack, TLS, and a self-test end-to-end. You open `https://<your-domain>` (or `http://<vps-ip>:6790` for plain HTTP), register the admin, and the stack is yours.
 
-**Already know what you want?** Skip the wizard and pass flags
-directly:
+> **Why this exists.** Convex's open-source backend ships solo — one deployment, one admin key, no concept of teams or projects. Convex Cloud has all that but it's closed and runs on someone else's machine. Synapse is the missing layer between "great single-instance backend" and "platform you control": you get the multi-deployment, RBAC, billing-account-shaped management surface that Cloud has, **without ever leaving your infra**.
+
+**Already know what you want?** Skip the wizard and pass flags directly:
 
 ```bash
 # Production with HTTPS
@@ -43,11 +28,21 @@ curl -sSf https://raw.githubusercontent.com/Iann29/convex-synapse/main/setup.sh 
   | bash -s -- --no-tls --skip-dns-check --non-interactive
 ```
 
-With a domain you get TLS via Caddy + Let's Encrypt automatically;
-without one, Synapse exposes plain HTTP on `:6790` (dashboard) and
-`:8080` (API). Validated end-to-end against a real Hetzner CPX22.
+With a domain you get TLS via Caddy + Let's Encrypt automatically; without one, Synapse exposes plain HTTP on `:6790` (dashboard) and `:8080` (API). Validated end-to-end against a real Hetzner CPX22.
 
 ![Project page with a deployment provisioned](docs/screenshots/04-project-deployment.png)
+
+## What you can do with this
+
+**Run a personal Convex backend, properly.** Sign up, create a team, spin up dev / preview / prod deployments, point your `npx convex` at them, watch the embedded official Convex Dashboard reflect every function call, every row, every log line — same UI Convex Cloud ships, on infrastructure you own.
+
+**Host Convex apps for other people, safely.** Each deployment can be `kind="aster"` instead of the default `kind="convex"`. Aster (open-source, in [Iann29/aster](https://github.com/Iann29/aster)) is a capability-narrowed execution plane: tenant code lives in a V8 cell that has **no database credentials**. A separate broker process owns Postgres; the cell only sees sealed snapshot capsules over a Unix-domain socket. Even a CVE-class V8 escape leaves the attacker with an empty isolate. **Real `npx convex deploy` bundles execute end-to-end** — proven by `aster-runner/docker/smoke-bundle.sh` and a real-VPS smoke captured in [`docs/ASTER_VPS_SMOKE.md`](docs/ASTER_VPS_SMOKE.md). This is the killer differentiator: nobody else lets you run customer Convex code on shared infrastructure with this isolation guarantee.
+
+**Use Convex in regulated industries.** "How do you guarantee the application code can't reach data outside its scope?" is a question your auditor asks. With Synapse + Aster, the answer is *the code physically does not have credentials. Every read passes through a sealed capsule with a per-invocation context.* That's an auditable property, not a code-review-and-pinky-swear.
+
+**Replace your Cloud account without losing functionality.** Custom domains with on-demand TLS, scoped access tokens, deploy keys for CI integrations, project-level RBAC, audit log with Cloud-vocabulary action names, OpenAPI parity with the upstream dashboard's management API. The `npx convex` CLI talks to Synapse with the same shape it talks to Cloud. Migrate without rewriting client code.
+
+**Upgrade from your phone.** A yellow "v1.X.Y available" banner in the dashboard polls GitHub releases hourly; one click triggers `setup.sh --upgrade` via a host-side systemd daemon (unix socket, no TCP exposure), streams logs back to the modal, and the page reloads when the new build is healthy. No SSH for routine upgrades.
 
 ## Architecture
 
