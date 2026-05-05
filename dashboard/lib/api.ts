@@ -169,6 +169,29 @@ export type CreateDeployKeyResponse = DeployKey & {
   exportSnippet: string;
 };
 
+// DeploymentDomain mirrors models.DeploymentDomain on the backend
+// (synapse/internal/models/models.go). A custom domain registered against
+// a deployment so callers can reach it at e.g. "api.example.com" instead
+// of the "<name>.<base>" wildcard subdomain. The proxy + on-demand TLS
+// layer (PR #5) reads rows where status='active' for routing decisions;
+// this DTO is what the dashboard consumes from /v1/deployments/{name}/domains.
+//
+// status='pending' (just inserted, DNS not yet verified or
+// SYNAPSE_PUBLIC_IP unconfigured), 'active' (A record matches the
+// configured public IP), 'failed' (lookup error or wrong IP — see
+// lastDnsError for details).
+export type DeploymentDomain = {
+  id: string;
+  deploymentId: string;
+  domain: string;
+  role: "api" | "dashboard";
+  status: "pending" | "active" | "failed";
+  dnsVerifiedAt?: string;
+  lastDnsError?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type EnvVar = {
   name: string;
   value: string;
@@ -763,6 +786,38 @@ export const api = {
     revokeDeployKey(name: string, keyId: string): Promise<void> {
       return request<void>(
         `/v1/deployments/${encodeURIComponent(name)}/deploy_keys/${encodeURIComponent(keyId)}/revoke`,
+        { method: "POST", body: {} },
+      );
+    },
+    // Custom domains (PR #64+). Per-deployment domain registry — POST
+    // triggers a synchronous DNS preflight against SYNAPSE_PUBLIC_IP, so
+    // the row often comes back already 'active' or 'failed'. List wraps
+    // the {domains:[…]} envelope so callers always get a flat array.
+    async listDomains(name: string): Promise<DeploymentDomain[]> {
+      const r = await request<{ domains: DeploymentDomain[] }>(
+        `/v1/deployments/${encodeURIComponent(name)}/domains`,
+      );
+      return r.domains ?? [];
+    },
+    addDomain(
+      name: string,
+      domain: string,
+      role: "api" | "dashboard",
+    ): Promise<DeploymentDomain> {
+      return request<DeploymentDomain>(
+        `/v1/deployments/${encodeURIComponent(name)}/domains`,
+        { method: "POST", body: { domain, role } },
+      );
+    },
+    deleteDomain(name: string, domainId: string): Promise<void> {
+      return request<void>(
+        `/v1/deployments/${encodeURIComponent(name)}/domains/${encodeURIComponent(domainId)}`,
+        { method: "DELETE" },
+      );
+    },
+    verifyDomain(name: string, domainId: string): Promise<DeploymentDomain> {
+      return request<DeploymentDomain>(
+        `/v1/deployments/${encodeURIComponent(name)}/domains/${encodeURIComponent(domainId)}/verify`,
         { method: "POST", body: {} },
       );
     },
