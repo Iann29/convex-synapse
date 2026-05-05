@@ -119,6 +119,13 @@ type Config struct {
 	// GitHubRepo points /v1/admin/version_check at the right release
 	// stream. Default Iann29/convex-synapse; overridable for forks.
 	GitHubRepo string
+
+	// PublicIP (v1.1+) is the IPv4 address operators publish in DNS for
+	// custom-domain verification. When SYNAPSE_PUBLIC_IP is set, the
+	// deployment_domains POST and verify handlers resolve A records and
+	// gate status transitions on a match. Empty disables DNS preflight
+	// (rows stay status='pending' with a helpful last_dns_error).
+	PublicIP string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -191,6 +198,7 @@ func Load() (*Config, error) {
 
 		UpdaterSocket: getEnvDefault("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"),
 		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),
+		PublicIP:      strings.TrimSpace(os.Getenv("SYNAPSE_PUBLIC_IP")),
 	}, nil
 }
 

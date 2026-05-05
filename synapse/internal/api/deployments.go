@@ -85,6 +85,12 @@ type DeploymentsHandler struct {
 	// ([]byte, error) } so we don't import internal/crypto here —
 	// production wiring passes *crypto.SecretBox.
 	Crypto SecretEncrypter
+
+	// Domains, when non-nil, mounts /domains[...] sub-routes onto each
+	// /v1/deployments/{name} subrouter. Wired by router.go alongside
+	// the deployments handler so the handler doesn't have to know the
+	// PublicIP env value directly.
+	Domains *DomainsHandler
 }
 
 // publicDeploymentURL returns the URL a *remote* caller (the operator's
@@ -199,6 +205,14 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/deploy_keys", h.createDeployKey)
 		r.Get("/deploy_keys", h.listDeployKeys)
 		r.Post("/deploy_keys/{id}/revoke", h.revokeDeployKey)
+		// Custom domains (v1.1+, migration 000012). The DomainsHandler
+		// reuses loadDeploymentForRequest from this struct; nil = the
+		// router was wired without domain support, in which case we
+		// silently omit the routes (the dashboard probes feature
+		// availability via 404 on /domains).
+		if h.Domains != nil {
+			h.Domains.MountInDeploymentRoutes(r)
+		}
 	})
 	return r
 }
