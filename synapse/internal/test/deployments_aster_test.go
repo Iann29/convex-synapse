@@ -332,12 +332,15 @@ func TestDeployments_DeleteAsterRoutesToDestroyAster(t *testing.T) {
 // ---------- POST /v1/deployments/{name}/aster/invoke -----------------
 
 type invokeAsterReq struct {
-	JS         string   `json:"js"`
-	SnapshotTS uint64   `json:"snapshotTs,omitempty"`
-	CellID     string   `json:"cellId,omitempty"`
-	LeaseEpoch uint64   `json:"leaseEpoch,omitempty"`
-	Prewarm    []string `json:"prewarm,omitempty"`
-	MaxTraps   int      `json:"maxTraps,omitempty"`
+	JS           string   `json:"js,omitempty"`
+	ModulePath   string   `json:"modulePath,omitempty"`
+	FunctionName string   `json:"functionName,omitempty"`
+	ArgsJson     string   `json:"argsJson,omitempty"`
+	SnapshotTS   uint64   `json:"snapshotTs,omitempty"`
+	CellID       string   `json:"cellId,omitempty"`
+	LeaseEpoch   uint64   `json:"leaseEpoch,omitempty"`
+	Prewarm      []string `json:"prewarm,omitempty"`
+	MaxTraps     int      `json:"maxTraps,omitempty"`
 }
 
 type invokeAsterResp struct {
@@ -450,5 +453,160 @@ func TestDeployments_InvokeAsterCellRejectsEmptyJS(t *testing.T) {
 	}
 	if n := len(h.Docker.InvokedAsterCells); n != 0 {
 		t.Errorf("InvokedAsterCells: got %d, want 0", n)
+	}
+}
+
+// TestDeployments_InvokeAsterCellAcceptsModuleMode locks the
+// module-query path: the API forwards `modulePath` + `functionName` +
+// `argsJson` to the docker layer verbatim, AND the cell's stdout
+// (whatever the FakeDocker hook returns) flows back to the client.
+//
+// Side-channel assertion: FakeDocker's recorded request must NOT
+// include any JS source — module-mode and raw-JS are mutually
+// exclusive end-to-end, so a regression that double-routes both
+// would surface as both fields populated on the recorded spec.
+func TestDeployments_InvokeAsterCellAcceptsModuleMode(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Module Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "ModuleProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	customStdout := `{"output":"{\"_id\":\"messages|aaaa\",\"name\":\"ian\"}","traps":1,"capsule_hash":"abc"}`
+	h.Docker.InvokeAsterCellFn = func(_ context.Context, _ dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error) {
+		return &dockerprov.InvokeAsterResult{
+			Stdout:   customStdout,
+			Stderr:   "",
+			ExitCode: 0,
+		}, nil
+	}
+
+	wantArgs := `[{"id":"0123456789abcdef0123456789abcdef/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
+
+	var resp invokeAsterResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+		owner.AccessToken,
+		invokeAsterReq{
+			ModulePath:   "messages.js",
+			FunctionName: "getById",
+			ArgsJson:     wantArgs,
+		},
+		http.StatusOK, &resp)
+
+	if resp.Stdout != customStdout {
+		t.Errorf("Stdout: got %q, want %q", resp.Stdout, customStdout)
+	}
+	if resp.ExitCode != 0 {
+		t.Errorf("ExitCode: got %d, want 0", resp.ExitCode)
+	}
+
+	if n := len(h.Docker.InvokedAsterCells); n != 1 {
+		t.Fatalf("InvokedAsterCells: got %d calls, want 1", n)
+	}
+	got := h.Docker.InvokedAsterCells[0]
+	if got.DeploymentName != dep.Name {
+		t.Errorf("DeploymentName: got %q, want %q", got.DeploymentName, dep.Name)
+	}
+	if got.ModulePath != "messages.js" {
+		t.Errorf("ModulePath: got %q, want %q", got.ModulePath, "messages.js")
+	}
+	if got.FunctionName != "getById" {
+		t.Errorf("FunctionName: got %q, want %q", got.FunctionName, "getById")
+	}
+	if got.ArgsJson != wantArgs {
+		t.Errorf("ArgsJson: got %q, want %q", got.ArgsJson, wantArgs)
+	}
+	if got.JSSource != "" {
+		t.Errorf("JSSource: got %q, want empty (module-mode must not also send raw JS)", got.JSSource)
+	}
+	if got.InstanceSecret == "" {
+		t.Errorf("InstanceSecret empty; cell can't seal-decrypt without it")
+	}
+}
+
+// TestDeployments_InvokeAsterCellRejectsMixedModes locks the
+// mutually-exclusive 400 — setting both `js` and any module-mode
+// field returns mutually_exclusive_modes, and the docker layer is
+// never reached.
+func TestDeployments_InvokeAsterCellRejectsMixedModes(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Mixed Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "MixedProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	env := h.AssertStatus(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+		owner.AccessToken,
+		invokeAsterReq{
+			JS:           "globalThis.main = async () => 1;",
+			ModulePath:   "messages.js",
+			FunctionName: "getById",
+			ArgsJson:     `[{"id":"x"}]`,
+		},
+		http.StatusBadRequest)
+	if env.Code != "mutually_exclusive_modes" {
+		t.Errorf("error code: got %q, want mutually_exclusive_modes", env.Code)
+	}
+	if n := len(h.Docker.InvokedAsterCells); n != 0 {
+		t.Errorf("InvokedAsterCells: got %d, want 0 (mixed modes must reject before docker)", n)
+	}
+}
+
+// TestDeployments_InvokeAsterCellRejectsHalfModuleConfig locks the
+// "half-set module mode" 400 — setting `modulePath` without
+// `functionName` returns incomplete_module_mode and never reaches
+// docker. Mirrors the symmetric "missing argsJson" case via a
+// sub-test so future field additions keep all branches covered.
+func TestDeployments_InvokeAsterCellRejectsHalfModuleConfig(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Half Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "HalfProj")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]any{"type": "dev", "kind": "aster"},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	cases := []struct {
+		name string
+		body invokeAsterReq
+	}{
+		{
+			name: "missing functionName",
+			body: invokeAsterReq{ModulePath: "messages.js", ArgsJson: `[]`},
+		},
+		{
+			name: "missing argsJson",
+			body: invokeAsterReq{ModulePath: "messages.js", FunctionName: "getById"},
+		},
+		{
+			name: "missing modulePath",
+			body: invokeAsterReq{FunctionName: "getById", ArgsJson: `[]`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(h.Docker.InvokedAsterCells)
+			env := h.AssertStatus(http.MethodPost, "/v1/deployments/"+dep.Name+"/aster/invoke",
+				owner.AccessToken, tc.body, http.StatusBadRequest)
+			if env.Code != "incomplete_module_mode" {
+				t.Errorf("error code: got %q, want incomplete_module_mode", env.Code)
+			}
+			if got := len(h.Docker.InvokedAsterCells); got != before {
+				t.Errorf("InvokedAsterCells: grew by %d, want 0 (half-config must reject before docker)", got-before)
+			}
+		})
 	}
 }
