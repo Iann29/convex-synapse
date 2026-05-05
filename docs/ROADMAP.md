@@ -286,15 +286,11 @@ module loader and Convex-shaped HTTP frontend are the open work. See
 - [x] **IDv6 ↔ DocumentId mapping (Aster repo)** — base32 codec from
   upstream `crates/value/src/id_v6.rs`. Required before a Convex CLI-
   bundled module can call `db.get(id)` against an Aster cell.
-- [ ] **Module loader (Aster repo)** — drive the same
-  `module.<funcName>.invokeQuery(JSON.stringify(args))` shape Convex's
-  own runner uses (see upstream `crates/isolate/src/environment/udf/mod.rs`).
-- [ ] **VPS smoke with the e2e fixture** — deploy `aster-e2e-fixture`
-  against a shared Postgres-backed Convex deployment, then drive the same IDv6
-  through a `kind=aster` cell-on-demand invocation. First VPS attempt
-  documented in `docs/ASTER_VPS_SMOKE.md`: fixture deploy/control query worked,
-  but Aster returned `output:null` because the test stack was non-HA SQLite and
-  brokerd had no `ASTER_STORE=postgres` wiring.
+- [x] **Module loader (Aster repo)** — `crates/v8cell::execute_module_query_with_broker` compiles a real `npx convex deploy` bundle as a V8 ES module, asserts `isQuery`, dispatches `<export>.invokeQuery(args_json)`, drives the `Convex.asyncSyscall("1.0/get")` trap loop. Locked by `crates/v8cell/tests/module_loader.rs` (lib) + `docker/smoke-bundle.sh` (binaries + Postgres). Real Convex queries execute end-to-end. (Iann29/aster #15, #17, #19–24)
+- [ ] **VPS smoke through Synapse with module-mode** — extend `synapse-vps`'s `aster/invoke` flow with the new `ASTER_FUNCTION_NAME` + `ASTER_ARGS_JSON` envs (Aster #23) and a real Convex deployment whose `_source_packages.blob` Aster mounts. The local docker smoke passes (`docker/smoke-bundle.sh` in Iann29/aster); Synapse-driven VPS replication is the remaining integration step. The first VPS attempt's `output:null` is now traced to: non-HA SQLite for the Convex side + no `ASTER_STORE=postgres` wiring at the time. Synapse #59 closed the wiring; the SQLite/Postgres source pairing still needs operator setup.
+- [ ] **Convex-shaped HTTP frontend (Synapse)** — `/api/query/<module>:<fn>` → cell invocation. The module-mode binary path exists (Aster #23); Synapse's `aster/invoke` still takes raw JS. Map Convex's request shape (path + args + format) to the new envs.
+- [ ] **Per-deployment Aster source binding (Synapse)** — today `SYNAPSE_ASTER_POSTGRES_URL` + `SYNAPSE_ASTER_MODULES_DIR` are process-level; production needs `aster_deployments(deployment_id, source_convex_deployment_id, postgres_url, modules_dir)` so each Aster mirror points at its specific Convex source.
+- [ ] **Aster mutations / actions** — v0.6 cell explicitly rejects non-queries (typed error). Commit / OCC story lands separately so its review surface stays isolated.
 - [ ] **OS sandboxing on the v8cell container** — cgroups v2,
   seccomp, read-only rootfs, per-tenant UID. Required before a
   hostile multi-tenant operator can put unrelated workloads on the
