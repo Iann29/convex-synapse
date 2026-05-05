@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,10 +31,102 @@ import (
 var Version = "dev"
 
 func main() {
+	// One-shot CLI subcommands live alongside the server. We parse a
+	// dedicated FlagSet first; if it matches a subcommand flag, run
+	// it and exit without touching the DB / Docker / HTTP server.
+	if handled, err := runSubcommand(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// stringSliceFlag is a flag.Value collector for repeatable --map
+// arguments in the form key=value. Stored as a slice (preserving
+// order for diagnostics); callers convert to a map.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string     { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error { *s = append(*s, v); return nil }
+
+// runSubcommand inspects argv looking for one of the one-shot CLI
+// flags. Returns (handled=true, err) when the flag is set, telling
+// main() to exit instead of starting the server. Returns
+// (handled=false, nil) when no subcommand was requested — main()
+// continues with the normal boot path.
+//
+// Today there's exactly one subcommand: --adopt-domains-from-caddy.
+// Adding more is just another fs.Bool / fs.String + early-return
+// branch here. If the surface grows past 2-3 we should split into
+// a proper synapse-cli binary; until then this keeps the install
+// footprint at one Go binary.
+func runSubcommand(args []string, stdout *os.File) (bool, error) {
+	fs := flag.NewFlagSet("synapse", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+
+	adopt := fs.Bool("adopt-domains-from-caddy", false,
+		"parse a Caddyfile and register the hostnames as Synapse deployment_domains, then exit")
+	caddyfile := fs.String("caddyfile", "",
+		"path to the Caddyfile to import (required with --adopt-domains-from-caddy)")
+	apiURL := fs.String("api-url", "http://localhost:8080",
+		"Synapse API base URL")
+	token := fs.String("token", "", "admin/access token for the Synapse API")
+	dryRun := fs.Bool("dry-run", false,
+		"parse + print the import plan without making any API calls")
+	defaultRole := fs.String("default-role", "api",
+		`fallback role when the parser can't infer ("api" or "dashboard")`)
+	var maps stringSliceFlag
+	fs.Var(&maps, "map",
+		"hostname=deployment-name override (repeatable). Example: --map=api.foo.com=fooprod")
+
+	// Custom error handling: if the user passes a flag we don't
+	// know we want to continue to run() (the server has its own env-
+	// based config, no flags). flag.ContinueOnError + a manual error
+	// check gets us that.
+	if err := fs.Parse(args); err != nil {
+		// Don't swallow help requests — flag.ErrHelp is what we get
+		// when the user passes -h / --help; surface it as "handled
+		// with no error" so we exit 0.
+		if errors.Is(err, flag.ErrHelp) {
+			return true, nil
+		}
+		// Unknown flags here are not necessarily fatal — the server's
+		// regular run() flow doesn't use any flags, so anything we
+		// don't recognize must be a typo. Surface it.
+		return true, err
+	}
+
+	if !*adopt {
+		// No subcommand — fall through to the server boot path. We
+		// still tolerate the user passing extra flags we ignored
+		// because future-us might add unrelated subcommands.
+		return false, nil
+	}
+
+	overrides := map[string]string{}
+	for _, raw := range maps {
+		k, v, ok := strings.Cut(raw, "=")
+		if !ok || k == "" || v == "" {
+			return true, fmt.Errorf("--map expects host=name (got %q)", raw)
+		}
+		overrides[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+	}
+
+	flags := adoptDomainsFlags{
+		Caddyfile:   *caddyfile,
+		APIURL:      *apiURL,
+		Token:       *token,
+		DryRun:      *dryRun,
+		DefaultRole: *defaultRole,
+		Overrides:   overrides,
+	}
+	return true, adoptDomainsRun(flags, stdout)
 }
 
 func run() error {
