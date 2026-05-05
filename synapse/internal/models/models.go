@@ -209,6 +209,40 @@ type DeployKey struct {
 	RevokedAt     *time.Time `json:"revokedAt,omitempty"`
 }
 
+// DeploymentDomain is a custom domain registered against a deployment so
+// remote callers can reach it at "api.example.com" instead of the
+// "<name>.<base>" wildcard subdomain. The proxy/TLS layer (PR #5) reads
+// rows where status='active' to make routing + on-demand TLS gating
+// decisions; this model is shared with the dashboard (PR #6).
+//
+// Lifecycle: row inserted with status='pending'; the create-handler
+// kicks a synchronous DNS preflight (5s timeout). Match → 'active';
+// mismatch → 'failed' with last_dns_error populated. The /verify
+// endpoint re-runs the same preflight on demand.
+//
+// LastDNSError is omitted on the wire when empty so successful rows
+// don't carry a stale "" field.
+type DeploymentDomain struct {
+	ID            string     `json:"id"`
+	DeploymentID  string     `json:"deploymentId"`
+	Domain        string     `json:"domain"`
+	Role          string     `json:"role"`
+	Status        string     `json:"status"`
+	DNSVerifiedAt *time.Time `json:"dnsVerifiedAt,omitempty"`
+	LastDNSError  string     `json:"lastDnsError,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+const (
+	DomainRoleAPI       = "api"
+	DomainRoleDashboard = "dashboard"
+
+	DomainStatusPending = "pending"
+	DomainStatusActive  = "active"
+	DomainStatusFailed  = "failed"
+)
+
 const (
 	TokenScopeUser       = "user"
 	TokenScopeTeam       = "team"

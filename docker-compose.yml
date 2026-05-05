@@ -81,6 +81,12 @@ services:
       # be passed through the environment block to actually reach the
       # binary (real-VPS smoke caught this missing in v1.0 chunk 1).
       SYNAPSE_BASE_DOMAIN: ${SYNAPSE_BASE_DOMAIN:-}
+      # SYNAPSE_PUBLIC_IP (v1.1+) — IPv4 the operator publishes in DNS
+      # for per-deployment custom domains. The /v1/deployments/{name}
+      # /domains POST + verify handlers gate status='active' on a
+      # successful A-record match. Empty disables DNS preflight (rows
+      # stay status='pending' with a helpful last_dns_error).
+      SYNAPSE_PUBLIC_IP: ${SYNAPSE_PUBLIC_IP:-}
       # CORS — locked to the dashboard origin in production. Defaults
       # to "*" for local dev so a browser opened against an arbitrary
       # IP/port can still call the API.

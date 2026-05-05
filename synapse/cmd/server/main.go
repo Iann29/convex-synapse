@@ -117,6 +117,7 @@ func run() error {
 		Crypto:        secretBox,
 		UpdaterSocket: cfg.UpdaterSocket,
 		GitHubRepo:    cfg.GitHubRepo,
+		PublicIP:      cfg.PublicIP,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the

@@ -81,6 +81,15 @@ const (
 	ActionCreateDeployKey = "createDeployKey"
 	ActionRevokeDeployKey = "revokeDeployKey"
 
+	// Per-deployment custom domains (v1.1+, migration 000012).
+	// Synapse-original; Convex Cloud manages domains at the project
+	// level. Matches the existing "<verb><Noun>" pattern with a
+	// concrete noun ("Domain") so audit_events queries can pick out
+	// the resource without joining target_id.
+	ActionAddDomain      = "domain.added"
+	ActionRemoveDomain   = "domain.removed"
+	ActionVerifyDomain   = "domain.verified"
+
 	// Instance-level upgrade flow (v1.1.0+). Synapse-original — Cloud has
 	// no per-customer upgrade because Cloud is the platform.
 	ActionUpgradeStarted = "upgradeStarted"
@@ -95,6 +104,9 @@ const (
 	TargetAccessToken = "accessToken"
 	TargetUser        = "user"
 	TargetDeployKey   = "deployKey"
+	// TargetDomain is a deployment_domains row — used by domain.added /
+	// domain.removed / domain.verified events.
+	TargetDomain = "domain"
 	// TargetSynapse is the instance itself — used by upgrade events.
 	TargetSynapse = "synapse"
 )

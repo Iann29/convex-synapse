@@ -71,6 +71,12 @@ type RouterDeps struct {
 	// Setting it (httptest.Server URL) lets integration tests stub the
 	// GitHub fetch without network.
 	GitHubAPIBase string
+
+	// PublicIP (v1.1+) is the IPv4 the operator publishes in DNS for
+	// per-deployment custom domains. The /domains create + verify
+	// handlers gate status='active' on a successful A-record match.
+	// Empty disables DNS preflight; rows stay status='pending'.
+	PublicIP string
 }
 
 // HAConfig carries cluster-wide defaults for the per-deployment Postgres
@@ -129,6 +135,16 @@ func NewRouter(d RouterDeps) http.Handler {
 		HA:                    d.HA,
 		Crypto:                d.Crypto,
 	}
+	// Per-deployment custom domains (v1.1+). Sub-routes mount under
+	// /v1/deployments/{name}/domains; the handler reuses the
+	// deployments handler for loadDeploymentForRequest so
+	// authorisation logic stays in one place.
+	domainsH := &DomainsHandler{
+		DB:          d.DB,
+		Deployments: deploymentsH,
+		PublicIP:    d.PublicIP,
+	}
+	deploymentsH.Domains = domainsH
 	// teamsH + projectsH carry a *DeploymentsHandler reference so their
 	// listDeployments handlers can call publicDeploymentURL — same
 	// rewrite as /auth and /cli_credentials so dashboards and CLIs see
