@@ -336,6 +336,34 @@ func (c *Client) Restart(ctx context.Context, deploymentName string) error {
 	return c.restart(ctx, containerName(deploymentName))
 }
 
+// Recreate stops + removes the existing container (keeping the data
+// volume so SQLite contents survive) and re-Provisions with the
+// supplied spec. Used by the custom-domains flow to apply a refreshed
+// CORS_ALLOWED_ORIGINS env without resetting backend state.
+//
+// Single-replica path only (spec.HAReplica must be false). HA
+// deployments would need per-replica orchestration that the v1.1
+// custom-domains flow deliberately ducks.
+//
+// On the wire this is ~15s of downtime per deployment (stop + start +
+// healthcheck). Callers should advertise that to the operator before
+// triggering — see DomainsHandler.deploymentRestartTriggered.
+func (c *Client) Recreate(ctx context.Context, spec DeploymentSpec) (*DeploymentInfo, error) {
+	if spec.HAReplica {
+		return nil, fmt.Errorf("recreate: HA replicas not supported in this path")
+	}
+	cName := containerName(spec.Name)
+	// Same shape as destroy() but always keep the volume.
+	timeout := 10
+	_ = c.api.ContainerStop(ctx, cName, container.StopOptions{Timeout: &timeout})
+	if err := c.api.ContainerRemove(ctx, cName, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
+		if !isNotFound(err) {
+			return nil, fmt.Errorf("remove container %s: %w", cName, err)
+		}
+	}
+	return c.Provision(ctx, spec)
+}
+
 // RestartReplica is the HA-aware variant of Restart, addressing one
 // replica by index.
 func (c *Client) RestartReplica(ctx context.Context, deploymentName string, replicaIndex int) error {

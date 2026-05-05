@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,7 +33,7 @@ const provisionTimeout = 5 * time.Minute
 // Provisioner is the subset of the docker provisioner that the deployments
 // handler depends on. Pulled out behind an interface so tests can swap in a
 // fake without spinning up a real Docker daemon. *dockerprov.Client
-// implements all four methods, so production wiring is unchanged.
+// implements all five methods, so production wiring is unchanged.
 type Provisioner interface {
 	Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	Destroy(ctx context.Context, deploymentName string) error
@@ -42,6 +43,11 @@ type Provisioner interface {
 	// `/api/check_admin_key` validation. Random hex strings are rejected by
 	// the keybroker which signs admin keys with INSTANCE_SECRET.
 	GenerateAdminKey(ctx context.Context, instanceName, instanceSecret string) (string, error)
+	// Recreate destroys the existing container (keeping its data volume)
+	// and provisions a fresh one with the supplied spec. Used by the
+	// custom-domains flow to apply an updated CORS_ALLOWED_ORIGINS env
+	// without losing SQLite state. Single-replica only.
+	Recreate(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -91,6 +97,149 @@ type DeploymentsHandler struct {
 	// the deployments handler so the handler doesn't have to know the
 	// PublicIP env value directly.
 	Domains *DomainsHandler
+}
+
+// rebuildCORSAndRestart recomputes CORS_ALLOWED_ORIGINS from the
+// active rows in deployment_domains and recreates the deployment's
+// container so the new value takes effect. Returns true when a
+// restart was actually triggered (so the caller can surface that to
+// the operator), false when we deliberately skipped (HA, adopted,
+// non-running, missing fields).
+//
+// Trade-off: this is a ~15s hard restart per call (stop + start +
+// healthcheck). Custom-domain add/delete/verify-success are rare
+// operations, so the simplicity wins over a more surgical "patch
+// container env" path that Docker doesn't natively support anyway.
+//
+// HA deployments are skipped here — they need per-replica
+// orchestration (and a rolling restart so the proxy keeps serving)
+// that the v1.1 custom-domains slice deliberately ducks. The proxy +
+// TLS layers DO route HA-deployment custom domains; only the
+// CORS-rebuild restart sits out.
+//
+// `existingEnv` is what the deployment was originally provisioned
+// with — today the handler doesn't persist that, so we pass through
+// the four constant defaults plus the dynamic CORS value. If the
+// operator added per-deployment env vars via some out-of-band path
+// (no API for that today), this would clobber them; revisit if/when
+// per-project env vars become real.
+func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deploymentID, deploymentName string, logger *slog.Logger) bool {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// Load the deployment fields we need to drive Provision. The full
+	// loadDeployment helper joins projects+teams which is overkill;
+	// we use a direct query so this stays cheap on the hot path.
+	var (
+		instanceSecret string
+		hostPort       *int
+		adopted        bool
+		haEnabled      bool
+		status         string
+	)
+	err := h.DB.QueryRow(ctx, `
+		SELECT instance_secret, host_port, adopted, ha_enabled, status
+		  FROM deployments
+		 WHERE id = $1
+	`, deploymentID).Scan(&instanceSecret, &hostPort, &adopted, &haEnabled, &status)
+	if err != nil {
+		logger.Warn("rebuild cors: load deployment failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+
+	// Adopted deployments aren't managed by Synapse — operator owns the
+	// container lifecycle; we can't recreate something we didn't create.
+	if adopted {
+		logger.Info("rebuild cors: skipping adopted deployment",
+			"deployment_id", deploymentID, "name", deploymentName)
+		return false
+	}
+	// HA deployments need a per-replica orchestration (rolling
+	// restart, encrypted storage env, replica index per container).
+	// Out of scope for v1.1 custom-domains.
+	if haEnabled {
+		logger.Info("rebuild cors: skipping HA deployment",
+			"deployment_id", deploymentID, "name", deploymentName)
+		return false
+	}
+	// Only restart deployments that are actually up. Provisioning /
+	// failed / stopped rows: leave alone — the next successful
+	// provision will pick up the active domains via the same query.
+	if status != models.DeploymentStatusRunning {
+		logger.Info("rebuild cors: deployment not running, skipping restart",
+			"deployment_id", deploymentID, "name", deploymentName, "status", status)
+		return false
+	}
+	if hostPort == nil || *hostPort == 0 {
+		logger.Warn("rebuild cors: deployment has no host port, skipping",
+			"deployment_id", deploymentID, "name", deploymentName)
+		return false
+	}
+
+	origins, err := loadActiveDomainOrigins(ctx, h.DB, deploymentID)
+	if err != nil {
+		logger.Warn("rebuild cors: load active domains failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+
+	envVars := map[string]string{}
+	if len(origins) > 0 {
+		// Comma-separated list — same shape SYNAPSE_ALLOWED_ORIGINS
+		// uses for the API server's own CORS middleware. The Convex
+		// backend reads CORS_ALLOWED_ORIGINS for the same purpose
+		// when it's set. Empty list → leave the env unset so the
+		// backend falls back to its defaults.
+		envVars["CORS_ALLOWED_ORIGINS"] = strings.Join(origins, ",")
+	}
+
+	spec := dockerprov.DeploymentSpec{
+		Name:                  deploymentName,
+		InstanceSecret:        instanceSecret,
+		HostPort:              *hostPort,
+		EnvVars:               envVars,
+		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
+	}
+
+	logger.Info("rebuild cors: recreating container",
+		"deployment_id", deploymentID, "name", deploymentName,
+		"active_domains", len(origins))
+	if _, err := h.Docker.Recreate(ctx, spec); err != nil {
+		logger.Error("rebuild cors: recreate failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+	return true
+}
+
+// loadActiveDomainOrigins reads all active domains for the deployment
+// and formats each as `https://<domain>` so the result can be dropped
+// into CORS_ALLOWED_ORIGINS as-is. Result order is by created_at ASC
+// so the env var is deterministic across calls (helps the operator
+// diff between rebuilds).
+func loadActiveDomainOrigins(ctx context.Context, db *pgxpool.Pool, deploymentID string) ([]string, error) {
+	rows, err := db.Query(ctx, `
+		SELECT domain
+		  FROM deployment_domains
+		 WHERE deployment_id = $1
+		   AND status = 'active'
+		 ORDER BY created_at ASC
+	`, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out = append(out, "https://"+d)
+	}
+	return out, rows.Err()
 }
 
 // publicDeploymentURL returns the URL a *remote* caller (the operator's

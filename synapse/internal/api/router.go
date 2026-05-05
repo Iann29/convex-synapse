@@ -77,6 +77,22 @@ type RouterDeps struct {
 	// handlers gate status='active' on a successful A-record match.
 	// Empty disables DNS preflight; rows stay status='pending'.
 	PublicIP string
+
+	// DomainCache, when non-nil, is invoked by the domains handler
+	// after add / delete / status-flip so the proxy's per-host
+	// custom-domain cache drops stale entries instead of waiting for
+	// the TTL to elapse. Production wiring passes the *proxy.Resolver
+	// (which satisfies the interface). Tests that don't exercise the
+	// proxy leave it nil.
+	DomainCache DomainCacheInvalidator
+}
+
+// DomainCacheInvalidator is the subset of *proxy.Resolver the
+// domains handler depends on. Defined as an interface so the api
+// package doesn't import internal/proxy (and can stay test-friendly
+// with a no-op stub).
+type DomainCacheInvalidator interface {
+	InvalidateDomain(host string)
 }
 
 // HAConfig carries cluster-wide defaults for the per-deployment Postgres
@@ -143,6 +159,8 @@ func NewRouter(d RouterDeps) http.Handler {
 		DB:          d.DB,
 		Deployments: deploymentsH,
 		PublicIP:    d.PublicIP,
+		Cache:       d.DomainCache,
+		Logger:      d.Logger,
 	}
 	deploymentsH.Domains = domainsH
 	// teamsH + projectsH carry a *DeploymentsHandler reference so their

@@ -126,6 +126,16 @@ type Config struct {
 	// gate status transitions on a match. Empty disables DNS preflight
 	// (rows stay status='pending' with a helpful last_dns_error).
 	PublicIP string
+
+	// DashboardAddr is the upstream `host:port` the proxy forwards
+	// requests for `role='dashboard'` deployment_domains rows to —
+	// i.e. an operator who registered "admin.example.com" with role
+	// dashboard expects browser traffic to that host to land on the
+	// Synapse Convex Dashboard. Empty disables dashboard-role
+	// routing (the proxy emits 503 dashboard_not_configured).
+	// Default mirrors compose ("synapse-convex-dashboard-proxy:80");
+	// host-mode deployments can point at "127.0.0.1:6791".
+	DashboardAddr string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -199,6 +209,7 @@ func Load() (*Config, error) {
 		UpdaterSocket: getEnvDefault("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"),
 		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),
 		PublicIP:      strings.TrimSpace(os.Getenv("SYNAPSE_PUBLIC_IP")),
+		DashboardAddr: getEnvDefault("SYNAPSE_DASHBOARD_UPSTREAM", "synapse-convex-dashboard-proxy:80"),
 	}, nil
 }
 
