@@ -47,9 +47,32 @@ type Resolver struct {
 	// re-read the DB. Short enough to catch deletes, long enough that a
 	// chatty client doesn't hammer the DB on every request.
 	CacheTTL time.Duration
+	// DashboardAddr is the upstream address requests with role='dashboard'
+	// in deployment_domains forward to (the dashboard container's port).
+	// Empty disables dashboard-role routing — the lookup returns
+	// ErrNoReplicas so the proxy emits a 503. Defaults are wired in
+	// cmd/server/main.go: "synapse-convex-dashboard-proxy:80" inside
+	// compose, "127.0.0.1:6791" on host. Test harness leaves it blank.
+	DashboardAddr string
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
+
+	// domainCache mirrors `cache` but keyed on the full custom-domain
+	// host (lowercased). Same TTL as the deployment-name cache; rows
+	// flip in/out of status='active' rarely so the same TTL is fine.
+	domainMu    sync.RWMutex
+	domainCache map[string]domainEntry
+}
+
+// domainEntry caches one custom domain → deployment + role binding.
+// `name` is the deployment.name we route to; `role` selects
+// "api" (forward to the deployment's backend port) vs "dashboard"
+// (forward to Resolver.DashboardAddr).
+type domainEntry struct {
+	name      string
+	role      string
+	expiresAt time.Time
 }
 
 // cacheEntry stores the resolved replica list for a deployment, plus the
@@ -254,19 +277,94 @@ func (r *Resolver) Invalidate(name string) {
 	delete(r.cache, name)
 }
 
+// ResolveDomain looks up a custom domain (Host header) in
+// deployment_domains. Returns the deployment name + role bound to that
+// domain when an active row exists; ErrNoReplicas otherwise (so the
+// proxy can emit 503 / 404 cleanly).
+//
+// The lookup is case-insensitive — DNS is case-insensitive and the
+// domain column is CITEXT.  Caches the binding for the same TTL as
+// the per-deployment Resolver cache; InvalidateDomain drops a single
+// entry so add/delete in the domains handler reflects on the next
+// request without waiting for the TTL to expire.
+func (r *Resolver) ResolveDomain(ctx context.Context, host string) (name, role string, err error) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" {
+		return "", "", fmt.Errorf("empty host")
+	}
+	r.domainMu.RLock()
+	if e, ok := r.domainCache[host]; ok && time.Now().Before(e.expiresAt) {
+		r.domainMu.RUnlock()
+		return e.name, e.role, nil
+	}
+	r.domainMu.RUnlock()
+
+	var dname, drole string
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err = r.DB.QueryRow(queryCtx, `
+		SELECT d.name, dd.role
+		  FROM deployment_domains dd
+		  JOIN deployments d ON d.id = dd.deployment_id
+		 WHERE dd.domain = $1
+		   AND dd.status = 'active'
+		   AND d.status <> 'deleted'
+	`, host).Scan(&dname, &drole)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", fmt.Errorf("no active domain row for %q", host)
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	ttl := r.CacheTTL
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	r.domainMu.Lock()
+	if r.domainCache == nil {
+		r.domainCache = make(map[string]domainEntry)
+	}
+	r.domainCache[host] = domainEntry{
+		name:      dname,
+		role:      drole,
+		expiresAt: time.Now().Add(ttl),
+	}
+	r.domainMu.Unlock()
+	return dname, drole, nil
+}
+
+// InvalidateDomain drops a single host from the domain cache. Called
+// after a domain row is added / status-flipped / deleted so the next
+// request re-reads from the DB. Lowercased to match cache keys.
+func (r *Resolver) InvalidateDomain(host string) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	r.domainMu.Lock()
+	defer r.domainMu.Unlock()
+	delete(r.domainCache, host)
+}
+
 // Handler returns an http.Handler that proxies to a Convex backend.
-// Two routing modes are supported simultaneously:
+// Three routing modes are supported simultaneously:
 //
 //  1. **Path-based** (always on): URLs of the form
 //     `/d/{name}/{rest...}` are forwarded to `http://{address}/{rest...}`.
 //     This is the v0.2 contract — every operator with `SYNAPSE_PROXY_ENABLED=true`
 //     gets it.
 //
-//  2. **Host-header-based** (v1.0+, opt-in via baseDomain non-empty):
-//     when `r.Host` matches `<name>.<baseDomain>`, route to the named
-//     deployment using `r.URL.Path` as the upstream path. Lets operators
-//     wire wildcard DNS + on-demand TLS so Convex clients see
+//  2. **Host-header wildcard subdomain** (v1.0+, opt-in via baseDomain
+//     non-empty): when `r.Host` matches `<name>.<baseDomain>`, route to
+//     the named deployment using `r.URL.Path` as the upstream path. Lets
+//     operators wire wildcard DNS + on-demand TLS so Convex clients see
 //     `https://<name>.<base>` instead of `<base>/d/<name>`.
+//
+//  3. **Custom domain** (v1.1+, always on when deployment_domains has
+//     active rows): when neither (1) nor (2) match, look up `r.Host` in
+//     deployment_domains. An active row routes to the bound deployment;
+//     the row's `role` selects which container — `api` forwards to the
+//     deployment's backend (same path as the wildcard mode) while
+//     `dashboard` forwards to `resolver.DashboardAddr` so a single
+//     custom domain can front the Convex dashboard UI.
 //
 // HA failover: ResolveAll returns the replicas in preference order. The
 // handler tries the first; on a connection-level error (Dial / EOF
@@ -275,28 +373,29 @@ func (r *Resolver) Invalidate(name string) {
 // untouched — they're upstream responses, not unreachable replicas, and
 // the caller should see them.
 //
-// Empty baseDomain disables host-based routing — the path form keeps
-// working unchanged, so non-custom-domain installs see no behaviour
-// change.
+// Empty baseDomain disables wildcard host-based routing. Custom-domain
+// routing kicks in only when `deployment_domains` has matching rows;
+// otherwise the path form keeps working unchanged, so non-custom-
+// domain installs see no behaviour change.
 func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var name, rest string
+		var name, rest, role string
 
-		// Host-based dispatch wins when configured AND the Host
-		// matches. We split on the host's leftmost label so a request
-		// to "bold-fox-1234.synapse.example.com" routes to
-		// "bold-fox-1234". Strip any ":port" suffix Caddy may have
-		// passed through. Empty subdomain (just `.<base>`) is a 404
-		// — there's no deployment to address.
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+
+		// (2) Wildcard subdomain dispatch wins when configured AND the
+		// Host matches. We split on the host's leftmost label so a
+		// request to "bold-fox-1234.synapse.example.com" routes to
+		// "bold-fox-1234". Empty subdomain (just `.<base>`) falls
+		// through to (3) and then (1).
 		if baseDomain != "" {
-			host := r.Host
-			if i := strings.IndexByte(host, ':'); i >= 0 {
-				host = host[:i]
-			}
 			if sub := matchHostSubdomain(host, baseDomain); sub != "" {
 				name, rest = sub, r.URL.Path
 				if rest == "" {
@@ -305,8 +404,22 @@ func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Ha
 			}
 		}
 
-		// Path-based fallback. Either baseDomain isn't configured or
-		// the Host doesn't match — try `/d/{name}/{rest}`.
+		// (3) Custom-domain dispatch. Skipped when (2) already
+		// matched. ResolveDomain returns ErrNoReplicas-style errors
+		// for unknown hosts; we fall through to (1) on any error so a
+		// missing row never short-circuits a legitimate /d/ request.
+		if name == "" && host != "" {
+			if dn, dr, derr := resolver.ResolveDomain(r.Context(), host); derr == nil {
+				name, role = dn, dr
+				rest = r.URL.Path
+				if rest == "" {
+					rest = "/"
+				}
+			}
+		}
+
+		// (1) Path-based fallback. Either no host match or no
+		// custom-domain row — try `/d/{name}/{rest}`.
 		if name == "" {
 			raw := strings.TrimPrefix(r.URL.Path, "/d/")
 			if raw == r.URL.Path {
@@ -327,6 +440,22 @@ func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Ha
 				"code":    "bad_request",
 				"message": "/d/{deploymentName}/... required",
 			})
+			return
+		}
+
+		// Dashboard role bypasses ResolveAll entirely — the dashboard
+		// is a fixed sidecar address, not a deployment_replicas row.
+		// Empty DashboardAddr means the operator hasn't wired one up;
+		// 503 keeps Caddy from caching the cert+route as healthy.
+		if role == DomainRoleDashboard {
+			if resolver.DashboardAddr == "" {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"code":    "dashboard_not_configured",
+					"message": "dashboard role configured but no upstream address available",
+				})
+				return
+			}
+			proxyOnce(w, r, resolver.DashboardAddr, rest, logger, name)
 			return
 		}
 
@@ -358,6 +487,14 @@ func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Ha
 		proxyWithFailover(w, r, addrs, rest, logger, name)
 	})
 }
+
+// DomainRoleAPI / DomainRoleDashboard mirror the values written into
+// deployment_domains.role. Duplicated here so the proxy package
+// doesn't have to import internal/models.
+const (
+	DomainRoleAPI       = "api"
+	DomainRoleDashboard = "dashboard"
+)
 
 // matchHostSubdomain returns the leftmost label of `host` when it's a
 // subdomain of `base` (host == "<sub>.<base>"), or "" otherwise. Case-

@@ -92,6 +92,19 @@ func run() error {
 		logger.Info("HA mode enabled; storage secrets envelope active")
 	}
 
+	// Proxy resolver — built up-front so the domains handler can
+	// invalidate cache entries when an active row gets added /
+	// deleted / status-flipped. Always created (even when neither
+	// proxy mode is enabled) so the api package gets a working
+	// invalidator; the resolver itself only does work if some path
+	// down below actually invokes it.
+	proxyResolver := &proxy.Resolver{
+		DB:            pool,
+		UseNetworkDNS: cfg.HealthcheckViaNetwork,
+		CacheTTL:      30 * time.Second,
+		DashboardAddr: cfg.DashboardAddr,
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
 		Logger:                logger,
 		DB:                    pool,
@@ -118,6 +131,7 @@ func run() error {
 		UpdaterSocket: cfg.UpdaterSocket,
 		GitHubRepo:    cfg.GitHubRepo,
 		PublicIP:      cfg.PublicIP,
+		DomainCache:   proxyResolver,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the
@@ -170,50 +184,69 @@ func run() error {
 	// Top-level routing decision tree:
 	//
 	//   1. If BaseDomain is set AND r.Host matches `<sub>.<base>` →
-	//      route to the proxy (custom-domains mode, v1.0+).
-	//   2. Else if path starts with /d/ → route to the proxy (legacy
+	//      route to the proxy (wildcard subdomain mode, v1.0+).
+	//   2. Else if r.Host matches an active deployment_domains row →
+	//      route to the proxy (per-deployment custom domain, v1.1+).
+	//   3. Else if path starts with /d/ → route to the proxy (legacy
 	//      path-based mode, v0.2+, controlled by SYNAPSE_PROXY_ENABLED).
-	//   3. Else → route to the API.
+	//   4. Else → route to the API.
 	//
-	// Mounting via http.NewServeMux works for #2+#3 but not #1 (mux
-	// doesn't dispatch on Host). So when BaseDomain is set we wrap
-	// the mux in a Host-checking shim. Both modes coexist: an
-	// internal compose-network call to "synapse:8080/d/foo/bar" still
-	// works even with custom domains turned on.
+	// Mounting via http.NewServeMux works for #3+#4 but not #1/#2 (mux
+	// doesn't dispatch on Host). When EITHER host-based mode is on we
+	// wrap the mux in a Host-checking shim. The custom-domain branch
+	// is always-on by virtue of operators being able to register
+	// rows; we still honour ProxyEnabled to gate the path mode for
+	// installs that want host routing only.
 	var topHandler http.Handler = handler
-	if cfg.ProxyEnabled || cfg.BaseDomain != "" {
-		resolver := &proxy.Resolver{
-			DB:            pool,
-			UseNetworkDNS: cfg.HealthcheckViaNetwork,
-			CacheTTL:      30 * time.Second,
-		}
-		proxyH := proxy.Handler(resolver, logger, cfg.BaseDomain)
+	hostMode := cfg.BaseDomain != "" // wildcard mode flag
+	if cfg.ProxyEnabled || hostMode {
+		proxyH := proxy.Handler(proxyResolver, logger, cfg.BaseDomain)
 
 		mux := http.NewServeMux()
 		mux.Handle("/d/", proxyH)
 		mux.Handle("/", handler)
 		topHandler = mux
 
-		if cfg.BaseDomain != "" {
-			// Wrap with a Host check. The proxy's matchHostSubdomain
-			// owns the parsing — we duplicate the "ends in .<base>"
-			// test here only to short-circuit the dispatch decision.
-			suffix := "." + strings.ToLower(cfg.BaseDomain)
-			baseLower := strings.ToLower(cfg.BaseDomain)
-			inner := topHandler
-			topHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				host := strings.ToLower(r.Host)
-				if i := strings.IndexByte(host, ':'); i >= 0 {
-					host = host[:i]
-				}
-				if strings.HasSuffix(host, suffix) && host != baseLower {
+		// Host-based dispatch shim. Wraps the mux so the proxy
+		// handler sees host-style requests (no /d/ prefix). The shim
+		// runs unconditionally now — even without BaseDomain — so a
+		// custom domain registered via the API immediately starts
+		// routing without an operator restart.
+		suffix := ""
+		baseLower := ""
+		if hostMode {
+			suffix = "." + strings.ToLower(cfg.BaseDomain)
+			baseLower = strings.ToLower(cfg.BaseDomain)
+		}
+		inner := topHandler
+		topHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			host := strings.ToLower(r.Host)
+			if i := strings.IndexByte(host, ':'); i >= 0 {
+				host = host[:i]
+			}
+			// Wildcard subdomain match — keep the existing behaviour.
+			if hostMode && strings.HasSuffix(host, suffix) && host != baseLower {
+				proxyH.ServeHTTP(w, r)
+				return
+			}
+			// Custom-domain match — cheap cached lookup. Skip the
+			// special-cased internal hosts (synapse-api, localhost,
+			// 127.x.x.x) so compose-network calls don't accidentally
+			// trip a DB query on every request.
+			if host != "" && host != baseLower &&
+				!strings.HasPrefix(host, "127.") &&
+				host != "localhost" && host != "synapse-api" {
+				if _, _, derr := proxyResolver.ResolveDomain(r.Context(), host); derr == nil {
 					proxyH.ServeHTTP(w, r)
 					return
 				}
-				inner.ServeHTTP(w, r)
-			})
-			logger.Info("custom domains enabled", "base_domain", cfg.BaseDomain)
+			}
+			inner.ServeHTTP(w, r)
+		})
+		if hostMode {
+			logger.Info("custom domains enabled (wildcard)", "base_domain", cfg.BaseDomain)
 		}
+		logger.Info("custom domains enabled (per-deployment)")
 		if cfg.ProxyEnabled {
 			logger.Info("reverse proxy enabled", "mount", "/d/")
 		}

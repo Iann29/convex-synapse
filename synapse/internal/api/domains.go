@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"regexp"
@@ -37,6 +38,16 @@ type DomainsHandler struct {
 	// to a "PublicIP not configured" hint so the operator knows why.
 	// Set via RouterDeps.PublicIP (env: SYNAPSE_PUBLIC_IP).
 	PublicIP string
+
+	// Cache is the proxy's per-host custom-domain resolver. When
+	// non-nil, add/delete/status-flip drops the host from the cache
+	// so the next request re-reads from the DB. Nil = the operator
+	// is running synapse without the proxy (no need to invalidate).
+	Cache DomainCacheInvalidator
+
+	// Logger annotates the rebuild-CORS-and-restart log lines. nil
+	// falls back to slog.Default().
+	Logger *slog.Logger
 
 	// resolver is overridable in tests so the DNS path doesn't reach
 	// out to the real internet from the integration suite. nil =
@@ -148,6 +159,21 @@ func (h *DomainsHandler) verifyDomainDNS(ctx context.Context, domain, expectedIP
 	}
 	return models.DomainStatusFailed,
 		"expected " + expectedIP + ", got " + strings.Join(got, ", ")
+}
+
+// domainResponse is the shape returned by POST /domains, POST
+// /domains/{id}/verify and (implicitly) DELETE — it embeds the
+// DeploymentDomain model and adds an optional `deploymentRestartTriggered`
+// hint. The hint surfaces when the handler had to recreate the
+// deployment's container to refresh CORS_ALLOWED_ORIGINS — a ~15s
+// downtime event that the dashboard wants to flag to the operator.
+//
+// Anonymous-embed so existing clients that key off the legacy field
+// shape (`id`, `deploymentId`, etc.) keep working — only the new
+// boolean is additive.
+type domainResponse struct {
+	models.DeploymentDomain
+	DeploymentRestartTriggered bool `json:"deploymentRestartTriggered,omitempty"`
 }
 
 // scanDomain is the row-shape for SELECTs on deployment_domains. Used
@@ -308,7 +334,29 @@ func (h *DomainsHandler) createDomain(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	writeJSON(w, http.StatusCreated, updated)
+	// Drop any stale cache entry the proxy might have for this host
+	// — landed here as 'pending' but if the operator's previously
+	// deleted+re-added the same domain the resolver could have a
+	// cached miss + ErrNoReplicas response baked in for the TTL.
+	if h.Cache != nil {
+		h.Cache.InvalidateDomain(domainCanonical)
+	}
+
+	// Restart the deployment's container ONLY when the row landed
+	// 'active' — that's the only state where the proxy will route
+	// browser traffic at it, so a stale CORS_ALLOWED_ORIGINS becomes
+	// a real problem. Pending / failed rows stay invisible to the
+	// proxy until /verify flips them.
+	restartTriggered := false
+	if updated.Status == models.DomainStatusActive {
+		restartTriggered = h.Deployments.rebuildCORSAndRestart(
+			r.Context(), d.ID, d.Name, h.Logger)
+	}
+
+	writeJSON(w, http.StatusCreated, domainResponse{
+		DeploymentDomain:           updated,
+		DeploymentRestartTriggered: restartTriggered,
+	})
 }
 
 // applyVerification updates the row's status + verifiedAt + lastErr
@@ -365,12 +413,18 @@ func (h *DomainsHandler) deleteDomain(w http.ResponseWriter, r *http.Request) {
 	// AND gives us the values we need for the audit row in one shot.
 	// The deployment_id guard rejects cross-deployment deletes (the
 	// loadDeploymentForRequest check is defense-in-depth on top).
-	var domain string
+	// We also pull `status` so we know whether to recreate the
+	// container — only 'active' rows were live in the proxy, so
+	// removing a 'pending' / 'failed' row needs no restart.
+	var (
+		domain string
+		status string
+	)
 	err := h.DB.QueryRow(r.Context(), `
 		DELETE FROM deployment_domains
 		WHERE id = $1 AND deployment_id = $2
-		RETURNING domain
-	`, domainID, d.ID).Scan(&domain)
+		RETURNING domain, status
+	`, domainID, d.ID).Scan(&domain, &status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "domain_not_found",
@@ -401,6 +455,22 @@ func (h *DomainsHandler) deleteDomain(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
+	// Drop the proxy cache entry so the next request immediately
+	// 404s instead of routing to a deployment that no longer answers
+	// for this domain. Safe to call regardless of prior status — the
+	// cache only ever holds 'active' rows.
+	if h.Cache != nil {
+		h.Cache.InvalidateDomain(domain)
+	}
+
+	// Restart the container if the deleted row was 'active' — that's
+	// the only state where the deployment's CORS list referenced this
+	// domain. Pending / failed rows never made it into the live env.
+	if status == models.DomainStatusActive {
+		_ = h.Deployments.rebuildCORSAndRestart(
+			r.Context(), d.ID, d.Name, h.Logger)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -422,11 +492,14 @@ func (h *DomainsHandler) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var domainName string
+	var (
+		domainName  string
+		priorStatus string
+	)
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT domain FROM deployment_domains
+		SELECT domain, status FROM deployment_domains
 		WHERE id = $1 AND deployment_id = $2
-	`, domainID, d.ID).Scan(&domainName)
+	`, domainID, d.ID).Scan(&domainName, &priorStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "domain_not_found",
@@ -471,5 +544,29 @@ func (h *DomainsHandler) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		Metadata:   meta,
 	})
 
-	writeJSON(w, http.StatusOK, updated)
+	// Always invalidate the proxy cache — verify can flip in either
+	// direction (active→failed or pending→active) and cached entries
+	// for either side are now wrong.
+	if h.Cache != nil {
+		h.Cache.InvalidateDomain(domainName)
+	}
+
+	// Restart only on a pending/failed → active transition: that's
+	// when the deployment's CORS list newly needs to acknowledge the
+	// domain. active → failed should also drop the host from the
+	// allow-list, but a stale "https://gone.example.com" in CORS is
+	// harmless (browsers still won't load it without TLS), so we
+	// skip the restart on the down-flip to keep the operator's fault
+	// blast radius small. Operator can DELETE the row to force a
+	// rebuild if they really want it cleared.
+	restartTriggered := false
+	if priorStatus != models.DomainStatusActive && updated.Status == models.DomainStatusActive {
+		restartTriggered = h.Deployments.rebuildCORSAndRestart(
+			r.Context(), d.ID, d.Name, h.Logger)
+	}
+
+	writeJSON(w, http.StatusOK, domainResponse{
+		DeploymentDomain:           updated,
+		DeploymentRestartTriggered: restartTriggered,
+	})
 }

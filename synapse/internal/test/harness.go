@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -478,9 +479,16 @@ type FakeDocker struct {
 	StatusFn           func(ctx context.Context, name string) (string, error)
 	StatusReplicaFn    func(ctx context.Context, name string, replicaIndex int) (string, error)
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
+	RecreateFn         func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 
+	mu          sync.Mutex
 	Provisioned []dockerprov.DeploymentSpec
 	Destroyed   []string
+	// Recreated is the ordered list of specs the handler asked us to
+	// recreate. Tests assert on this for the custom-domains restart-on-
+	// add/delete/verify flow. Reads + writes are mutex-guarded so tests
+	// that wait via Eventually don't race the handler goroutine.
+	Recreated []dockerprov.DeploymentSpec
 }
 
 func NewFakeDocker() *FakeDocker {
@@ -488,7 +496,9 @@ func NewFakeDocker() *FakeDocker {
 }
 
 func (f *FakeDocker) Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+	f.mu.Lock()
 	f.Provisioned = append(f.Provisioned, spec)
+	f.mu.Unlock()
 	if f.ProvisionFn != nil {
 		return f.ProvisionFn(ctx, spec)
 	}
@@ -500,11 +510,34 @@ func (f *FakeDocker) Provision(ctx context.Context, spec dockerprov.DeploymentSp
 }
 
 func (f *FakeDocker) Destroy(ctx context.Context, name string) error {
+	f.mu.Lock()
 	f.Destroyed = append(f.Destroyed, name)
+	f.mu.Unlock()
 	if f.DestroyFn != nil {
 		return f.DestroyFn(ctx, name)
 	}
 	return nil
+}
+
+// ProvisionedSpecs / DestroyedNames return mutex-guarded snapshots of
+// the recorded calls. Tests that read these fields directly still work
+// (the existing tests don't run under -race in CI), but new code should
+// prefer the snapshot accessors so race-detector-clean concurrent reads
+// stay safe.
+func (f *FakeDocker) ProvisionedSpecs() []dockerprov.DeploymentSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]dockerprov.DeploymentSpec, len(f.Provisioned))
+	copy(out, f.Provisioned)
+	return out
+}
+
+func (f *FakeDocker) DestroyedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.Destroyed))
+	copy(out, f.Destroyed)
+	return out
 }
 
 func (f *FakeDocker) Status(ctx context.Context, name string) (string, error) {
@@ -534,6 +567,38 @@ func (f *FakeDocker) GenerateAdminKey(ctx context.Context, name, secret string) 
 		return f.GenerateAdminKeyFn(ctx, name, secret)
 	}
 	return "fake-admin-key-" + name, nil
+}
+
+// Recreate records the spec so tests can assert restart-on-add/delete/
+// verify behaviour, then defaults to the same ProvisionFn-or-stub
+// behaviour that Provision uses (so the handler's post-recreate path
+// keeps working without test-specific wiring).
+func (f *FakeDocker) Recreate(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+	f.mu.Lock()
+	f.Recreated = append(f.Recreated, spec)
+	f.mu.Unlock()
+	if f.RecreateFn != nil {
+		return f.RecreateFn(ctx, spec)
+	}
+	if f.ProvisionFn != nil {
+		return f.ProvisionFn(ctx, spec)
+	}
+	return &dockerprov.DeploymentInfo{
+		ContainerID:   "fake-container-" + spec.Name,
+		HostPort:      spec.HostPort,
+		DeploymentURL: fmt.Sprintf("http://127.0.0.1:%d", spec.HostPort),
+	}, nil
+}
+
+// RecreatedSpecs returns a snapshot of the recorded specs. Tests use
+// this instead of touching f.Recreated directly to avoid racing the
+// handler goroutine that may still be appending.
+func (f *FakeDocker) RecreatedSpecs() []dockerprov.DeploymentSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]dockerprov.DeploymentSpec, len(f.Recreated))
+	copy(out, f.Recreated)
+	return out
 }
 
 // SeedDeployment inserts a deployments row directly. Useful for exercising

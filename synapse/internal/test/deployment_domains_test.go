@@ -9,17 +9,21 @@ import (
 
 // domainResp mirrors the JSON shape returned by /domains endpoints.
 // Decoded with DisallowUnknownFields so any drift in the handler
-// payload fails loudly.
+// payload fails loudly. `deploymentRestartTriggered` is set on
+// POST /domains and POST /domains/{id}/verify when the handler had
+// to recreate the deployment's container to refresh CORS_ALLOWED_ORIGINS;
+// omitempty in the handler keeps GET /domains rows un-flagged.
 type domainResp struct {
-	ID            string     `json:"id"`
-	DeploymentID  string     `json:"deploymentId"`
-	Domain        string     `json:"domain"`
-	Role          string     `json:"role"`
-	Status        string     `json:"status"`
-	DNSVerifiedAt *time.Time `json:"dnsVerifiedAt,omitempty"`
-	LastDNSError  string     `json:"lastDnsError,omitempty"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	UpdatedAt     time.Time  `json:"updatedAt"`
+	ID                         string     `json:"id"`
+	DeploymentID               string     `json:"deploymentId"`
+	Domain                     string     `json:"domain"`
+	Role                       string     `json:"role"`
+	Status                     string     `json:"status"`
+	DNSVerifiedAt              *time.Time `json:"dnsVerifiedAt,omitempty"`
+	LastDNSError               string     `json:"lastDnsError,omitempty"`
+	CreatedAt                  time.Time  `json:"createdAt"`
+	UpdatedAt                  time.Time  `json:"updatedAt"`
+	DeploymentRestartTriggered bool       `json:"deploymentRestartTriggered,omitempty"`
 }
 
 type listDomainsResp struct {
@@ -31,9 +35,10 @@ type listDomainsResp struct {
 // Returns the auth tokens + deployment name the caller plugs into
 // /v1/deployments/{name}/domains.
 type domainsFixture struct {
-	owner      *User
-	team       teamResp
-	deployment string
+	owner        *User
+	team         teamResp
+	deployment   string
+	deploymentID string
 }
 
 func newDomainsFixture(t *testing.T, h *Harness, deployment string, port int) domainsFixture {
@@ -41,8 +46,8 @@ func newDomainsFixture(t *testing.T, h *Harness, deployment string, port int) do
 	owner := h.RegisterRandomUser()
 	team := createTeam(t, h, owner.AccessToken, "Domains Co "+deployment)
 	proj := createProject(t, h, owner.AccessToken, team.Slug, "P-"+deployment)
-	h.SeedDeployment(proj.ID, deployment, "prod", "running", true, owner.ID, port, "")
-	return domainsFixture{owner: owner, team: team, deployment: deployment}
+	depID := h.SeedDeployment(proj.ID, deployment, "prod", "running", true, owner.ID, port, "")
+	return domainsFixture{owner: owner, team: team, deployment: deployment, deploymentID: depID}
 }
 
 func TestDomains_List_Empty(t *testing.T) {

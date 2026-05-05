@@ -15,10 +15,14 @@ import (
 // cert issuance for arbitrary subdomains by sending TLS handshakes —
 // Caddy would happily ask Let's Encrypt for `evil.<base>` if we let it.
 //
-// We answer 200 iff:
-//   1. BaseDomain is configured (custom-domains mode)
-//   2. The asked-about host is `<sub>.<BaseDomain>` (case-insensitive)
-//   3. <sub> is the name of a real, non-deleted deployment
+// We answer 200 iff one of:
+//
+//  A. The host is `<sub>.<BaseDomain>` (case-insensitive) AND `<sub>`
+//     is the name of a real, non-deleted deployment (wildcard
+//     subdomain mode — needs BaseDomain configured).
+//  B. The host exactly matches an active row in `deployment_domains`
+//     bound to a real, non-deleted deployment (per-deployment custom
+//     domain, v1.1+).
 //
 // Endpoint: GET /v1/internal/tls_ask?domain=<host>
 // Public — Caddy hits it from inside the docker network with no JWT.
@@ -32,53 +36,80 @@ type TLSAskHandler struct {
 }
 
 func (h *TLSAskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Off when custom domains aren't configured. Returning 404 here
-	// (vs 200) means Caddy NEVER issues an on-demand cert without
-	// the operator opting in — fail-safe.
-	if h.BaseDomain == "" {
-		http.Error(w, "custom domains not configured", http.StatusNotFound)
-		return
-	}
 	host := strings.TrimSpace(r.URL.Query().Get("domain"))
 	if host == "" {
 		http.Error(w, "domain query param required", http.StatusBadRequest)
 		return
 	}
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	base := strings.ToLower(strings.Trim(h.BaseDomain, ". "))
-	suffix := "." + base
-	if !strings.HasSuffix(host, suffix) || host == base {
-		http.Error(w, "domain not under base", http.StatusForbidden)
-		return
-	}
-	name := host[:len(host)-len(suffix)]
-	// Refuse multi-label subdomains — Synapse only addresses a single
-	// label per deployment. "foo.bar.<base>" without a dedicated
-	// deployment row "foo.bar" is suspicious.
-	if strings.Contains(name, ".") {
-		http.Error(w, "multi-label subdomain", http.StatusForbidden)
-		return
-	}
-	if name == "" {
-		http.Error(w, "empty subdomain", http.StatusBadRequest)
-		return
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	var exists bool
+
+	// (A) Wildcard subdomain path — only when BaseDomain is set.
+	// When the host falls under the base, we do the wildcard check
+	// AND short-circuit on its result so an attacker can't make us
+	// issue `evil.<base>` certs by registering the same string as a
+	// custom domain (the unique constraint on deployment_domains
+	// would already block it, but defense-in-depth).
+	if h.BaseDomain != "" {
+		base := strings.ToLower(strings.Trim(h.BaseDomain, ". "))
+		suffix := "." + base
+		if strings.HasSuffix(host, suffix) && host != base {
+			name := host[:len(host)-len(suffix)]
+			// Refuse multi-label subdomains — Synapse only addresses a
+			// single label per deployment under the wildcard.
+			if strings.Contains(name, ".") {
+				http.Error(w, "multi-label subdomain", http.StatusForbidden)
+				return
+			}
+			if name == "" {
+				http.Error(w, "empty subdomain", http.StatusBadRequest)
+				return
+			}
+			var exists bool
+			err := h.DB.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM deployments
+					WHERE name = $1 AND status <> 'deleted'
+				)`, name).Scan(&exists)
+			if err != nil {
+				http.Error(w, "db error", http.StatusServiceUnavailable)
+				return
+			}
+			if !exists {
+				http.Error(w, "deployment not found", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Falls through to (B) when host isn't under the base.
+	}
+
+	// (B) Custom-domain path — accept any host with an active row in
+	// deployment_domains pointing at a non-deleted deployment.
+	var domainExists bool
 	err := h.DB.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM deployments
-			WHERE name = $1 AND status <> 'deleted'
-		)`, name).Scan(&exists)
+			SELECT 1
+			  FROM deployment_domains dd
+			  JOIN deployments d ON d.id = dd.deployment_id
+			 WHERE dd.domain = $1
+			   AND dd.status = 'active'
+			   AND d.status <> 'deleted'
+		)`, host).Scan(&domainExists)
 	if err != nil {
 		http.Error(w, "db error", http.StatusServiceUnavailable)
 		return
 	}
-	if !exists {
-		http.Error(w, "deployment not found", http.StatusNotFound)
+	if domainExists {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+
+	// Neither path matched. 404 covers "host not under base AND not a
+	// custom domain"; the wildcard branch above already covered
+	// "under base but the deployment doesn't exist".
+	http.Error(w, "domain not registered", http.StatusNotFound)
 }

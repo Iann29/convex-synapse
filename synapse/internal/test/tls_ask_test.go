@@ -32,22 +32,28 @@ func TestTLSAsk_RejectsMissingDomainParam(t *testing.T) {
 }
 
 func TestTLSAsk_RejectsHostOutsideBase(t *testing.T) {
+	// v1.1+: with custom-domain support, a host outside the base
+	// becomes a deployment_domains lookup. Without an active row the
+	// answer is 404 (not registered), not the legacy 403.
 	h := SetupWithOpts(t, SetupOpts{BaseDomain: "synapse.example.com"})
 	q := url.Values{"domain": {"evil.example.com"}}
 	resp := h.Do(http.MethodGet, "/v1/internal/tls_ask?"+q.Encode(), "", nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("tls_ask out-of-base: status=%d want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("tls_ask out-of-base: status=%d want 404", resp.StatusCode)
 	}
 }
 
 func TestTLSAsk_RejectsBaseItself(t *testing.T) {
+	// "synapse.example.com" itself is not under the wildcard (host
+	// equals base, not "<sub>.<base>") and isn't an active custom
+	// domain → 404 not registered.
 	h := SetupWithOpts(t, SetupOpts{BaseDomain: "synapse.example.com"})
 	q := url.Values{"domain": {"synapse.example.com"}}
 	resp := h.Do(http.MethodGet, "/v1/internal/tls_ask?"+q.Encode(), "", nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("tls_ask base-itself: status=%d want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("tls_ask base-itself: status=%d want 404", resp.StatusCode)
 	}
 }
 
