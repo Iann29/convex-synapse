@@ -34,14 +34,15 @@ of decisions; this doc focuses on **what runs through Synapse today**.
   `aster-e2e-fixture` app's `messages.ts` through a cell and proves
   `getById` returns the seeded document end-to-end. **First-class
   proof that a real Convex bundle executes inside an Aster cell.**
-- **What's missing for "real Convex app over real network":** wiring
-  the new `execute_module_query_with_broker` entry point into the
-  v8cell *binary* (it lives at the lib level today; binary still
-  reads `ASTER_JS{,_INLINE,_MODULE_PATH}` and runs the `globalThis.main`
-  shape), real-VPS smoke that drives the new path through Synapse →
-  brokerd container → real Postgres `_source_packages.blob`, a
-  per-deployment source model that durably points Aster at the
-  matching Convex Postgres / modules directory (today the source is
+- **What's missing for "real Convex app over real network":** the
+  cell binary now wires the new entry (#23) and a docker-driven
+  end-to-end smoke proves `getById` returns the seeded document
+  through the binaries against real Postgres (#24). Remaining gaps
+  are integration-shaped, not capability-shaped: real-VPS smoke that
+  drives the same path through *Synapse* (today's docker smoke uses
+  raw `docker run`, not Synapse's `provisionAster` + `aster/invoke`),
+  a per-deployment source model that durably points Aster at a
+  specific Convex deployment's Postgres / modules directory (today
   process-level via SYNAPSE_ASTER_*), and a Convex-shaped HTTP
   frontend that maps `/api/query/<module>:<fn>` to a cell invocation.
 
@@ -82,7 +83,7 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 - `TestDeployments_CreateAsterPassesRuntimeConfigToWorker` —
   `SYNAPSE_ASTER_*`-equivalent harness config reaches the docker spec.
 
-## What landed in Aster (PRs #1-22 in Iann29/aster)
+## What landed in Aster (PRs #1-24 in Iann29/aster)
 
 | PR | What |
 |---|---|
@@ -108,8 +109,10 @@ of decisions; this doc focuses on **what runs through Synapse today**.
 | #20 | **Cell-side bundle ingestion** — v8cell binary's new `ASTER_MODULE_PATH` env (mutually exclusive with `ASTER_JS` / `ASTER_JS_INLINE`) bootstraps a sealed capsule, calls `LoadModuleBundle`, unzips the response, picks `<path>` or `<path>.js` entry. New `aster-ipc::bundle::extract_module_source` with 8 unit tests covering happy path, suffix policy, missing-entry diagnostic, non-ZIP / non-UTF-8 rejection, nested paths. |
 | #21 | **Bundle entry name fix** — research against a real `npx convex deploy` (memo at `/tmp/aster-research-bundle-ground-truth.md`) showed Convex's backend re-packages the wire payload as a ZIP with entries prefixed `modules/<path>.js`. PR #20's lookup didn't include that prefix; PR #21's `candidate_names` tries `modules/<path>.js` first. +2 unit tests. |
 | #22 | **V8 ESM module loader + invokeQuery dispatch (the proof point)** — new `V8SandboxCell::execute_module_query_with_broker` compiles a real `npx convex deploy` bundle as an ES module, evaluates it (top-level await pumped via `MicrotasksPolicy::Explicit`), reads the named export, asserts `isQuery === true` (rejects mutations/actions for v0.5), calls `<export>.invokeQuery(argsJson)`, drives the existing `Convex.asyncSyscall("1.0/get", ...)` trap loop while the user handler awaits. **The test `module_get_by_id_through_fake_broker_returns_doc` runs the byte-for-byte 58 KB bundle of `aster-e2e-fixture/convex/messages.ts` through the cell — `getById` returns the seeded document with name/body/_id intact and exactly 1 trap.** That test is the project's first proof that a real Convex bundle executes end-to-end inside an Aster cell. 3 integration tests + the bundled fixture file. |
+| #23 | **Cell binary wires the module path** — `aster_v8cell` binary gains `ASTER_FUNCTION_NAME` + `ASTER_ARGS_JSON` envs that route to PR #22's library entry point. Mutually exclusive with `ASTER_JS` / `ASTER_JS_INLINE`; half-config rejected with operator-actionable error messages (e.g. naming the missing env, hinting `[]` for zero-arg queries). 11 unit tests on the env-parse paths via an `EnvMap` helper that avoids `std::env`'s process-global state. |
+| #24 | **Real-bundle docker smoke (the END-TO-END proof)** — `docker/smoke-bundle.sh` boots `postgres:16`, stages a real `npx convex deploy` ZIP at `<modules_dir>/<storage_key>.blob` (with the bundle's actual SHA-256 in `_source_packages.sha256`), spins brokerd in `ASTER_STORE=postgres` mode, runs the v8cell binary against it. Output: `{"output":"{\"_id\":\"messages|aaaa...\",\"name\":\"ian\"}","traps":1}` — real bundle compiled as ESM, real `getById.invokeQuery` invoked, real `Convex.asyncSyscall("1.0/get")` trap drained against real Postgres, real document returned. **This proves the full path against the real binaries, not just the library.** |
 
-**Test coverage (Aster side, all green):** 95 workspace tests (incl. 3 new module-loader integration tests against a real Convex bundle) + 19 Postgres
+**Test coverage (Aster side, all green):** 106 workspace tests (incl. 3 module-loader integration tests against a real Convex bundle + 11 binary env-parse tests in #23) + 19 Postgres
 integration tests + 1 cross-process E2E (brokerd + v8cell over UDS in
 two real Docker containers) + 1 brokerd-postgres smoke (3 containers).
 
