@@ -65,14 +65,6 @@ const (
 	DeploymentStatusStopped      = "stopped"
 	DeploymentStatusFailed       = "failed"
 	DeploymentStatusDeleted      = "deleted"
-
-	// Kind selects the runtime backing the deployment. "convex" provisions
-	// the upstream Convex backend container (every deployment before v1.1).
-	// "aster" provisions an Aster brokerd container and supports raw-JS
-	// cell invocation through the control API. It intentionally has no
-	// HTTP deployment URL until the Convex-shaped Aster frontend lands.
-	DeploymentKindConvex = "convex"
-	DeploymentKindAster  = "aster"
 )
 
 // Deployment is the metadata Synapse persists for a provisioned Convex backend.
@@ -86,10 +78,6 @@ type Deployment struct {
 	ProjectID      string `json:"projectId"`
 	Name           string `json:"name"`
 	DeploymentType string `json:"deploymentType"`
-	// Kind is "convex" (default) or "aster". See the DeploymentKind*
-	// constants. Always emitted so dashboards/CLIs can branch UI without
-	// a second round-trip.
-	Kind           string `json:"kind"`
 	Status         string `json:"status"`
 	ContainerID    string `json:"-"`
 	HostPort       int    `json:"-"`

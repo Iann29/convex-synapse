@@ -137,9 +137,6 @@ func run() error {
 				JobTimeout:            5 * time.Minute,
 				NodeID:                nodeID,
 				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
-				AsterPostgresURL:      cfg.AsterPostgresURL,
-				AsterDBSchema:         cfg.AsterDBSchema,
-				AsterModulesHostPath:  cfg.AsterModulesDir,
 			},
 			Logger: logger,
 			Crypto: secretBox, // nil when HA is off — single-replica jobs don't read it

@@ -84,62 +84,6 @@ func TestProxy_404OnMissingDeployment(t *testing.T) {
 	}
 }
 
-// kind=aster rows are reachable as far as Synapse metadata goes (the
-// brokerd container is up + healthy), but the runtime speaks the Aster
-// IPC protocol over a Unix-domain socket — there's no HTTP proxy. The
-// resolver must surface that with a typed sentinel and the handler must
-// translate it into a 501 + JSON the dashboard can render. A fall-through
-// to "no_replicas" or generic 502 would be misleading.
-func TestProxy_KindAsterReturns501NotImplemented(t *testing.T) {
-	h := Setup(t)
-	owner := h.RegisterRandomUser()
-	team := createTeam(t, h, owner.AccessToken, "AsterPx")
-	project := createProject(t, h, owner.AccessToken, team.Slug, "App")
-
-	// Seed a kind=aster deployment row directly. SeedDeployment doesn't
-	// take Kind today, so we INSERT manually and add the matching
-	// replica row to keep the resolver happy.
-	var depID string
-	if err := h.DB.QueryRow(h.rootCtx, `
-		INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
-		                          admin_key, instance_secret, is_default,
-		                          creator_user_id, ha_enabled, replica_count)
-		VALUES ($1, 'px-aster-7777', 'dev', 'aster', 'running', NULL,
-		        '', 'fake-secret', false, $2, false, 1)
-		RETURNING id
-	`, project.ID, owner.ID).Scan(&depID); err != nil {
-		t.Fatalf("seed aster deployment: %v", err)
-	}
-	if _, err := h.DB.Exec(h.rootCtx, `
-		INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, container_id, status)
-		VALUES ($1, 0, NULL, 'fake-broker-id', 'running')
-	`, depID); err != nil {
-		t.Fatalf("seed aster replica: %v", err)
-	}
-
-	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
-	srv := httptest.NewServer(proxy.Handler(resolver, nil, ""))
-	t.Cleanup(srv.Close)
-
-	resp, err := http.Get(srv.URL + "/d/px-aster-7777/anything")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("status: got %d, want 501; body=%s", resp.StatusCode, body)
-	}
-	bodyStr := string(body)
-	if !strings.Contains(bodyStr, "aster_not_proxied") {
-		t.Errorf("body should carry typed code aster_not_proxied; got %q", bodyStr)
-	}
-	if !strings.Contains(bodyStr, `"kind":"aster"`) {
-		t.Errorf("body should echo kind=aster so the dashboard can branch; got %q", bodyStr)
-	}
-}
-
 // A "deleted" or "failed" deployment row must not be reachable through the proxy.
 func TestProxy_404ForNonRunningDeployment(t *testing.T) {
 	h := Setup(t)

@@ -4,10 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,18 +42,6 @@ type Provisioner interface {
 	// `/api/check_admin_key` validation. Random hex strings are rejected by
 	// the keybroker which signs admin keys with INSTANCE_SECRET.
 	GenerateAdminKey(ctx context.Context, instanceName, instanceSecret string) (string, error)
-
-	// DestroyAster removes a kind=aster deployment's brokerd container
-	// + per-deployment volume. Mirrors Destroy but for the Aster path
-	// (which has no SQLite volume / port mapping).
-	DestroyAster(ctx context.Context, deploymentName string) error
-	// StatusAster reports the brokerd container's docker state. Empty
-	// string + nil error means "container not found".
-	StatusAster(ctx context.Context, deploymentName string) (string, error)
-	// InvokeAsterCell runs a one-shot v8cell against the deployment's
-	// brokerd. The cell receives JS source via env, executes against
-	// the broker's UDS, prints a JSON envelope on stdout, exits.
-	InvokeAsterCell(ctx context.Context, req dockerprov.InvokeAsterRequest) (*dockerprov.InvokeAsterResult, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -213,12 +199,6 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/deploy_keys", h.createDeployKey)
 		r.Get("/deploy_keys", h.listDeployKeys)
 		r.Post("/deploy_keys/{id}/revoke", h.revokeDeployKey)
-		// Aster cell on-demand spawn (v1.1+). Only valid on
-		// kind=aster deployments; rejects with 409 on the others.
-		// The handler parses the JS source + args from the body,
-		// spawns a one-shot aster-v8cell container against the
-		// deployment's brokerd, and returns the cell's stdout.
-		r.Post("/aster/invoke", h.invokeAsterCell)
 	})
 	return r
 }
@@ -334,7 +314,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 	// scanning straight into the non-pointer fields blows up on NULL, so
 	// we go through pointers and dereference defensively below.
 	err := db.QueryRow(ctx, `
-		SELECT d.id, d.project_id, d.name, d.deployment_type, d.kind, d.status,
+		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
 		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
 		       d.ha_enabled, d.replica_count,
@@ -346,7 +326,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		 WHERE d.name = $1
 		   AND d.status <> 'deleted'
 	`, name).Scan(
-		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Kind, &d.Status,
+		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
 		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
 		&d.HAEnabled, &d.ReplicaCount,
@@ -608,11 +588,6 @@ type createDeploymentReq struct {
 	Reference string `json:"reference,omitempty"`
 	IsDefault bool   `json:"isDefault,omitempty"`
 
-	// Kind selects the runtime: "convex" (default) provisions a Convex
-	// backend container; "aster" provisions an Aster brokerd container
-	// with no Convex admin key or HTTP deployment URL. Empty == "convex".
-	Kind string `json:"kind,omitempty"`
-
 	// HA, if true, provisions the deployment with replica_count=2 backed
 	// by Postgres + S3 instead of SQLite + local volume. Refused with
 	// 400 ha_disabled when SYNAPSE_HA_ENABLED isn't true on this Synapse
@@ -681,29 +656,6 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		req.Type = models.DeploymentTypeDev
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_type", "deploymentType must be dev|prod|preview|custom")
-		return
-	}
-	switch req.Kind {
-	case models.DeploymentKindConvex, models.DeploymentKindAster:
-	case "":
-		req.Kind = models.DeploymentKindConvex
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be convex|aster")
-		return
-	}
-	if req.Kind == models.DeploymentKindAster && req.HA {
-		// HA semantics (Postgres + S3 + dual replicas) are tied to the
-		// Convex backend image. Aster has its own (future) story for
-		// horizontal execution; refusing here keeps the contract honest.
-		writeError(w, http.StatusBadRequest, "invalid_combination", "HA is not yet supported for kind=aster")
-		return
-	}
-	if req.Kind == models.DeploymentKindAster {
-		// kind=aster uses the same durable provisioning queue, but its
-		// docker branch starts brokerd over a Unix-domain socket instead
-		// of a TCP-backed Convex runtime. publicDeploymentURL stays empty
-		// until the Convex-shaped HTTP frontend lands.
-		h.createAsterDeployment(w, r, projectID, teamID, uid, req)
 		return
 	}
 	if req.HA {
@@ -788,12 +740,12 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		// resolves to something live during a roll-out.
 		primaryPort := ports[0]
 		if txErr = tx.QueryRow(r.Context(), `
-			INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
+			INSERT INTO deployments (project_id, name, deployment_type, status, host_port,
 			                          admin_key, instance_secret, is_default, reference,
 			                          creator_user_id, ha_enabled, replica_count)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12, $13)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11, $12)
 			RETURNING id, created_at
-		`, projectID, name, req.Type, models.DeploymentKindConvex, models.DeploymentStatusProvisioning, primaryPort,
+		`, projectID, name, req.Type, models.DeploymentStatusProvisioning, primaryPort,
 			adminKey, instanceSecret, req.IsDefault, req.Reference, uid,
 			req.HA, replicaCount,
 		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
@@ -858,7 +810,6 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 		return
 	}
 	d.Name = name
-	d.Kind = models.DeploymentKindConvex
 	if len(ports) > 0 {
 		d.HostPort = ports[0]
 	}
@@ -888,111 +839,6 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	// renders something the operator's browser can actually hit (PR #10
 	// added the helper but only wired it into /auth + /cli_credentials).
 	d.DeploymentURL = h.publicDeploymentURL(&d)
-	writeJSON(w, http.StatusCreated, d)
-}
-
-// createAsterDeployment is the kind=aster branch of createDeployment. It
-// inserts the deployment row plus a provisioning replica row and enqueues
-// the normal durable worker job. The worker reads d.kind from the join and
-// calls Docker.Provision's Aster branch, which starts brokerd instead of a
-// Convex backend.
-//
-// Aster keeps host_port NULL because brokerd exposes only a Unix-domain
-// socket. It also stores admin_key=” because Aster cells use capsule
-// seals + cell identity, not Convex-style bearer admin keys.
-func (h *DeploymentsHandler) createAsterDeployment(
-	w http.ResponseWriter,
-	r *http.Request,
-	projectID, teamID, uid string,
-	req createDeploymentReq,
-) {
-	instanceSecret, err := dockerprov.RandomHex(32)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to generate secret")
-		return
-	}
-
-	d := models.Deployment{
-		ProjectID:      projectID,
-		Name:           "",
-		DeploymentType: req.Type,
-		Kind:           models.DeploymentKindAster,
-		Status:         models.DeploymentStatusProvisioning,
-		InstanceSecret: instanceSecret,
-		IsDefault:      req.IsDefault,
-		Reference:      req.Reference,
-		CreatorUserID:  uid,
-		ReplicaCount:   1,
-	}
-
-	err = synapsedb.WithRetryOnUniqueViolation(r.Context(), 5, func() error {
-		name, allocErr := h.allocateDeploymentName(r.Context())
-		if allocErr != nil {
-			return allocErr
-		}
-		tx, txErr := h.DB.Begin(r.Context())
-		if txErr != nil {
-			return txErr
-		}
-		defer tx.Rollback(r.Context())
-
-		// admin_key='' — Aster has no Convex-style admin key. The column
-		// is NOT NULL but accepts empty string. The Aster auth model is
-		// capsule seals + cell identity, not a shared bearer.
-		if txErr = tx.QueryRow(r.Context(), `
-			INSERT INTO deployments (project_id, name, deployment_type, kind, status, host_port,
-			                          admin_key, instance_secret, is_default, reference,
-			                          creator_user_id, ha_enabled, replica_count)
-			VALUES ($1, $2, $3, $4, $5, NULL, '', $6, $7, NULLIF($8, ''), $9, false, 1)
-			RETURNING id, created_at
-		`, projectID, name, req.Type, models.DeploymentKindAster, models.DeploymentStatusProvisioning,
-			instanceSecret, req.IsDefault, req.Reference, uid,
-		).Scan(&d.ID, &d.CreatedAt); txErr != nil {
-			return txErr
-		}
-
-		// Replica row in 'provisioning' so the worker has a target to
-		// flip to 'running' once Docker.Provision returns. host_port and
-		// container_id stay NULL until provision succeeds — the brokerd
-		// listens on a Unix-domain socket, not a TCP port.
-		var replicaID string
-		if txErr = tx.QueryRow(r.Context(), `
-			INSERT INTO deployment_replicas (deployment_id, replica_index, host_port, container_id, status)
-			VALUES ($1, 0, NULL, NULL, 'provisioning')
-			RETURNING id
-		`, d.ID).Scan(&replicaID); txErr != nil {
-			return txErr
-		}
-
-		// Enqueue the same provisioning_job kind the Convex path uses;
-		// the worker reads d.kind from the join and dispatches into
-		// Client.provisionAster instead of the SQLite/HA path.
-		if txErr = provisioner.EnqueueReplica(r.Context(), tx, d.ID, replicaID, h.HealthcheckViaNetwork); txErr != nil {
-			return txErr
-		}
-		d.Name = name
-		return tx.Commit(r.Context())
-	})
-	if err != nil {
-		logErr("insert aster deployment", err)
-		writeError(w, http.StatusInternalServerError, "internal", "Failed to record deployment")
-		return
-	}
-
-	_ = audit.Record(r.Context(), h.DB, audit.Options{
-		TeamID:     teamID,
-		ActorID:    uid,
-		Action:     audit.ActionCreateDeployment,
-		TargetType: audit.TargetDeployment,
-		TargetID:   d.ID,
-		Metadata: map[string]any{
-			"name":           d.Name,
-			"deploymentType": req.Type,
-			"kind":           models.DeploymentKindAster,
-			"projectId":      projectID,
-		},
-	})
-
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -1516,15 +1362,7 @@ func (h *DeploymentsHandler) deleteDeployment(w http.ResponseWriter, r *http.Req
 	if !d.Adopted {
 		// Tear down the container/volume first; if that fails, leave the row
 		// alone so the operator can retry. A successful Destroy is idempotent.
-		// kind=aster routes to DestroyAster (brokerd container + per-deployment
-		// volume); everything else uses the Convex backend Destroy.
-		var destroyErr error
-		if d.Kind == models.DeploymentKindAster {
-			destroyErr = h.Docker.DestroyAster(r.Context(), d.Name)
-		} else {
-			destroyErr = h.Docker.Destroy(r.Context(), d.Name)
-		}
-		if destroyErr != nil {
+		if destroyErr := h.Docker.Destroy(r.Context(), d.Name); destroyErr != nil {
 			logErr("docker destroy", destroyErr)
 			writeError(w, http.StatusInternalServerError, "destroy_failed", destroyErr.Error())
 			return
@@ -1908,186 +1746,4 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 		},
 	})
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// ---------- POST /v1/deployments/{name}/aster/invoke -----------------
-
-// invokeAsterCellReq is the body shape for a one-shot cell run.
-// Bound to the docker-side `InvokeAsterRequest` 1:1 except we don't
-// expose `InstanceSecret` (the handler reads it from the deployment
-// row) or the host-side `Timeout` (capped server-side).
-//
-// Two mutually-exclusive modes:
-//
-//   - Raw-JS (legacy): set `js`. The cell `eval`s it inline.
-//   - Module-query: set `modulePath` + `functionName` + `argsJson`.
-//     The cell loads the bundle via brokerd's `LoadModuleBundle` and
-//     calls the named export as a Convex query.
-type invokeAsterCellReq struct {
-	// JS is the literal JavaScript the cell executes. Mutually
-	// exclusive with the module-mode trio. Capped at 64 KiB to fit
-	// in a Docker env var.
-	JS string `json:"js,omitempty"`
-
-	// ModulePath is the canonical module path the cell loads from
-	// the deployment's `_modules` index (e.g. "messages.js"). When
-	// set, FunctionName + ArgsJson are also required.
-	ModulePath string `json:"modulePath,omitempty"`
-
-	// FunctionName is the exported query function on the loaded
-	// module (e.g. "getById"). Required when ModulePath is set.
-	FunctionName string `json:"functionName,omitempty"`
-
-	// ArgsJson is the JSON-encoded arg array forwarded to
-	// `invokeQuery(args)` (per Convex's `handler(ctx, ...args)`
-	// shape, this is a JSON ARRAY — `[{"id": "..."}]`, not a
-	// bare object). Kept as a string end-to-end so we never
-	// re-encode the bytes the cell binary expects.
-	ArgsJson string `json:"argsJson,omitempty"`
-
-	// SnapshotTS pins the read snapshot. 0 = let the broker decide.
-	SnapshotTS uint64 `json:"snapshotTs,omitempty"`
-
-	// CellID identifies this invocation in the broker's per-cell
-	// rate-limit / lease tracking. Server generates one when absent.
-	CellID string `json:"cellId,omitempty"`
-
-	// LeaseEpoch monotonically increases per cell to invalidate stale
-	// capsules. Defaults to 1 server-side.
-	LeaseEpoch uint64 `json:"leaseEpoch,omitempty"`
-
-	// Prewarm is a list of document IDs (Aster wire form
-	// `<table_hex>/<id_hex>` OR Convex IDv6) the broker hydrates
-	// before the cell starts.
-	Prewarm []string `json:"prewarm,omitempty"`
-
-	// MaxTraps caps trap continuations per invocation. Defaults to
-	// 64 server-side.
-	MaxTraps int `json:"maxTraps,omitempty"`
-}
-
-type invokeAsterCellResp struct {
-	// Stdout is the cell binary's raw stdout — typically a one-line
-	// JSON envelope `{"output":..,"traps":..,"capsule_hash":..}`.
-	// Pass-through verbatim so clients can choose whether to parse.
-	Stdout string `json:"stdout"`
-	// Stderr is whatever the cell printed to stderr (rare on the
-	// success path; useful for debugging).
-	Stderr string `json:"stderr,omitempty"`
-	// ExitCode is the cell's process exit. 0 means the cell ran to
-	// completion; non-zero means a runtime error (look at Stderr).
-	ExitCode int64 `json:"exitCode"`
-}
-
-// asterInvokeMaxJSBytes mirrors the docker-side cap. 64 KiB fits
-// comfortably in the per-env-var limit Docker enforces (~128 KiB on
-// Linux) with headroom for the rest of the env block.
-const asterInvokeMaxJSBytes = 64 * 1024
-
-// asterInvokeTimeout is the host-side ceiling on a single cell run.
-// 30s is generous for read-only smoke (typical run is <1s) and tight
-// enough that a wedged cell doesn't pin a Docker daemon slot forever.
-const asterInvokeTimeout = 30 * time.Second
-
-func (h *DeploymentsHandler) invokeAsterCell(w http.ResponseWriter, r *http.Request) {
-	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
-	if !ok {
-		return
-	}
-	if d.Kind != models.DeploymentKindAster {
-		writeError(w, http.StatusConflict, "wrong_kind",
-			"This endpoint only applies to kind=aster deployments")
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, asterInvokeMaxJSBytes+1))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "read_body", "Could not read request body")
-		return
-	}
-	defer r.Body.Close()
-	if len(body) > asterInvokeMaxJSBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "js_too_large",
-			fmt.Sprintf("JS source exceeds %d-byte cap; use the module loader for full bundles",
-				asterInvokeMaxJSBytes))
-		return
-	}
-
-	var req invokeAsterCellReq
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", "Body must be JSON: "+err.Error())
-		return
-	}
-
-	jsSet := strings.TrimSpace(req.JS) != ""
-	moduleSet := req.ModulePath != "" || req.FunctionName != "" || req.ArgsJson != ""
-
-	// Mutual exclusion. Setting `js` and any of the module-mode trio
-	// in the same request is a 400 — we'd otherwise have to pick a
-	// silent winner, and either choice surprises the caller.
-	if jsSet && moduleSet {
-		writeError(w, http.StatusBadRequest, "mutually_exclusive_modes",
-			"Set either 'js' (raw-JS mode) or the module-mode trio "+
-				"('modulePath' + 'functionName' + 'argsJson'), not both.")
-		return
-	}
-
-	if !jsSet && !moduleSet {
-		writeError(w, http.StatusBadRequest, "missing_js",
-			"Field 'js' is required and non-empty (or set 'modulePath' + 'functionName' + 'argsJson' for module mode).")
-		return
-	}
-
-	if moduleSet {
-		// All three module-mode fields must be set together — the
-		// cell binary refuses to spawn with a partial config, and
-		// surfacing that here is friendlier than a 502 from docker.
-		if req.ModulePath == "" {
-			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
-				"Field 'modulePath' is required when running in module mode.")
-			return
-		}
-		if req.FunctionName == "" {
-			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
-				"Field 'functionName' is required when running in module mode.")
-			return
-		}
-		if req.ArgsJson == "" {
-			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
-				"Field 'argsJson' is required when running in module mode.")
-			return
-		}
-	}
-
-	dockerReq := dockerprov.InvokeAsterRequest{
-		DeploymentName: d.Name,
-		InstanceSecret: d.InstanceSecret,
-		JSSource:       req.JS,
-		ModulePath:     req.ModulePath,
-		FunctionName:   req.FunctionName,
-		ArgsJson:       req.ArgsJson,
-		SnapshotTS:     req.SnapshotTS,
-		CellID:         req.CellID,
-		LeaseEpoch:     req.LeaseEpoch,
-		Prewarm:        req.Prewarm,
-		MaxTraps:       req.MaxTraps,
-		Timeout:        asterInvokeTimeout,
-	}
-	result, err := h.Docker.InvokeAsterCell(r.Context(), dockerReq)
-	if err != nil {
-		// The docker layer wraps all transport / config / spawn errors
-		// in a generic Go error. Surface as 502 — the brokerd /
-		// daemon is "downstream" from the operator's perspective.
-		writeError(w, http.StatusBadGateway, "cell_spawn_failed", err.Error())
-		return
-	}
-
-	resp := invokeAsterCellResp{
-		Stdout:   result.Stdout,
-		Stderr:   result.Stderr,
-		ExitCode: result.ExitCode,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
 }

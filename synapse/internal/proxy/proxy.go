@@ -61,15 +61,6 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
-// ErrAsterNotProxied signals that the deployment exists and is reachable,
-// but it's a kind=aster row whose runtime doesn't speak HTTP — it speaks
-// the Aster IPC protocol over a Unix-domain socket. The proxy maps this
-// to a typed 501 so the dashboard can render an "Aster — execution
-// path not yet wired" panel instead of pretending the deployment is
-// broken. Raw-JS cell invocation already lives on the control API; this
-// sentinel remains until the Convex-shaped HTTP frontend lands.
-var ErrAsterNotProxied = errors.New("kind=aster deployments do not expose an HTTP proxy yet")
-
 // ErrNoReplicas signals that a deployment has no live replicas. Distinct
 // from "deployment not found" so the handler can return 503 (Service
 // Unavailable) instead of 404.
@@ -111,10 +102,10 @@ func (r *Resolver) ResolveAll(ctx context.Context, name string) ([]string, error
 
 	// First: does the deployment exist and is it in a routable state?
 	var haEnabled bool
-	var depStatus, depKind string
+	var depStatus string
 	err := r.DB.QueryRow(ctx,
-		`SELECT ha_enabled, status, kind FROM deployments WHERE name = $1`, name,
-	).Scan(&haEnabled, &depStatus, &depKind)
+		`SELECT ha_enabled, status FROM deployments WHERE name = $1`, name,
+	).Scan(&haEnabled, &depStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("deployment %q not found", name)
 	}
@@ -123,13 +114,6 @@ func (r *Resolver) ResolveAll(ctx context.Context, name string) ([]string, error
 	}
 	if depStatus != "running" {
 		return nil, fmt.Errorf("deployment %q is %s, not running", name, depStatus)
-	}
-	// kind=aster: row exists and the brokerd container is up, but
-	// there's no HTTP runtime to proxy into. Surface that explicitly so
-	// the handler can return a 501 with a useful message rather than a
-	// confusing 502/timeout.
-	if depKind == "aster" {
-		return nil, ErrAsterNotProxied
 	}
 
 	// Then: ordered list of running replicas. last_seen_active_at DESC
@@ -351,14 +335,6 @@ func Handler(resolver *Resolver, logger *slog.Logger, baseDomain string) http.Ha
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"code":    "no_replicas",
 				"message": "Deployment has no running replicas",
-			})
-			return
-		}
-		if errors.Is(err, ErrAsterNotProxied) {
-			writeJSON(w, http.StatusNotImplemented, map[string]string{
-				"code":    "aster_not_proxied",
-				"message": "kind=aster deployments are reachable through the Aster IPC protocol, not HTTP. Use POST /v1/deployments/{name}/aster/invoke for raw-JS smokes; Convex-shaped HTTP access lands with the module-loader frontend.",
-				"kind":    "aster",
 			})
 			return
 		}

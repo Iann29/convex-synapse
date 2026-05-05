@@ -592,7 +592,7 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 	var err error
 	if cursor == "" {
 		rows, err = h.DB.Query(r.Context(), `
-			SELECT id, project_id, name, deployment_type, kind, status,
+			SELECT id, project_id, name, deployment_type, status,
 			       deployment_url, is_default, reference, creator_user_id, created_at,
 			       adopted
 			  FROM deployments
@@ -615,7 +615,7 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 			return
 		}
 		rows, err = h.DB.Query(r.Context(), `
-			SELECT id, project_id, name, deployment_type, kind, status,
+			SELECT id, project_id, name, deployment_type, status,
 			       deployment_url, is_default, reference, creator_user_id, created_at,
 			       adopted
 			  FROM deployments
@@ -637,7 +637,7 @@ func (h *ProjectsHandler) listDeployments(w http.ResponseWriter, r *http.Request
 	for rows.Next() {
 		var d models.Deployment
 		var url, ref, creator *string
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Kind, &d.Status,
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 			&url, &d.IsDefault, &ref, &creator, &d.CreatedAt, &d.Adopted); err != nil {
 			logErr("scan deployment", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to scan deployments")

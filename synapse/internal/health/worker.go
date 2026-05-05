@@ -31,10 +31,6 @@ import (
 type DockerStatusReporter interface {
 	Status(ctx context.Context, deploymentName string) (string, error)
 	StatusReplica(ctx context.Context, deploymentName string, replicaIndex int) (string, error)
-	// StatusAster reports the brokerd container's docker state for a
-	// kind=aster deployment. Empty string + nil error means "not found"
-	// (worker treats that the same as missing-container for Convex).
-	StatusAster(ctx context.Context, deploymentName string) (string, error)
 }
 
 // Restarter is the optional auto-recovery hook. When the worker reconciles
@@ -147,7 +143,7 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 	// reconcile their state. The operator who registered them owns the
 	// lifecycle.
 	rows, err := w.DB.Query(ctx, `
-		SELECT r.id, d.id, d.name, r.replica_index, d.ha_enabled, d.kind
+		SELECT r.id, d.id, d.name, r.replica_index, d.ha_enabled
 		  FROM deployment_replicas r
 		  JOIN deployments d ON d.id = r.deployment_id
 		 WHERE r.status = 'running'
@@ -165,12 +161,11 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 		name         string
 		replicaIndex int
 		haEnabled    bool
-		kind         string
 	}
 	var items []item
 	for rows.Next() {
 		var it item
-		if err := rows.Scan(&it.replicaID, &it.deploymentID, &it.name, &it.replicaIndex, &it.haEnabled, &it.kind); err != nil {
+		if err := rows.Scan(&it.replicaID, &it.deploymentID, &it.name, &it.replicaIndex, &it.haEnabled); err != nil {
 			logger.Error("health: scan row", "err", err)
 			rows.Close()
 			return
@@ -189,7 +184,7 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 	deploymentsTouched := make(map[string]bool)
 	var changed int
 	for _, it := range items {
-		if w.reconcileReplica(ctx, logger, cfg, it.replicaID, it.deploymentID, it.name, it.replicaIndex, it.haEnabled, it.kind) {
+		if w.reconcileReplica(ctx, logger, cfg, it.replicaID, it.deploymentID, it.name, it.replicaIndex, it.haEnabled) {
 			changed++
 			deploymentsTouched[it.deploymentID] = true
 		}
@@ -209,7 +204,7 @@ func (w *Worker) sweep(ctx context.Context, logger *slog.Logger, cfg Config) {
 // batches it so a single deployment with N changed replicas gets one
 // recompute, not N).
 func (w *Worker) reconcileReplica(ctx context.Context, logger *slog.Logger, cfg Config,
-	replicaID, deploymentID, name string, replicaIndex int, haEnabled bool, kind string,
+	replicaID, deploymentID, name string, replicaIndex int, haEnabled bool,
 ) bool {
 	statusCtx, cancel := context.WithTimeout(ctx, cfg.StatusTimeout)
 	defer cancel()
@@ -217,10 +212,6 @@ func (w *Worker) reconcileReplica(ctx context.Context, logger *slog.Logger, cfg 
 	var dockerStatus string
 	var err error
 	switch {
-	case kind == "aster":
-		// kind=aster: probe the brokerd container, not a Convex one.
-		// HA isn't supported for aster yet, so no replica-index branch.
-		dockerStatus, err = w.Docker.StatusAster(statusCtx, name)
 	case haEnabled:
 		dockerStatus, err = w.Docker.StatusReplica(statusCtx, name, replicaIndex)
 	default:
