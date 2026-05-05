@@ -1916,11 +1916,34 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 // Bound to the docker-side `InvokeAsterRequest` 1:1 except we don't
 // expose `InstanceSecret` (the handler reads it from the deployment
 // row) or the host-side `Timeout` (capped server-side).
+//
+// Two mutually-exclusive modes:
+//
+//   - Raw-JS (legacy): set `js`. The cell `eval`s it inline.
+//   - Module-query: set `modulePath` + `functionName` + `argsJson`.
+//     The cell loads the bundle via brokerd's `LoadModuleBundle` and
+//     calls the named export as a Convex query.
 type invokeAsterCellReq struct {
-	// JS is the literal JavaScript the cell executes. Required.
-	// Capped at 64 KiB to fit in a Docker env var; bigger bundles
-	// land via the module loader (#98 in Iann29/aster).
-	JS string `json:"js"`
+	// JS is the literal JavaScript the cell executes. Mutually
+	// exclusive with the module-mode trio. Capped at 64 KiB to fit
+	// in a Docker env var.
+	JS string `json:"js,omitempty"`
+
+	// ModulePath is the canonical module path the cell loads from
+	// the deployment's `_modules` index (e.g. "messages.js"). When
+	// set, FunctionName + ArgsJson are also required.
+	ModulePath string `json:"modulePath,omitempty"`
+
+	// FunctionName is the exported query function on the loaded
+	// module (e.g. "getById"). Required when ModulePath is set.
+	FunctionName string `json:"functionName,omitempty"`
+
+	// ArgsJson is the JSON-encoded arg array forwarded to
+	// `invokeQuery(args)` (per Convex's `handler(ctx, ...args)`
+	// shape, this is a JSON ARRAY — `[{"id": "..."}]`, not a
+	// bare object). Kept as a string end-to-end so we never
+	// re-encode the bytes the cell binary expects.
+	ArgsJson string `json:"argsJson,omitempty"`
 
 	// SnapshotTS pins the read snapshot. 0 = let the broker decide.
 	SnapshotTS uint64 `json:"snapshotTs,omitempty"`
@@ -1995,15 +2018,54 @@ func (h *DeploymentsHandler) invokeAsterCell(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "bad_json", "Body must be JSON: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.JS) == "" {
-		writeError(w, http.StatusBadRequest, "missing_js", "Field 'js' is required and non-empty")
+
+	jsSet := strings.TrimSpace(req.JS) != ""
+	moduleSet := req.ModulePath != "" || req.FunctionName != "" || req.ArgsJson != ""
+
+	// Mutual exclusion. Setting `js` and any of the module-mode trio
+	// in the same request is a 400 — we'd otherwise have to pick a
+	// silent winner, and either choice surprises the caller.
+	if jsSet && moduleSet {
+		writeError(w, http.StatusBadRequest, "mutually_exclusive_modes",
+			"Set either 'js' (raw-JS mode) or the module-mode trio "+
+				"('modulePath' + 'functionName' + 'argsJson'), not both.")
 		return
+	}
+
+	if !jsSet && !moduleSet {
+		writeError(w, http.StatusBadRequest, "missing_js",
+			"Field 'js' is required and non-empty (or set 'modulePath' + 'functionName' + 'argsJson' for module mode).")
+		return
+	}
+
+	if moduleSet {
+		// All three module-mode fields must be set together — the
+		// cell binary refuses to spawn with a partial config, and
+		// surfacing that here is friendlier than a 502 from docker.
+		if req.ModulePath == "" {
+			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
+				"Field 'modulePath' is required when running in module mode.")
+			return
+		}
+		if req.FunctionName == "" {
+			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
+				"Field 'functionName' is required when running in module mode.")
+			return
+		}
+		if req.ArgsJson == "" {
+			writeError(w, http.StatusBadRequest, "incomplete_module_mode",
+				"Field 'argsJson' is required when running in module mode.")
+			return
+		}
 	}
 
 	dockerReq := dockerprov.InvokeAsterRequest{
 		DeploymentName: d.Name,
 		InstanceSecret: d.InstanceSecret,
 		JSSource:       req.JS,
+		ModulePath:     req.ModulePath,
+		FunctionName:   req.FunctionName,
+		ArgsJson:       req.ArgsJson,
 		SnapshotTS:     req.SnapshotTS,
 		CellID:         req.CellID,
 		LeaseEpoch:     req.LeaseEpoch,

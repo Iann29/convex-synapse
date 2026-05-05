@@ -228,8 +228,30 @@ type InvokeAsterRequest struct {
 
 	// JSSource is the literal JavaScript the cell executes. Becomes
 	// `ASTER_JS_INLINE` (the v8cell binary supports this since
-	// Iann29/aster#16). Required.
+	// Iann29/aster#16). Mutually exclusive with the module-mode trio
+	// (ModulePath / FunctionName / ArgsJson). One mode must be chosen
+	// at the API layer; the docker layer surfaces a clear error if both
+	// are set.
 	JSSource string
+
+	// ModulePath is the canonical module path the cell will load via
+	// the brokerd's `LoadModuleBundle` IPC. Combined with FunctionName
+	// + ArgsJson this drives the module-query path (real `npx convex
+	// deploy` bundles). Becomes `ASTER_MODULE_PATH`. Mutually exclusive
+	// with JSSource.
+	ModulePath string
+
+	// FunctionName is the exported function name on the loaded module
+	// (e.g. `getById`). Becomes `ASTER_FUNCTION_NAME`. Required when
+	// ModulePath is set.
+	FunctionName string
+
+	// ArgsJson is the JSON-encoded argument array the cell forwards to
+	// `invokeQuery(args)`. Stays a string end-to-end so we don't pay
+	// for a parse + re-stringify round-trip and don't risk re-encoding
+	// the bytes the cell binary actually expects. Becomes
+	// `ASTER_ARGS_JSON`. Required when ModulePath is set.
+	ArgsJson string
 
 	// SnapshotTS pins the read snapshot. 0 means "use whatever the
 	// broker reports" — fine for read-only smoke tests, less fine for
@@ -414,7 +436,7 @@ func (c *Client) InvokeAsterCell(ctx context.Context, req InvokeAsterRequest) (*
 
 func buildAsterCellEnv(req InvokeAsterRequest, cellID string, leaseEpoch uint64, maxTraps int) []string {
 	prewarm := strings.Join(req.Prewarm, ",")
-	return []string{
+	env := []string{
 		"ASTER_BROKER_SOCK=/run/aster/broker.sock",
 		"ASTER_TENANT=" + req.DeploymentName,
 		"ASTER_DEPLOYMENT=" + req.DeploymentName,
@@ -424,13 +446,30 @@ func buildAsterCellEnv(req InvokeAsterRequest, cellID string, leaseEpoch uint64,
 		fmt.Sprintf("ASTER_LEASE_EPOCH=%d", leaseEpoch),
 		"ASTER_PREWARM=" + prewarm,
 		fmt.Sprintf("ASTER_MAX_TRAPS=%d", maxTraps),
-		// Clear any file-based image default: ASTER_JS and
+		// Always clear any file-based image default: ASTER_JS and
 		// ASTER_JS_INLINE are mutually exclusive in aster_v8cell.
 		"ASTER_JS=",
-		// The whole point of this slice — the cell binary now reads
-		// the JS source from this env (Iann29/aster#16).
-		"ASTER_JS_INLINE=" + req.JSSource,
 	}
+
+	// Module-mode trio takes precedence over inline JS. The mutual-
+	// exclusion check at the API layer keeps both groups from being
+	// set in a single request, but the env-builder is defensive: if
+	// ModulePath is non-empty we route module-mode envs and keep
+	// ASTER_JS_INLINE absent so the cell binary's own validation
+	// (which rejects setting both) doesn't trip.
+	if req.ModulePath != "" {
+		env = append(env,
+			"ASTER_MODULE_PATH="+req.ModulePath,
+			"ASTER_FUNCTION_NAME="+req.FunctionName,
+			"ASTER_ARGS_JSON="+req.ArgsJson,
+		)
+		return env
+	}
+
+	// Legacy raw-JS path — the cell binary reads the JS source from
+	// ASTER_JS_INLINE (Iann29/aster#16).
+	env = append(env, "ASTER_JS_INLINE="+req.JSSource)
+	return env
 }
 
 func (req *InvokeAsterRequest) validate() error {
@@ -440,6 +479,25 @@ func (req *InvokeAsterRequest) validate() error {
 	if req.InstanceSecret == "" {
 		return errors.New("invoke aster: instance secret required (must match brokerd seal seed)")
 	}
+
+	// Module-mode trio: ModulePath + FunctionName + ArgsJson.
+	moduleMode := req.ModulePath != "" || req.FunctionName != "" || req.ArgsJson != ""
+	if moduleMode {
+		if req.JSSource != "" {
+			return errors.New("invoke aster: JSSource and module-mode (ModulePath/FunctionName/ArgsJson) are mutually exclusive")
+		}
+		if req.ModulePath == "" {
+			return errors.New("invoke aster: ModulePath required when running module-mode")
+		}
+		if req.FunctionName == "" {
+			return errors.New("invoke aster: FunctionName required when running module-mode")
+		}
+		if req.ArgsJson == "" {
+			return errors.New("invoke aster: ArgsJson required when running module-mode")
+		}
+		return nil
+	}
+
 	if req.JSSource == "" {
 		return errors.New("invoke aster: JSSource required")
 	}

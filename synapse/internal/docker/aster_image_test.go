@@ -46,6 +46,41 @@ func TestAsterCellEnvClearsFileSource(t *testing.T) {
 	}
 }
 
+// TestAsterCellEnvModuleModeOmitsJSInline locks the env-builder's
+// module-mode branch: when ModulePath / FunctionName / ArgsJson are
+// set, the env contains the three module envs and does NOT contain
+// any ASTER_JS_INLINE entry. ASTER_JS= clear-line is still emitted
+// defensively so a stale image-default cannot collide.
+func TestAsterCellEnvModuleModeOmitsJSInline(t *testing.T) {
+	env := buildAsterCellEnv(InvokeAsterRequest{
+		DeploymentName: "dep",
+		InstanceSecret: "secret",
+		ModulePath:     "messages.js",
+		FunctionName:   "getById",
+		ArgsJson:       `[{"id":"abc/def"}]`,
+	}, "cell-1", 7, 11)
+
+	wantPresent := map[string]bool{
+		"ASTER_MODULE_PATH=messages.js":           false,
+		"ASTER_FUNCTION_NAME=getById":             false,
+		`ASTER_ARGS_JSON=[{"id":"abc/def"}]`:      false,
+		"ASTER_JS=":                                false,
+	}
+	for _, item := range env {
+		if _, ok := wantPresent[item]; ok {
+			wantPresent[item] = true
+		}
+		if strings.HasPrefix(item, "ASTER_JS_INLINE=") {
+			t.Fatalf("env must not include ASTER_JS_INLINE in module mode: got %q", item)
+		}
+	}
+	for want, ok := range wantPresent {
+		if !ok {
+			t.Fatalf("env missing %q: %v", want, env)
+		}
+	}
+}
+
 func TestAsterBrokerEnvAndBindsIncludePostgresModules(t *testing.T) {
 	spec := DeploymentSpec{
 		Name:                 "dep",
