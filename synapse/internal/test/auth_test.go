@@ -10,11 +10,12 @@ import (
 // Defined here (not exported from the harness) so each test file can extend
 // it locally if its endpoint adds fields.
 type userResp struct {
-	ID         string    `json:"id"`
-	Email      string    `json:"email"`
-	Name       string    `json:"name"`
-	CreateTime time.Time `json:"createTime"`
-	UpdateTime time.Time `json:"updateTime"`
+	ID              string    `json:"id"`
+	Email           string    `json:"email"`
+	Name            string    `json:"name"`
+	IsInstanceAdmin bool      `json:"isInstanceAdmin,omitempty"`
+	CreateTime      time.Time `json:"createTime"`
+	UpdateTime      time.Time `json:"updateTime"`
 }
 
 func TestRegister_HappyPath(t *testing.T) {
@@ -41,6 +42,9 @@ func TestRegister_HappyPath(t *testing.T) {
 	}
 	if got.ExpiresIn <= 0 {
 		t.Errorf("expected positive expiresIn, got %d", got.ExpiresIn)
+	}
+	if !got.User.IsInstanceAdmin {
+		t.Errorf("first registered user should be instance admin")
 	}
 }
 

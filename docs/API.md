@@ -24,6 +24,9 @@ Returns `{status, version, database}`. Status is `ok` or `degraded`.
 
 Body: `{email, password, name?}`. 8-char min password.
 Returns: `{accessToken, refreshToken, tokenType:"Bearer", expiresIn, user}`.
+On an empty instance, the first registered user is promoted to
+`user.isInstanceAdmin=true`; later users do not inherit instance-admin
+rights from team or project roles.
 
 ### `POST /v1/auth/login` 🔧
 
@@ -64,6 +67,32 @@ operators have no opt-ins, so `optInsToAccept` is always `[]`.
 
 Returns `{optInsToAccept: []}`. Self-hosted operators don't agree to
 Convex Cloud's TOS or marketing opt-ins; the operator owns the box.
+
+## Instance admin
+
+These endpoints are host-wide and require `user.isInstanceAdmin=true`.
+Being `admin` on a team or project does not grant access. Existing installs
+are migrated with the oldest user promoted as the initial instance admin;
+new installs promote the first registered user.
+
+### `GET /v1/admin/version_check` 🔧
+
+Returns `{current, latest?, updateAvailable, releaseUrl?, releaseNotes?,
+publishedAt?, fetchedAt?, error?}`. Checks GitHub Releases `/latest` with a
+15-minute cache. On upstream failure and no cached release, returns 200 with
+`current` plus `error` so the dashboard can fail soft.
+
+### `POST /v1/admin/upgrade` 🔧
+
+Body `{ref?}`. Starts the host-side updater daemon via unix socket and
+returns the daemon response, usually `{started:true, ref}` with HTTP 202.
+Returns 503 `updater_unavailable` / `updater_unreachable` when the daemon is
+not configured or not running.
+
+### `GET /v1/admin/upgrade/status` 🔧
+
+Returns the updater daemon's current state/log tail, or `{state:"unavailable",
+error}` when the daemon cannot be reached.
 
 ## Teams
 

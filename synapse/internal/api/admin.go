@@ -24,10 +24,9 @@ import (
 )
 
 // AdminHandler covers instance-level operations: version check + auto-upgrade.
-// Endpoints under /v1/admin are gated to "any team admin" (a user who is
-// admin in at least one team). Synapse has no global super-admin role; in a
-// single-tenant self-hosted box, anyone trusted enough to admin a team is
-// trusted enough to upgrade the box.
+// Endpoints under /v1/admin are gated to users.is_instance_admin. Team and
+// project admins own application resources; instance admins own host-wide
+// operations such as upgrading the Synapse binary and compose stack.
 type AdminHandler struct {
 	DB      *pgxpool.Pool
 	Version string
@@ -70,19 +69,17 @@ const (
 
 func (h *AdminHandler) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Use(h.requireAnyTeamAdmin)
+	r.Use(h.requireInstanceAdmin)
 	r.Get("/version_check", h.versionCheck)
 	r.Post("/upgrade", h.upgrade)
 	r.Get("/upgrade/status", h.upgradeStatus)
 	return r
 }
 
-// requireAnyTeamAdmin gates every /v1/admin/* route. A user counts as an
-// admin if they have role='admin' in at least one team_members row. We
-// don't expose a global "instance admin" because the typical self-hosted
-// flow (single team, single operator) doesn't need that distinction —
-// anyone with team-admin reach already controls the data behind Synapse.
-func (h *AdminHandler) requireAnyTeamAdmin(next http.Handler) http.Handler {
+// requireInstanceAdmin gates every /v1/admin/* route. The first registered
+// user is promoted during registration; later team admins do not inherit this
+// host-wide role just by owning a team.
+func (h *AdminHandler) requireInstanceAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid, err := auth.UserID(r.Context())
 		if err != nil || uid == "" {
@@ -91,14 +88,14 @@ func (h *AdminHandler) requireAnyTeamAdmin(next http.Handler) http.Handler {
 		}
 		var hasAdmin bool
 		if err := h.DB.QueryRow(r.Context(), `
-			SELECT EXISTS(SELECT 1 FROM team_members WHERE user_id = $1 AND role = $2)
-		`, uid, "admin").Scan(&hasAdmin); err != nil {
+			SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_instance_admin)
+		`, uid).Scan(&hasAdmin); err != nil {
 			logErr("admin gate query", err)
 			writeError(w, http.StatusInternalServerError, "internal", "Failed to verify admin status")
 			return
 		}
 		if !hasAdmin {
-			writeError(w, http.StatusForbidden, "forbidden", "Instance admin endpoints require team-admin role on at least one team")
+			writeError(w, http.StatusForbidden, "forbidden", "Instance admin endpoints require instance-admin role")
 			return
 		}
 		next.ServeHTTP(w, r)

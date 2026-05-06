@@ -55,7 +55,7 @@ These are explicitly stubbed in the dashboard fork (entitlements report everythi
 ### Postgres schema
 
 Tables:
-- `users` — id, email (unique), password_hash, name, created_at
+- `users` — id, email (unique), password_hash, name, is_instance_admin, created_at
 - `teams` — id, name, slug (unique), creator_user_id, created_at
 - `team_members` — team_id, user_id, role (`admin`/`member`), created_at
 - `projects` — id, team_id, name, slug (unique per team), created_at

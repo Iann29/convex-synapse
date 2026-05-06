@@ -64,8 +64,8 @@ func (h *MeHandler) me(w http.ResponseWriter, r *http.Request) {
 	}
 	var u models.User
 	err = h.DB.QueryRow(r.Context(), `
-		SELECT id, email, name, created_at, updated_at FROM users WHERE id = $1
-	`, uid).Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt, &u.UpdatedAt)
+		SELECT id, email, name, is_instance_admin, created_at, updated_at FROM users WHERE id = $1
+	`, uid).Scan(&u.ID, &u.Email, &u.Name, &u.IsInstanceAdmin, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "user_not_found", "User no longer exists")
 		return
@@ -109,8 +109,8 @@ func (h *MeHandler) updateProfileName(w http.ResponseWriter, r *http.Request) {
 	var u models.User
 	err = h.DB.QueryRow(r.Context(), `
 		UPDATE users SET name = $1, updated_at = now() WHERE id = $2
-		RETURNING id, email, name, created_at, updated_at
-	`, req.Name, uid).Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt, &u.UpdatedAt)
+		RETURNING id, email, name, is_instance_admin, created_at, updated_at
+	`, req.Name, uid).Scan(&u.ID, &u.Email, &u.Name, &u.IsInstanceAdmin, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "user_not_found", "User no longer exists")
 		return
@@ -236,10 +236,10 @@ func (h *MeHandler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 // — bookmarked endpoint for the cloud dashboard's existing client code.
 
 type memberDataResp struct {
-	Teams           []models.Team       `json:"teams"`
-	Projects        []models.Project    `json:"projects"`
-	Deployments     []models.Deployment `json:"deployments"`
-	OptInsToAccept  []any               `json:"optInsToAccept"`
+	Teams          []models.Team       `json:"teams"`
+	Projects       []models.Project    `json:"projects"`
+	Deployments    []models.Deployment `json:"deployments"`
+	OptInsToAccept []any               `json:"optInsToAccept"`
 }
 
 func (h *MeHandler) memberData(w http.ResponseWriter, r *http.Request) {
