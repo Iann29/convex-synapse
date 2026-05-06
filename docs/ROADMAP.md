@@ -144,10 +144,10 @@ behind it needs to land), so adding them is a runtime-only change.
   drive `docker kill` against the active replica from the
   `SYNAPSE_HA_E2E=1` test and assert traffic flows to the standby
   within 60s.
-- [ ] Active health probe in `internal/proxy/`. Today
-  `last_seen_active_at` is unset by anyone — the picker falls back to
-  `replica_index ASC`. A 2s probe loop hitting `/api/check_admin_key`
-  populates the column so the picker stabilises on the lease holder.
+- [x] Active health probe in `internal/proxy/`. A 2s probe loop hits
+  `/api/check_admin_key` on each running HA replica and populates
+  `last_seen_active_at`, so the proxy picker stabilises on the current
+  lease holder instead of falling back to `replica_index ASC`.
 
 ## v1.0 — "Safe to depend on" 🚀 IN PROGRESS
 

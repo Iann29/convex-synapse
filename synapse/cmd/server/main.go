@@ -275,6 +275,16 @@ func run() error {
 		}
 	}
 
+	if cfg.HAEnabled {
+		go (&proxy.HealthProbe{
+			DB:            pool,
+			UseNetworkDNS: cfg.HealthcheckViaNetwork,
+			Period:        2 * time.Second,
+			Timeout:       1500 * time.Millisecond,
+			Logger:        logger,
+		}).Run(rootCtx)
+	}
+
 	// Top-level routing decision tree:
 	//
 	//   1. If BaseDomain is set AND r.Host matches `<sub>.<base>` →
