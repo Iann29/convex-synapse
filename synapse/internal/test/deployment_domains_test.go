@@ -37,6 +37,7 @@ type listDomainsResp struct {
 type domainsFixture struct {
 	owner        *User
 	team         teamResp
+	projectID    string
 	deployment   string
 	deploymentID string
 }
@@ -47,7 +48,7 @@ func newDomainsFixture(t *testing.T, h *Harness, deployment string, port int) do
 	team := createTeam(t, h, owner.AccessToken, "Domains Co "+deployment)
 	proj := createProject(t, h, owner.AccessToken, team.Slug, "P-"+deployment)
 	depID := h.SeedDeployment(proj.ID, deployment, "prod", "running", true, owner.ID, port, "")
-	return domainsFixture{owner: owner, team: team, deployment: deployment, deploymentID: depID}
+	return domainsFixture{owner: owner, team: team, projectID: proj.ID, deployment: deployment, deploymentID: depID}
 }
 
 func TestDomains_List_Empty(t *testing.T) {
@@ -124,15 +125,15 @@ func TestDomains_Add_InvalidDomain(t *testing.T) {
 	f := newDomainsFixture(t, h, "dom-bad-3333", 3505)
 
 	bad := []string{
-		"",                       // empty
-		" ",                      // whitespace
-		"localhost",              // single label
-		"http://example.com",     // scheme
-		"example.com:8080",       // port
-		"example.com/path",       // path
-		"-bad.example.com",       // leading hyphen on label
-		"bad-.example.com",       // trailing hyphen on label
-		"foo bar.example.com",    // space
+		"",                    // empty
+		" ",                   // whitespace
+		"localhost",           // single label
+		"http://example.com",  // scheme
+		"example.com:8080",    // port
+		"example.com/path",    // path
+		"-bad.example.com",    // leading hyphen on label
+		"bad-.example.com",    // trailing hyphen on label
+		"foo bar.example.com", // space
 	}
 	for _, d := range bad {
 		env := h.AssertStatus(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",

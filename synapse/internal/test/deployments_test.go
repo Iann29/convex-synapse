@@ -454,6 +454,47 @@ func TestDeployments_CreateReturnsImmediatelyAndProvisionsAsync(t *testing.T) {
 	}
 }
 
+func TestDeployments_CreateAppliesProjectEnvVarsToProvisionSpec(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Env Runtime Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "EnvRuntime")
+
+	h.DoJSON(http.MethodPost,
+		"/v1/projects/"+proj.ID+"/update_default_environment_variables",
+		owner.AccessToken,
+		map[string]any{"changes": []map[string]any{
+			{"op": "set", "name": "SHARED", "value": "yes"},
+			{"op": "set", "name": "PROD_ONLY", "value": "prod", "deploymentTypes": []string{"prod"}},
+			{"op": "set", "name": "DEV_ONLY", "value": "dev", "deploymentTypes": []string{"dev"}},
+			{"op": "set", "name": "CUSTOM_ONLY", "value": "custom", "deploymentTypes": []string{"custom"}},
+		}},
+		http.StatusOK, nil)
+
+	var got deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken, map[string]string{"type": "prod"}, http.StatusCreated, &got)
+	waitForStatus(t, h, got.Name, "running", 5*time.Second)
+
+	specs := h.Docker.ProvisionedSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("expected 1 Provision call, got %d (%+v)", len(specs), specs)
+	}
+	env := specs[0].EnvVars
+	if env["SHARED"] != "yes" {
+		t.Errorf("SHARED env: got %q want yes", env["SHARED"])
+	}
+	if env["PROD_ONLY"] != "prod" {
+		t.Errorf("PROD_ONLY env: got %q want prod", env["PROD_ONLY"])
+	}
+	if _, ok := env["DEV_ONLY"]; ok {
+		t.Errorf("DEV_ONLY should not apply to prod deployment: %+v", env)
+	}
+	if _, ok := env["CUSTOM_ONLY"]; ok {
+		t.Errorf("CUSTOM_ONLY should not apply to prod deployment: %+v", env)
+	}
+}
+
 // TestDeployments_CreateAsyncFailureMarksRowFailed covers the unhappy path:
 // FakeDocker returns an error from Provision, so the goroutine should
 // transition the row to "failed" (not leave it stuck in "provisioning").

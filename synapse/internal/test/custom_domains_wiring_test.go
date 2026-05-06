@@ -350,12 +350,22 @@ func TestProxy_DomainCacheInvalidation(t *testing.T) {
 // run after the response is written.
 func expectRestart(t *testing.T, fd *FakeDocker, deploymentName string) []string {
 	t.Helper()
+	envs := expectRestartEnvVars(t, fd, deploymentName)
+	out := make([]string, 0, len(envs))
+	for _, env := range envs {
+		out = append(out, env["CORS_ALLOWED_ORIGINS"])
+	}
+	return out
+}
+
+func expectRestartEnvVars(t *testing.T, fd *FakeDocker, deploymentName string) []map[string]string {
+	t.Helper()
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
-		var matched []string
+		var matched []map[string]string
 		for _, s := range fd.RecreatedSpecs() {
 			if s.Name == deploymentName {
-				matched = append(matched, s.EnvVars["CORS_ALLOWED_ORIGINS"])
+				matched = append(matched, s.EnvVars)
 			}
 		}
 		if len(matched) > 0 {
@@ -455,6 +465,33 @@ func TestDomains_Restart_OnDeleteActive(t *testing.T) {
 		if v != "" {
 			t.Errorf("post-delete CORS=%q want empty", v)
 		}
+	}
+}
+
+func TestDomains_RestartPreservesProjectEnvVars(t *testing.T) {
+	h := Setup(t)
+	f := newDomainsFixture(t, h, "dom-env-keep-5555", 4606)
+
+	h.DoJSON(http.MethodPost,
+		"/v1/projects/"+f.projectID+"/update_default_environment_variables",
+		f.owner.AccessToken,
+		map[string]any{"changes": []map[string]any{
+			{"op": "set", "name": "PROJECT_SECRET", "value": "kept", "deploymentTypes": []string{"prod"}},
+		}},
+		http.StatusOK, nil)
+	id := seedActiveDomain(t, h, f.deploymentID, "env-delete.example.com", "api")
+
+	h.AssertStatus(http.MethodDelete,
+		"/v1/deployments/"+f.deployment+"/domains/"+id,
+		f.owner.AccessToken, nil, http.StatusNoContent)
+
+	envs := expectRestartEnvVars(t, h.Docker, f.deployment)
+	last := envs[len(envs)-1]
+	if last["PROJECT_SECRET"] != "kept" {
+		t.Errorf("PROJECT_SECRET env: got %q want kept (all env=%+v)", last["PROJECT_SECRET"], last)
+	}
+	if got := last["CORS_ALLOWED_ORIGINS"]; got != "" {
+		t.Errorf("CORS_ALLOWED_ORIGINS after deleting last active domain: got %q want empty", got)
 	}
 }
 
