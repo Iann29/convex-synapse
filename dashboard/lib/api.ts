@@ -104,7 +104,9 @@ export type CliCredentials = {
 
 // DeployKey mirrors models.DeployKey on the backend. `adminKey` is only
 // populated on the create response (operator sees it once); subsequent
-// list responses see only the `prefix` chip.
+// list responses see only the `prefix` chip. Revoke rotates deployment
+// credentials, so every previously issued deploy key for that deployment
+// is invalidated together.
 export type DeployKey = {
   id: string;
   deploymentId: string;

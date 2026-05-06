@@ -70,7 +70,7 @@ function DeployKeysPanelExpanded({
   const revoke = async (key: DeployKey) => {
     if (
       !confirm(
-        `Revoke deploy key "${key.name}"?\n\nNote: this hides the key from the dashboard but does NOT immediately invalidate it on the Convex backend. To actually disable the key, rotate the deployment.`,
+        `Revoke deploy key "${key.name}"?\n\nSynapse will rotate this deployment's credentials and restart its container. All existing deploy keys for this deployment will stop working.`,
       )
     ) {
       return;
@@ -124,11 +124,9 @@ function DeployKeysPanelExpanded({
         </div>
 
         <p className="rounded border border-yellow-900/60 bg-yellow-900/20 px-3 py-2 text-[11px] text-yellow-200">
-          <span className="font-semibold">Caminho 1:</span> revoke removes a
-          key from this list, but it does not immediately invalidate the
-          credential on the Convex backend (admin keys are stateless on the
-          backend). To make a leaked key actually stop working, rotate the
-          deployment.
+          Revoking a deploy key rotates this deployment's credentials and
+          restarts its container. All existing deploy keys for this deployment
+          stop working after the rotation.
         </p>
 
         {error && (

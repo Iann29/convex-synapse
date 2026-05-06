@@ -13,13 +13,10 @@
 --   (new column)     admin_key_prefix (first 8 chars after "<name>|" — display)
 --   (new column)     revoked_at       (NULL = active)
 --
--- IMPORTANT: revoke is best-effort — the Convex backend authenticates
--- admin keys by signature against INSTANCE_SECRET (stateless), so we
--- cannot per-key revoke without rotating the deployment's instance
--- secret. revoked_at hides the row from the dashboard list; real
--- invalidation requires a deployment-wide rotation. The dashboard
--- surfaces that gotcha. A future "tier 2" with Synapse in the request
--- path would close the gap.
+-- Revoke rotates the deployment's INSTANCE_SECRET and recreates the managed
+-- container. Because the Convex backend authenticates admin keys by signature
+-- against that stateless secret, one rotation invalidates every deploy key
+-- minted before it; revoked_at marks all active rows for the deployment.
 --
 -- The pre-existing UNIQUE constraint on token_hash was a global
 -- collision check. Hashes of admin keys (which embed the deployment

@@ -496,6 +496,7 @@ Errors:
 
 ### `POST /v1/deployments/{name}/deploy_keys` ✅ (admins only)
 
+
 Body: `{name}`. Returns `{id, name, adminKey, prefix, envSnippet,
 exportSnippet}`. `adminKey` is shown once. Deploy keys are supported only
 for running, Synapse-managed, single-replica deployments.
@@ -507,10 +508,10 @@ createdByName?, createTime}]}`. The full key is never returned after create.
 
 ### `POST /v1/deployments/{name}/deploy_keys/{id}/revoke` ✅ (admins only)
 
-Revocation is deployment-wide. The current runtime rotates the deployment
-as a whole to invalidate previously minted admin keys; older checkouts only
-hid revoked rows because Convex admin keys are statelessly verified against
-`INSTANCE_SECRET`.
+Revokes a deploy key by rotating the deployment's `INSTANCE_SECRET`, updating
+the primary admin key, recreating the managed container, and marking every
+active deploy key for that deployment revoked. This is deployment-wide because
+the Convex backend validates admin keys statelessly against `INSTANCE_SECRET`.
 
 ### `POST /v1/deployments/{name}/access_tokens` ✅ (admins only)
 
