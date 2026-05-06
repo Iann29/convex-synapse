@@ -11,8 +11,8 @@
 --   4. atomic swap (flip ha_enabled, mark old replica stopped, swap
 --      proxy address)
 --
--- The endpoint reserves the API surface today; the worker's
--- step-2-through-4 mechanical work is bookmarked for a follow-up.
+-- The endpoint returns 202 once this job is queued; the worker owns
+-- the export/import mechanics and marks the job done/failed.
 
 ALTER TABLE provisioning_jobs
     DROP CONSTRAINT provisioning_jobs_kind_check;

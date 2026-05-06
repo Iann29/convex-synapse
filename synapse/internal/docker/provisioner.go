@@ -1,12 +1,14 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -83,6 +85,19 @@ type DeploymentInfo struct {
 	DeploymentURL string
 }
 
+// SnapshotMigrationSpec describes the Convex backup/restore hop used when a
+// SQLite single-replica deployment is upgraded to HA. The docker client runs
+// the official Convex CLI in a throwaway container on the Synapse network so
+// it can reach both the old single-replica backend and the new HA replicas by
+// container DNS name.
+type SnapshotMigrationSpec struct {
+	DeploymentName string
+	SourceURL      string
+	SourceAdminKey string
+	TargetURLs     []string
+	TargetAdminKey string
+}
+
 // ContainerName is the deterministic Docker container name for a given
 // deployment + replica. Exported so the proxy resolver can build the
 // in-network address (`http://convex-{name}-{idx}:3210`) without
@@ -120,21 +135,25 @@ func volumeName(deploymentName string) string {
 // Pulling at provision time would add seconds to every create_deployment;
 // callers should call this once at startup OR best-effort on first use.
 func (c *Client) EnsureImage(ctx context.Context) error {
+	return c.ensureImage(ctx, c.BackendImage)
+}
+
+func (c *Client) ensureImage(ctx context.Context, imageName string) error {
 	images, err := c.api.ImageList(ctx, image.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list images: %w", err)
 	}
 	for _, img := range images {
 		for _, tag := range img.RepoTags {
-			if tag == c.BackendImage {
+			if tag == imageName {
 				return nil
 			}
 		}
 	}
-	c.logger.Info("pulling backend image", "image", c.BackendImage)
-	rc, err := c.api.ImagePull(ctx, c.BackendImage, image.PullOptions{})
+	c.logger.Info("pulling docker image", "image", imageName)
+	rc, err := c.api.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
-		return fmt.Errorf("pull %s: %w", c.BackendImage, err)
+		return fmt.Errorf("pull %s: %w", imageName, err)
 	}
 	defer rc.Close()
 	// Drain the response so the pull actually completes.
@@ -142,6 +161,128 @@ func (c *Client) EnsureImage(ctx context.Context) error {
 		return fmt.Errorf("drain pull stream: %w", err)
 	}
 	return nil
+}
+
+// MigrateSnapshot exports a backup from the old single-replica backend and
+// imports it into one of the freshly-provisioned HA replicas. Synapse's own
+// image is distroless and intentionally has no node/npm, so the CLI runs in a
+// short-lived Node container attached to the same Docker network as the
+// backends. The archive stays inside that container and is deleted with it.
+func (c *Client) MigrateSnapshot(ctx context.Context, spec SnapshotMigrationSpec) error {
+	if spec.SourceURL == "" || spec.SourceAdminKey == "" || spec.TargetAdminKey == "" || len(spec.TargetURLs) == 0 {
+		return errors.New("snapshot migration: missing source or target credentials")
+	}
+
+	const cliImage = "node:22-alpine"
+	if err := c.ensureImage(ctx, cliImage); err != nil {
+		return err
+	}
+
+	targets := make([]string, 0, len(spec.TargetURLs))
+	for _, target := range spec.TargetURLs {
+		if strings.TrimSpace(target) != "" {
+			targets = append(targets, strings.TrimSpace(target))
+		}
+	}
+	if len(targets) == 0 {
+		return errors.New("snapshot migration: no target URLs")
+	}
+
+	script := `
+set -eu
+mkdir -p /backup
+CONVEX_SELF_HOSTED_URL="$SOURCE_CONVEX_SELF_HOSTED_URL" \
+CONVEX_SELF_HOSTED_ADMIN_KEY="$SOURCE_CONVEX_SELF_HOSTED_ADMIN_KEY" \
+  npx --yes convex@latest export --path /backup
+archive="$(find /backup -maxdepth 1 -type f -name '*.zip' | sort | tail -n 1)"
+if [ -z "$archive" ]; then
+  echo "convex export completed without producing a zip archive" >&2
+  exit 1
+fi
+import_ok=0
+while IFS= read -r target; do
+  [ -n "$target" ] || continue
+  if CONVEX_SELF_HOSTED_URL="$target" \
+     CONVEX_SELF_HOSTED_ADMIN_KEY="$TARGET_CONVEX_SELF_HOSTED_ADMIN_KEY" \
+       npx --yes convex@latest import --replace "$archive"; then
+    import_ok=1
+    break
+  fi
+done <<'TARGET_URLS_EOF'
+` + strings.Join(targets, "\n") + `
+TARGET_URLS_EOF
+if [ "$import_ok" != "1" ]; then
+  echo "convex import failed for every HA target replica" >&2
+  exit 1
+fi
+`
+
+	containerName := fmt.Sprintf("synapse-upgrade-%s-%d", spec.DeploymentName, time.Now().UnixNano())
+	resp, err := c.api.ContainerCreate(ctx, &container.Config{
+		Image: cliImage,
+		Cmd:   []string{"sh", "-lc", script},
+		Env: []string{
+			"SOURCE_CONVEX_SELF_HOSTED_URL=" + spec.SourceURL,
+			"SOURCE_CONVEX_SELF_HOSTED_ADMIN_KEY=" + spec.SourceAdminKey,
+			"TARGET_CONVEX_SELF_HOSTED_ADMIN_KEY=" + spec.TargetAdminKey,
+			"CONVEX_DISABLE_ANALYTICS=1",
+		},
+		Labels: map[string]string{
+			"synapse.managed":    "true",
+			"synapse.task":       "upgrade_to_ha",
+			"synapse.deployment": spec.DeploymentName,
+		},
+	}, &container.HostConfig{}, &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			c.Network: {},
+		},
+	}, nil, containerName)
+	if err != nil {
+		return fmt.Errorf("create migration container: %w", err)
+	}
+	defer func() {
+		_ = c.api.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
+	}()
+
+	if err := c.api.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("start migration container: %w", err)
+	}
+
+	statusCh, errCh := c.api.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("wait migration container: %w", err)
+		}
+	case status := <-statusCh:
+		if status.StatusCode != 0 {
+			return fmt.Errorf("snapshot migration failed: %s", c.migrationLogs(ctx, resp.ID, spec))
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (c *Client) migrationLogs(ctx context.Context, containerID string, spec SnapshotMigrationSpec) string {
+	rc, err := c.api.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "80",
+	})
+	if err != nil {
+		return "could not read migration logs: " + err.Error()
+	}
+	defer rc.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, rc)
+	out := buf.String()
+	out = strings.ReplaceAll(out, spec.SourceAdminKey, "[redacted]")
+	out = strings.ReplaceAll(out, spec.TargetAdminKey, "[redacted]")
+	if len(out) > 4000 {
+		out = out[len(out)-4000:]
+	}
+	return strings.TrimSpace(out)
 }
 
 // Provision creates and starts a Convex backend container per spec.
@@ -294,6 +435,21 @@ func (c *Client) waitHealthy(ctx context.Context, baseURL string, timeout time.D
 // for HA deployments.
 func (c *Client) Destroy(ctx context.Context, deploymentName string) error {
 	return c.destroy(ctx, containerName(deploymentName), volumeName(deploymentName), true)
+}
+
+// Stop halts the legacy single-replica container without removing it or its
+// SQLite volume. upgrade_to_ha uses this after the snapshot import succeeds:
+// the HA replicas become the live backends while the old container remains on
+// disk for operator inspection or manual rollback.
+func (c *Client) Stop(ctx context.Context, deploymentName string) error {
+	timeout := 10
+	if err := c.api.ContainerStop(ctx, containerName(deploymentName), container.StopOptions{Timeout: &timeout}); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("stop container %s: %w", containerName(deploymentName), err)
+	}
+	return nil
 }
 
 // DestroyReplica removes a single replica's container + (optional) volume.
