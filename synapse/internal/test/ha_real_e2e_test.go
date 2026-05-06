@@ -3,11 +3,17 @@ package synapsetest
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/Iann29/synapse/internal/api"
+	dockerprov "github.com/Iann29/synapse/internal/docker"
+	"github.com/Iann29/synapse/internal/proxy"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -20,19 +26,16 @@ import (
 //
 //	docker compose --profile ha up -d   # starts minio + backend-postgres
 //	SYNAPSE_HA_E2E=1 \
-//	  SYNAPSE_HA_BACKEND_POSTGRES_URL='postgres://convex:convex@localhost:5433/postgres?sslmode=disable' \
-//	  SYNAPSE_HA_BACKEND_S3_ENDPOINT='http://localhost:9000' \
+//	  SYNAPSE_HA_BACKEND_POSTGRES_URL='postgres://convex:convex@backend-postgres:5432/postgres?sslmode=disable' \
+//	  SYNAPSE_HA_BACKEND_POSTGRES_PROBE_URL='postgres://convex:convex@localhost:5433/postgres?sslmode=disable' \
+//	  SYNAPSE_HA_BACKEND_S3_ENDPOINT='http://minio:9000' \
 //	  SYNAPSE_HA_BACKEND_S3_ACCESS_KEY=minioadmin \
 //	  SYNAPSE_HA_BACKEND_S3_SECRET_KEY=minioadmin \
 //	  go test ./synapse/internal/test/ -run TestHA_RealBackend_Failover -count=1 -v
 //
-// The test uses the live FakeDocker harness today — replacing FakeDocker
-// with a real *dockerprov.Client is a follow-up in chunk 10. Right now
-// it confirms only the *control-plane* path (HA create -> 2 replica
-// rows -> 2 jobs -> deployments.status flip) works end-to-end against
-// a real Postgres-backed storage row, which is the easiest piece to
-// regress when the cluster config / encryption / per-deployment
-// derivation logic drifts.
+// The test injects a real *dockerprov.Client into the harness, provisions
+// real Convex backend containers, kills replica 0, and asserts the proxy
+// still reaches replica 1.
 func TestHA_RealBackend_Failover(t *testing.T) {
 	if os.Getenv("SYNAPSE_HA_E2E") != "1" {
 		t.Skip("HA real-backend e2e skipped (set SYNAPSE_HA_E2E=1 to run; see docs/HA_TESTING.md)")
@@ -48,27 +51,57 @@ func TestHA_RealBackend_Failover(t *testing.T) {
 	s3End := requireEnv("SYNAPSE_HA_BACKEND_S3_ENDPOINT")
 	s3Key := requireEnv("SYNAPSE_HA_BACKEND_S3_ACCESS_KEY")
 	s3Sec := requireEnv("SYNAPSE_HA_BACKEND_S3_SECRET_KEY")
+	pgProbeURL := os.Getenv("SYNAPSE_HA_BACKEND_POSTGRES_PROBE_URL")
+	if pgProbeURL == "" {
+		pgProbeURL = pgURL
+	}
 
 	// Verify the real backing Postgres is actually reachable before
 	// burning test time provisioning containers — easier to debug a
 	// flake here than later in the worker.
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer probeCancel()
-	probeConn, err := pgx.Connect(probeCtx, pgURL)
+	probeConn, err := pgx.Connect(probeCtx, pgProbeURL)
 	if err != nil {
-		t.Skipf("HA backend Postgres unreachable at %s: %v", pgURL, err)
+		t.Skipf("HA backend Postgres unreachable at %s: %v", pgProbeURL, err)
 	}
 	_ = probeConn.Close(probeCtx)
 
-	h := SetupHA(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	dockerHost := os.Getenv("SYNAPSE_DOCKER_HOST")
+	if dockerHost == "" {
+		dockerHost = "unix:///var/run/docker.sock"
+	}
+	backendImage := os.Getenv("SYNAPSE_BACKEND_IMAGE")
+	if backendImage == "" {
+		backendImage = "ghcr.io/get-convex/convex-backend:latest"
+	}
+	network := os.Getenv("SYNAPSE_DOCKER_NETWORK")
+	if network == "" {
+		network = "synapse-network"
+	}
+	dockerClient, err := dockerprov.NewClient(dockerHost, backendImage, network, logger)
+	if err != nil {
+		t.Skipf("Docker unavailable for HA real e2e: %v", err)
+	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pingCancel()
+	if err := dockerClient.Ping(pingCtx); err != nil {
+		t.Skipf("Docker ping failed for HA real e2e: %v", err)
+	}
 
-	// Override the HA cluster config the harness baked in with the live
-	// values from the env. The harness's RouterDeps was already built,
-	// so we can't change it after the fact — rather than refactor the
-	// harness right now we drive this test through the underlying SQL,
-	// confirming the encrypted-storage row path matches reality. Real
-	// Provision-against-live-containers lands in chunk 10 alongside
-	// the harness option to inject *dockerprov.Client.
+	h := SetupHAWithOpts(t, SetupOpts{
+		Docker: dockerClient,
+		HA: api.HAConfig{
+			Enabled:             true,
+			BackendPostgresURL:  pgURL,
+			BackendS3Endpoint:   s3End,
+			BackendS3Region:     "us-east-1",
+			BackendS3AccessKey:  s3Key,
+			BackendS3SecretKey:  s3Sec,
+			BackendBucketPrefix: "convex",
+		},
+	})
 
 	owner := h.RegisterRandomUser()
 	team := createTeam(t, h, owner.AccessToken, "HA Real Co")
@@ -91,9 +124,64 @@ func TestHA_RealBackend_Failover(t *testing.T) {
 		t.Fatalf("HA create: got haEnabled=%v replicaCount=%d, want true/2",
 			got.HAEnabled, got.ReplicaCount)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_ = dockerClient.DestroyReplica(cleanupCtx, got.Name, 0, true)
+		_ = dockerClient.DestroyReplica(cleanupCtx, got.Name, 1, true)
+	})
 
-	// Real-Provision-against-real-containers + docker-kill failover
-	// validation lands in chunk 10. For now we've confirmed the
-	// control-plane path commits storage rows without panicking on a
-	// real Postgres URL.
+	waitForStatus(t, h, got.Name, "running", 5*time.Minute)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var running int
+		_ = h.DB.QueryRow(h.rootCtx, `
+			SELECT count(*) FROM deployment_replicas
+			 WHERE deployment_id = $1 AND status = 'running'
+		`, got.ID).Scan(&running)
+		if running == 2 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	var running int
+	if err := h.DB.QueryRow(h.rootCtx, `
+		SELECT count(*) FROM deployment_replicas
+		 WHERE deployment_id = $1 AND status = 'running'
+	`, got.ID).Scan(&running); err != nil {
+		t.Fatalf("count running replicas: %v", err)
+	}
+	if running != 2 {
+		t.Fatalf("running replicas=%d want 2", running)
+	}
+
+	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: 10 * time.Millisecond}
+	proxySrv := httptest.NewServer(proxy.Handler(resolver, logger, ""))
+	t.Cleanup(proxySrv.Close)
+
+	assertVersion := func(label string) {
+		reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, proxySrv.URL+"/d/"+got.Name+"/version", nil)
+		if err != nil {
+			t.Fatalf("%s request: %v", label, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s GET /version: %v", label, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			t.Fatalf("%s /version status=%d want 2xx", label, resp.StatusCode)
+		}
+	}
+
+	assertVersion("before failover")
+	killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer killCancel()
+	if err := dockerClient.DestroyReplica(killCtx, got.Name, 0, true); err != nil {
+		t.Fatalf("destroy replica 0: %v", err)
+	}
+	resolver.Invalidate(got.Name)
+	assertVersion("after replica 0 destroy")
 }

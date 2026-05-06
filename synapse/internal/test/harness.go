@@ -83,6 +83,11 @@ func SetupHA(t *testing.T) *Harness {
 	return setup(t, true, SetupOpts{})
 }
 
+func SetupHAWithOpts(t *testing.T, opts SetupOpts) *Harness {
+	t.Helper()
+	return setup(t, true, opts)
+}
+
 // Setup creates a fresh database, applies migrations, and returns a Harness
 // wired to a real chi router and httptest.Server. All resources are released
 // via t.Cleanup.
@@ -125,6 +130,17 @@ type SetupOpts struct {
 	// GitHub. Production wiring leaves both empty (defaults apply).
 	GitHubRepo    string
 	GitHubAPIBase string
+	// Docker overrides the default FakeDocker in both the API router and
+	// provisioner worker. Gated real-backend e2e tests pass a
+	// *dockerprov.Client here; normal tests leave it nil.
+	Docker api.Provisioner
+	// HA overrides the default HA cluster config used by SetupHA. Leave
+	// zero to use the fake cluster endpoints.
+	HA api.HAConfig
+	// HealthcheckViaNetwork mirrors api.RouterDeps and provisioner.Config
+	// for tests that run Synapse inside the same Docker network as the
+	// provisioned backends.
+	HealthcheckViaNetwork bool
 }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
@@ -188,15 +204,28 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 
 	jwt := auth.NewJWTIssuer([]byte(jwtSecret), 15*time.Minute, 24*time.Hour)
 	fake := NewFakeDocker()
+	var dockerForRouter api.Provisioner = fake
+	var dockerForWorker provisioner.Provisioner = fake
+	if opts.Docker != nil {
+		dockerForRouter = opts.Docker
+		// opts.Docker is typed api.Provisioner but real injectors
+		// (FakeDocker, *dockerprov.Client) also satisfy
+		// provisioner.Provisioner — assert and fail loudly if not.
+		pw, ok := opts.Docker.(provisioner.Provisioner)
+		if !ok {
+			t.Fatalf("opts.Docker (%T) must implement provisioner.Provisioner", opts.Docker)
+		}
+		dockerForWorker = pw
+	}
 
 	deps := api.RouterDeps{
 		Logger:                logger,
 		DB:                    pool,
 		JWT:                   jwt,
-		Docker:                fake,
+		Docker:                dockerForRouter,
 		PortRangeMin:          3210,
 		PortRangeMax:          3500,
-		HealthcheckViaNetwork: false,
+		HealthcheckViaNetwork: opts.HealthcheckViaNetwork,
 		AllowedOrigins:        "*",
 		Version:               "test",
 		PublicURL:             opts.PublicURL,
@@ -222,14 +251,20 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		if berr != nil {
 			t.Fatalf("crypto.New: %v", berr)
 		}
-		deps.HA = api.HAConfig{
-			Enabled:             true,
-			BackendPostgresURL:  "postgres://synapse:synapse@cluster-pg.test:5432/convex_admin?sslmode=disable",
-			BackendS3Endpoint:   "http://minio.test:9000",
-			BackendS3Region:     "us-east-1",
-			BackendS3AccessKey:  "test-access-key",
-			BackendS3SecretKey:  "test-secret-key",
-			BackendBucketPrefix: "convex",
+		deps.HA = opts.HA
+		if !deps.HA.Enabled {
+			deps.HA = api.HAConfig{
+				Enabled:             true,
+				BackendPostgresURL:  "postgres://synapse:synapse@cluster-pg.test:5432/convex_admin?sslmode=disable",
+				BackendS3Endpoint:   "http://minio.test:9000",
+				BackendS3Region:     "us-east-1",
+				BackendS3AccessKey:  "test-access-key",
+				BackendS3SecretKey:  "test-secret-key",
+				BackendBucketPrefix: "convex",
+			}
+		}
+		if deps.HA.BackendS3Region == "" {
+			deps.HA.BackendS3Region = "us-east-1"
 		}
 		deps.Crypto = box
 	}
@@ -241,17 +276,26 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 	// don't care about provisioning still get one running; it's harmless
 	// when there are no jobs. Use 50ms poll so e2e flow completes
 	// snappily within test timeouts.
+	jobTimeout := 30 * time.Second
+	if opts.Docker != nil {
+		jobTimeout = 5 * time.Minute
+	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
+	var snapshotMigrator provisioner.SnapshotMigrator = fake
+	if sm, ok := dockerForWorker.(provisioner.SnapshotMigrator); ok {
+		snapshotMigrator = sm
+	}
 	pworker := &provisioner.Worker{
 		DB:               pool,
-		Docker:           fake,
-		SnapshotMigrator: fake,
+		Docker:           dockerForWorker,
+		SnapshotMigrator: snapshotMigrator,
 		Config: provisioner.Config{
-			PollInterval: 50 * time.Millisecond,
-			JobTimeout:   30 * time.Second,
-			NodeID:       "test-" + dbName,
-			PortRangeMin: 3210,
-			PortRangeMax: 3500,
+			PollInterval:          50 * time.Millisecond,
+			JobTimeout:            jobTimeout,
+			NodeID:                "test-" + dbName,
+			PortRangeMin:          3210,
+			PortRangeMax:          3500,
+			HealthcheckViaNetwork: opts.HealthcheckViaNetwork,
 		},
 		Logger: logger,
 	}

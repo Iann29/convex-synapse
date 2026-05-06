@@ -71,18 +71,20 @@ Restart Synapse: `docker compose up -d synapse`.
 
 ```bash
 SYNAPSE_HA_E2E=1 \
-  SYNAPSE_HA_BACKEND_POSTGRES_URL='postgres://convex:convex@localhost:5433/postgres?sslmode=disable' \
-  SYNAPSE_HA_BACKEND_S3_ENDPOINT='http://localhost:9000' \
+  SYNAPSE_HA_BACKEND_POSTGRES_URL='postgres://convex:convex@backend-postgres:5432/postgres?sslmode=disable' \
+  SYNAPSE_HA_BACKEND_POSTGRES_PROBE_URL='postgres://convex:convex@localhost:5433/postgres?sslmode=disable' \
+  SYNAPSE_HA_BACKEND_S3_ENDPOINT='http://minio:9000' \
   SYNAPSE_HA_BACKEND_S3_ACCESS_KEY=minioadmin \
   SYNAPSE_HA_BACKEND_S3_SECRET_KEY=minioadmin \
   go test ./synapse/internal/test/ -run TestHA_RealBackend_Failover -count=1 -v
 ```
 
-Today the test exercises the control-plane path against a real backing
-Postgres. Real `Provision`-against-real-containers + `docker kill` the
-active replica and assert failover lands in chunk 10 once the test
-harness gains an option to inject `*dockerprov.Client` instead of the
-FakeDocker stub.
+The `SYNAPSE_HA_BACKEND_*` values are what the Convex backend containers
+use from inside `synapse-network`; the optional `*_PROBE_URL` is only for
+the Go test process on the host to fail fast before provisioning. The test
+injects a real `*dockerprov.Client`, provisions two real backend
+containers, destroys replica 0, and verifies proxy traffic still reaches
+the standby.
 
 ## Tearing the HA profile down
 
