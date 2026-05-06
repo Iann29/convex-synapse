@@ -1,5 +1,9 @@
 # Roadmap
 
+Current test inventory as of 2026-05-06: 317 Go test functions, 50
+Playwright e2e tests, and 396 bats cases. Historical milestone counts below
+are left as per-PR deltas, not the current totals.
+
 ## v0.1 — "It runs end-to-end" ✅ DONE
 
 Getting a fresh user from `git clone` to a running Convex backend container
@@ -270,7 +274,7 @@ ship". Catalogue: `synapse/internal/api/not_supported.go`.
 | Profile (`/me`) | ✅ get / update_profile_name / delete_account / member_data / optins |
 | Teams | ✅ get / update / delete / list_projects / list_members / list_deployments / invites / accept / update_member_role / remove_member |
 | Projects | ✅ get / update (name+slug) / delete / transfer / env vars / list_deployments / **list/add/update_role/remove members (RBAC v1.0+)** |
-| Deployments | ✅ get / create / adopt / delete / auth / cli_credentials / deploy_keys / upgrade_to_ha / custom domains (v1.0) |
+| Deployments | ✅ get / create / adopt / delete / auth / cli_credentials / deploy_keys / custom domains (v1.0); 🔧 `upgrade_to_ha` validation route is reserved and returns 501 until the snapshot export/import worker lands |
 | Personal access tokens | ✅ user / team / project / app / deployment scopes + scope-aware auth middleware |
 | Team invites | ✅ list / cancel / accept (custom: opaque-token URL flow) |
 | Audit log | ✅ team-scoped read; admin-only |

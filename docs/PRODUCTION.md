@@ -140,12 +140,23 @@ For the Convex backend data itself: the SQLite file lives in
 or use `npx convex export` against each deployment if you need
 portable dumps.
 
-`./setup.sh backup` and `./setup.sh restore` are reserved for v0.6.1
-and will package both into a single tarball.
+Current installs should use `./setup.sh --backup` and
+`./setup.sh --restore=<archive|s3://...>`. The built-in flow packages
+Postgres metadata, deployment volumes, compose files, and optionally `.env`
+into a single archive; `--to-s3=s3://bucket/path/` uploads the archive after
+the local bundle is written.
 
 ## Upgrading
 
-For v0.6.0 (this milestone), the manual upgrade dance:
+Routine upgrades should use the lifecycle command:
+
+```bash
+cd /opt/synapse
+./setup.sh --upgrade
+```
+
+The dashboard auto-update flow calls the same command through the host-side
+updater daemon when it is installed. Manual fallback is still:
 
 ```bash
 cd /opt/synapse
@@ -158,9 +169,8 @@ Embedded migrations apply on startup — operator never runs them
 manually. The provisioner queue + advisory locks keep an in-flight
 deploy from being lost during the restart.
 
-`./setup.sh --upgrade` (reserved for **v0.6.1**) will wrap this with a
-health-check-based rollback if the new version fails to come up healthy
-within 60 s.
+`./setup.sh --upgrade` snapshots the old image IDs first and rolls back if
+the upgraded stack fails its health check.
 
 ## Common gotchas
 
@@ -174,12 +184,15 @@ within 60 s.
 
 ## What's NOT included today
 
-- Auto-renewing TLS for **per-deployment** custom domains (v1.0 — Caddy only terminates Synapse's own domain right now)
-- Multi-region replication (out of scope; lease design forbids it upstream — see V0_5_PLAN.md)
-- `./setup.sh --upgrade` / `--uninstall` / `--backup` (reserved for v0.6.1)
-- Hosted `curl -sf https://get.synapse.dev | sh` one-liner (reserved for v0.6.2)
-- Browser-driven first-run wizard (reserved for v0.6.3)
-- A K8s / Helm install path (v1.0)
+- Automated `upgrade_to_ha` for existing SQLite deployments. HA works at
+  create time; safe upgrade still needs a snapshot export/import worker.
+- Multi-region replication (out of scope; lease design forbids it upstream —
+  see V0_5_PLAN.md).
+- Scheduled backup retention. `setup.sh --backup [--to-s3=...]` exists;
+  operators still provide cron/systemd timers and retention policy.
+- A K8s / Helm install path.
+- Billing, SSO/SAML, Vercel/Discord integrations, and other Convex Cloud
+  account features intentionally cut from the self-hosted subset.
 
 ---
 
