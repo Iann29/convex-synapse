@@ -227,6 +227,7 @@ The v1.0 surface area takes Synapse from "works for one operator on a Hetzner bo
   - [x] Chunk 1 — `SYNAPSE_BASE_DOMAIN` config, `publicDeploymentURL` rewrite, proxy Host-header routing, `/v1/internal/tls_ask` endpoint. 14 new Go tests (139 → 146) (PR #35)
   - [x] Chunk 2 — `setup.sh --base-domain=<host>`, env.tmpl, DNS preflight (`check_base_domain` synthetic-subdomain probe), Caddy global `on_demand_tls { ask }`, new `caddy.wildcard` template appended to standalone + host fragments. 7 new bats (266 → 273) (PR #36)
   - [x] Chunk 3 — installer polish: `success_screen` reminds the operator about wildcard DNS when `--base-domain` was used (with copy-pasteable `dig` probe); `--status` shows a `Custom domains *.<host> (v1.0)` row when configured. No backend changes — `publicDeploymentURL` already emits the right URLs to the dashboard. 2 new bats (273 → 275) (PR #37)
+  - [x] HA CORS follow-up — active-domain changes now roll `CORS_ALLOWED_ORIGINS` across HA replicas one at a time using decrypted shared storage, so custom-domain browser traffic works for HA deployments too.
 
 ### 📋 Left to ship (priority order — operator can override)
 

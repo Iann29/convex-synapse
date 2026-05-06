@@ -520,6 +520,25 @@ func (c *Client) Recreate(ctx context.Context, spec DeploymentSpec) (*Deployment
 	return c.Provision(ctx, spec)
 }
 
+// RecreateReplica is the HA-aware variant of Recreate. It targets one
+// replica container by index and leaves any volume behind; normal HA
+// deployments keep state in Postgres + S3, and preserving a volume is the
+// least surprising fallback for any legacy HA row without Storage.
+func (c *Client) RecreateReplica(ctx context.Context, spec DeploymentSpec) (*DeploymentInfo, error) {
+	if !spec.HAReplica {
+		return nil, fmt.Errorf("recreate replica: HAReplica must be true")
+	}
+	cName := ContainerName(spec.Name, spec.ReplicaIndex, true)
+	timeout := 10
+	_ = c.api.ContainerStop(ctx, cName, container.StopOptions{Timeout: &timeout})
+	if err := c.api.ContainerRemove(ctx, cName, container.RemoveOptions{Force: true, RemoveVolumes: false}); err != nil {
+		if !isNotFound(err) {
+			return nil, fmt.Errorf("remove container %s: %w", cName, err)
+		}
+	}
+	return c.Provision(ctx, spec)
+}
+
 // RestartReplica is the HA-aware variant of Restart, addressing one
 // replica by index.
 func (c *Client) RestartReplica(ctx context.Context, deploymentName string, replicaIndex int) error {

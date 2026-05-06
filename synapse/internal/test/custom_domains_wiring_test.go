@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/proxy"
 )
 
@@ -378,6 +379,26 @@ func expectRestartEnvVars(t *testing.T, fd *FakeDocker, deploymentName string) [
 	return nil
 }
 
+func expectRecreateSpecs(t *testing.T, fd *FakeDocker, deploymentName string, want int) []dockerprov.DeploymentSpec {
+	t.Helper()
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		var matched []dockerprov.DeploymentSpec
+		for _, s := range fd.RecreatedSpecs() {
+			if s.Name == deploymentName {
+				matched = append(matched, s)
+			}
+		}
+		if len(matched) >= want {
+			return matched
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected %d Recreate calls for %q; got %v",
+		want, deploymentName, fd.RecreatedSpecs())
+	return nil
+}
+
 func TestDomains_Restart_OnDelete_RestartTriggered(t *testing.T) {
 	// Pre-seed two active rows on the same deployment, then delete
 	// one through the API. The handler should call Recreate, and
@@ -524,32 +545,46 @@ func TestDomains_NoRestart_OnDeletePending(t *testing.T) {
 	}
 }
 
-func TestDomains_NoRestart_OnHADeployment(t *testing.T) {
-	// HA deployments are deliberately skipped by rebuildCORSAndRestart —
-	// per-replica orchestration is out of scope for v1.1. Verify the
-	// handler logs + returns deploymentRestartTriggered=false even
-	// when an active row's deleted.
-	h := Setup(t)
+func TestDomains_Restart_OnHADeployment(t *testing.T) {
+	h := SetupHA(t)
 	owner := h.RegisterRandomUser()
 	team := createTeam(t, h, owner.AccessToken, "HA Domain Co")
 	proj := createProject(t, h, owner.AccessToken, team.Slug, "HA Domain")
-	depID := h.SeedDeployment(proj.ID, "ha-restart-skip-4444", "prod", "running",
-		true, owner.ID, 4605, "")
-	// Promote to HA after the fact — SeedDeployment seeds single-replica.
-	if _, err := h.DB.Exec(context.Background(),
-		`UPDATE deployments SET ha_enabled = TRUE, replica_count = 2 WHERE id = $1`, depID); err != nil {
-		t.Fatalf("promote ha: %v", err)
-	}
-	id := seedActiveDomain(t, h, depID, "ha-skip.example.com", "api")
+
+	var dep deploymentResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/create_deployment",
+		owner.AccessToken,
+		map[string]any{"type": "prod", "ha": true},
+		http.StatusCreated, &dep)
+	waitForStatus(t, h, dep.Name, "running", 5*time.Second)
+
+	keepID := seedActiveDomain(t, h, dep.ID, "ha-keep.example.com", "api")
+	dropID := seedActiveDomain(t, h, dep.ID, "ha-drop.example.com", "api")
+	_ = keepID
 
 	h.AssertStatus(http.MethodDelete,
-		"/v1/deployments/ha-restart-skip-4444/domains/"+id,
+		"/v1/deployments/"+dep.Name+"/domains/"+dropID,
 		owner.AccessToken, nil, http.StatusNoContent)
 
-	time.Sleep(100 * time.Millisecond)
-	for _, s := range h.Docker.RecreatedSpecs() {
-		if s.Name == "ha-restart-skip-4444" {
-			t.Errorf("did not expect Recreate for HA deployment; got %+v", s)
+	specs := expectRecreateSpecs(t, h.Docker, dep.Name, 2)
+	seen := map[int]bool{}
+	for _, s := range specs {
+		if !s.HAReplica {
+			t.Errorf("expected HAReplica=true, got %+v", s)
 		}
+		if s.Storage == nil {
+			t.Errorf("expected Storage on HA replica %d", s.ReplicaIndex)
+		}
+		seen[s.ReplicaIndex] = true
+		cors := s.EnvVars["CORS_ALLOWED_ORIGINS"]
+		if !strings.Contains(cors, "https://ha-keep.example.com") {
+			t.Errorf("replica %d CORS=%q want surviving domain", s.ReplicaIndex, cors)
+		}
+		if strings.Contains(cors, "ha-drop.example.com") {
+			t.Errorf("replica %d CORS=%q must not contain deleted domain", s.ReplicaIndex, cors)
+		}
+	}
+	if !seen[0] || !seen[1] {
+		t.Fatalf("expected rolling restart for replicas 0 and 1, got %v", seen)
 	}
 }
