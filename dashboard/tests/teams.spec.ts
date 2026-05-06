@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 import { truncateAll } from "./helpers/db";
 
 async function registerViaUI(page: Page) {
@@ -8,6 +8,26 @@ async function registerViaUI(page: Page) {
   await page.locator("#register-name").fill("Ian");
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page).toHaveURL(/\/teams\b/);
+}
+
+async function createTeamViaAPI(
+  request: APIRequestContext,
+  page: Page,
+  name: string,
+) {
+  const auth = await page.evaluate(() => {
+    const raw = window.localStorage.getItem("synapse.auth");
+    if (!raw) throw new Error("missing auth bundle");
+    return JSON.parse(raw) as { accessToken: string };
+  });
+  const apiBase =
+    process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "") ||
+    "http://localhost:8080";
+  const resp = await request.post(`${apiBase}/v1/teams/create_team`, {
+    headers: { Authorization: `Bearer ${auth.accessToken}` },
+    data: { name },
+  });
+  expect(resp.ok()).toBeTruthy();
 }
 
 test.beforeEach(async () => {
@@ -44,6 +64,21 @@ test("create team then create project", async ({ page }) => {
   await dialog.getByRole("button", { name: "Create", exact: true }).click();
 
   await expect(page.getByRole("link", { name: /my store/i })).toBeVisible();
+});
+
+test("teams page follows backend pagination", async ({ page, request }) => {
+  await registerViaUI(page);
+
+  for (let i = 0; i < 105; i++) {
+    await createTeamViaAPI(request, page, `Paged Team ${String(i).padStart(3, "0")}`);
+  }
+
+  // Registration already landed on /teams with an empty SWR cache. Reload
+  // after seeding via API so the page fetches from the backend again.
+  await page.reload();
+  await expect(
+    page.getByRole("link", { name: /paged team 104/i }),
+  ).toBeVisible();
 });
 
 test("rename project from its detail page", async ({ page }) => {

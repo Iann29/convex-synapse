@@ -34,6 +34,9 @@ func CORS(origins string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+				// The dashboard follows keyset pagination from browser fetch;
+				// non-simple response headers stay unreadable unless exposed.
+				w.Header().Set("Access-Control-Expose-Headers", "X-Next-Cursor")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {

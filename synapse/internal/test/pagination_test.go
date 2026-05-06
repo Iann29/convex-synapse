@@ -56,6 +56,34 @@ func TestPagination_TeamsListSinglePageNoHeader(t *testing.T) {
 	}
 }
 
+// TestPagination_CORSExposesCursorHeader covers the browser-only part of
+// pagination: fetch cannot read X-Next-Cursor from a cross-origin response
+// unless the CORS middleware explicitly exposes it.
+func TestPagination_CORSExposesCursorHeader(t *testing.T) {
+	h := Setup(t)
+	u := h.RegisterRandomUser()
+
+	req, err := http.NewRequest(http.MethodGet, h.Server.URL+"/v1/teams/", nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+u.AccessToken)
+	req.Header.Set("Origin", "http://localhost:3000")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); got != "X-Next-Cursor" {
+		t.Fatalf("Access-Control-Expose-Headers=%q want X-Next-Cursor", got)
+	}
+}
+
 // TestPagination_InvalidLimit rejects limit=0, negative, or non-numeric.
 func TestPagination_InvalidLimit(t *testing.T) {
 	h := Setup(t)
