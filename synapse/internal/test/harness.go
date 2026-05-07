@@ -141,7 +141,19 @@ type SetupOpts struct {
 	// for tests that run Synapse inside the same Docker network as the
 	// provisioned backends.
 	HealthcheckViaNetwork bool
+	// PublicIP mirrors api.RouterDeps.PublicIP. Tests that exercise
+	// the host-domain DNS preflight set this so the handler has an
+	// anchor IP to compare resolved A records against.
+	PublicIP string
+	// HostDomainResolver lets host-domain tests inject a fake DNS
+	// resolver. nil = use the system resolver (production wiring).
+	HostDomainResolver api.HostDomainResolver
 }
+
+// stubResolverFunc adapts a closure to api.HostDomainResolver.
+type stubResolverFunc func(host string) ([]string, error)
+
+func (f stubResolverFunc) LookupIP(host string) ([]string, error) { return f(host) }
 
 // SetupWithOpts is Setup + opts, used by tests that need to drive the
 // PublicURL rewrite path (otherwise they'd need to instantiate the
@@ -234,6 +246,8 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		UpdaterSocket:         opts.UpdaterSocket,
 		GitHubRepo:            opts.GitHubRepo,
 		GitHubAPIBase:         opts.GitHubAPIBase,
+		PublicIP:              opts.PublicIP,
+		HostDomainResolver:    opts.HostDomainResolver,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a

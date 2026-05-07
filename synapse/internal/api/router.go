@@ -85,6 +85,11 @@ type RouterDeps struct {
 	// (which satisfies the interface). Tests that don't exercise the
 	// proxy leave it nil.
 	DomainCache DomainCacheInvalidator
+
+	// HostDomainResolver lets the host-domain DNS preflight be stubbed
+	// in tests. Production wiring leaves this nil and the handler
+	// falls back to net.DefaultResolver. See AdminHandler.dnsLookupA.
+	HostDomainResolver HostDomainResolver
 }
 
 // DomainCacheInvalidator is the subset of *proxy.Resolver the
@@ -218,11 +223,15 @@ func NewRouter(d RouterDeps) http.Handler {
 			// users.is_instance_admin; we mount inside the authenticated group
 			// so unauthenticated probes still hit the auth 401 path.
 			adminH := &AdminHandler{
-				DB:            d.DB,
-				Version:       d.Version,
-				UpdaterSocket: d.UpdaterSocket,
-				GitHubRepo:    d.GitHubRepo,
-				GitHubAPIBase: d.GitHubAPIBase,
+				DB:                 d.DB,
+				Version:            d.Version,
+				UpdaterSocket:      d.UpdaterSocket,
+				GitHubRepo:         d.GitHubRepo,
+				GitHubAPIBase:      d.GitHubAPIBase,
+				PublicURL:          d.PublicURL,
+				BaseDomain:         d.BaseDomain,
+				PublicIP:           d.PublicIP,
+				HostDomainResolver: d.HostDomainResolver,
 			}
 			r.Mount("/admin", adminH.Routes())
 			// Personal access tokens — flat verb-suffixed endpoints under /v1.
