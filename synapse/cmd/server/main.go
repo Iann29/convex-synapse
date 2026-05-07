@@ -21,6 +21,7 @@ import (
 	"github.com/Iann29/synapse/internal/config"
 	"github.com/Iann29/synapse/internal/crypto"
 	"github.com/Iann29/synapse/internal/db"
+	synapsedns "github.com/Iann29/synapse/internal/dns"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/health"
 	"github.com/Iann29/synapse/internal/provisioner"
@@ -293,6 +294,21 @@ func run() error {
 			Logger:        logger,
 		}).Run(rootCtx)
 	}
+
+	// DNS verifier — polls deployment_domains rows that were just
+	// auto-configured (Cloudflare A record minted, status='pending')
+	// and flips them to 'active' once the record propagates globally.
+	// No-op when SYNAPSE_PUBLIC_IP is empty: the loop logs once and
+	// exits because there's no anchor IP to compare resolved A records
+	// against. Multi-node-safe via LockDNSVerifier advisory lock.
+	go func() {
+		v := &synapsedns.Verifier{
+			DB:         pool,
+			Logger:     logger,
+			ExpectedIP: cfg.PublicIP,
+		}
+		_ = v.Start(rootCtx)
+	}()
 
 	// Top-level routing decision tree:
 	//

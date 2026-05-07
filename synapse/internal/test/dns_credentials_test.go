@@ -391,6 +391,68 @@ func TestDomain_AutoConfigure_SingleCredential_Success(t *testing.T) {
 	}
 }
 
+// TestDomain_AutoConfigure_EnqueuesForVerifier asserts the contract
+// the verification loop (PR #3, internal/dns/verifier.go) consumes:
+// after a successful POST /auto_configure, the row sits at
+// status='pending' AND auto_configured=true AND dns_verified_at IS
+// NULL — the exact predicate Verifier.loadPending uses to find work.
+// A regression here (e.g. handler accidentally flipping to active
+// without resolution) would make the verifier silently skip every
+// auto-configured row.
+func TestDomain_AutoConfigure_EnqueuesForVerifier(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "fechasul.com.br"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		PublicIP:          "203.0.113.10",
+	})
+	owner := makeAdminUser(t, h)
+
+	var cred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/admin/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "L"},
+		http.StatusCreated, &cred)
+
+	team := createTeam(t, h, owner.AccessToken, "DNS Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "Queue")
+	depName := "dns-queue-" + randHex(3)
+	h.SeedDeployment(proj.ID, depName, "prod", "running", true, owner.ID, 3961, "")
+
+	var domain domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.fechasul.com.br", "role": "api"},
+		http.StatusCreated, &domain)
+
+	var configured domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains/"+domain.ID+"/auto_configure",
+		owner.AccessToken, map[string]any{}, http.StatusOK, &configured)
+
+	// The verifier's loadPending predicate, run as a SQL EXISTS — we
+	// don't import the dns package here to keep this test focused on
+	// the API contract; the verifier-side test (dns_verifier_test.go)
+	// covers the consumer.
+	var pending bool
+	if err := h.DB.QueryRow(context.Background(), `
+		SELECT EXISTS (
+		    SELECT 1 FROM deployment_domains
+		     WHERE id = $1
+		       AND auto_configured = true
+		       AND status = 'pending'
+		       AND dns_verified_at IS NULL
+		)
+	`, configured.ID).Scan(&pending); err != nil {
+		t.Fatalf("predicate query: %v", err)
+	}
+	if !pending {
+		t.Errorf("expected row to match verifier predicate after auto_configure, got pending=false")
+	}
+}
+
 func TestDomain_AutoConfigure_NoCredentialForZone(t *testing.T) {
 	// Credential covers `other.com`, domain is under `fechasul.com.br`.
 	stub := newCloudflareStub(t, &stubConfig{
