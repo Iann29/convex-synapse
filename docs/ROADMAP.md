@@ -143,11 +143,10 @@ behind it needs to land), so adding them is a runtime-only change.
   import with `--replace` into the new pair, swap the replica rows, and
   stop the old SQLite container without removing its volume. Endpoint
   now returns `202` once the job is queued.
-- [ ] Real-backend failover e2e: extend `synapsetest.Setup` with an
-  option to inject `*dockerprov.Client` instead of `FakeDocker`, then
-  drive `docker kill` against the active replica from the
-  `SYNAPSE_HA_E2E=1` test and assert traffic flows to the standby
-  within 60s.
+- [x] Real-backend failover e2e: `synapsetest.SetupHAWithOpts` can
+  inject `*dockerprov.Client`; the gated `SYNAPSE_HA_E2E=1` test
+  provisions two real backend containers, destroys replica 0, and
+  asserts proxy traffic still reaches the standby.
 - [x] Active health probe in `internal/proxy/`. A 2s probe loop hits
   `/api/check_admin_key` on each running HA replica and populates
   `last_seen_active_at`, so the proxy picker stabilises on the current
