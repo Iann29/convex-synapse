@@ -161,6 +161,59 @@ export type UpgradeStatus = {
   error?: string;
 };
 
+// GET /v1/admin/host_domain. The current public-URL configuration of the
+// Synapse host. `mode` summarises which template setup.sh is rendering:
+//   tls               → SYNAPSE_DOMAIN set, plain HTTPS
+//   plain             → SYNAPSE_PUBLIC_URL is http://<ip>:<port>, no TLS
+//   tls_with_wildcard → SYNAPSE_DOMAIN set + SYNAPSE_BASE_DOMAIN for
+//                       per-deployment subdomains
+// `fallbackUrls` is the list of always-reachable URLs (typically the IP
+// form) — surfaced so operators have something to land on if a domain
+// change goes wrong.
+export type HostDomainConfig = {
+  mode: "tls" | "plain" | "tls_with_wildcard";
+  domain?: string;
+  baseDomain?: string;
+  publicUrl?: string;
+  publicIp?: string;
+  acmeEmail?: string;
+  fallbackUrls?: string[];
+};
+
+// GET /v1/admin/host_domain/status/{jobId}. The host-side daemon mirrors
+// the upgrade flow — async, polled. `log` is a streaming tail of
+// setup.sh's stdout/stderr.
+export type HostDomainJobStatus = {
+  id: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  log?: string[];
+  error?: string;
+  createdAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+};
+
+// POST /v1/admin/host_domain. Returns the queued job id + a status URL
+// the dashboard polls to surface progress.
+export type HostDomainChangeResponse = {
+  jobId: string;
+  statusUrl: string;
+};
+
+// Body shape for POST /v1/admin/host_domain. All fields optional — the
+// backend interprets the combination:
+//   { plainHttp: true }                     → switch to plain HTTP
+//   { domain }                              → set/change a TLS domain
+//   { domain, baseDomain }                  → wildcard subdomains
+//   { acmeEmail }                           → bump the Let's Encrypt
+//                                             contact without re-issuing
+export type HostDomainChangeInput = {
+  domain?: string;
+  baseDomain?: string;
+  plainHttp?: boolean;
+  acmeEmail?: string;
+};
+
 // Returned once at create time. `adminKey` is the freshly-minted value;
 // `envSnippet` and `exportSnippet` are paste-ready for `.env.local` and
 // shell respectively. The dashboard MUST surface this immediately and
@@ -921,6 +974,26 @@ export const api = {
     },
     upgradeStatus(): Promise<UpgradeStatus> {
       return request<UpgradeStatus>("/v1/admin/upgrade/status");
+    },
+    // Host-domain reconfiguration (setup.sh --change-domain). Same shape
+    // as the upgrade flow: queue a job, poll a status endpoint. The
+    // actual reconfiguration runs on the host (touches Caddy + .env +
+    // compose), not inside the synapse-api container.
+    hostDomain: {
+      get(): Promise<HostDomainConfig> {
+        return request<HostDomainConfig>("/v1/admin/host_domain");
+      },
+      change(body: HostDomainChangeInput): Promise<HostDomainChangeResponse> {
+        return request<HostDomainChangeResponse>("/v1/admin/host_domain", {
+          method: "POST",
+          body,
+        });
+      },
+      status(jobId: string): Promise<HostDomainJobStatus> {
+        return request<HostDomainJobStatus>(
+          `/v1/admin/host_domain/status/${encodeURIComponent(jobId)}`,
+        );
+      },
     },
   },
 };
