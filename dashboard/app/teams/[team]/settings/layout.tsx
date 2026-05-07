@@ -4,16 +4,17 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { use } from "react";
 import clsx from "clsx";
-import useSWR from "swr";
 import { Badge } from "@/components/ui/badge";
-import { api } from "@/lib/api";
-import type { User } from "@/lib/auth";
 
 type Params = { team: string };
 
 // Team Settings shell. Two-column: a sticky sidebar nav on the left, the
 // active pane on the right. Each route under /teams/<ref>/settings/* mounts
 // its own page; this layout just provides chrome.
+//
+// Host-wide ("instance admin") configuration lives under /admin/* — it's
+// not per-team, so it doesn't belong here. The Admin link surfaces in
+// the top nav for instance admins.
 export default function TeamSettingsLayout({
   params,
   children,
@@ -25,25 +26,11 @@ export default function TeamSettingsLayout({
   const pathname = usePathname() ?? "";
   const base = `/teams/${encodeURIComponent(teamRef)}/settings`;
 
-  // Pull /me here so the sidebar can show host-level admin items only
-  // for users with is_instance_admin. Non-admins should not even see
-  // the link — backend re-checks anyway, but exposing the route invites
-  // confusion. Cached at the SWR layer so this is essentially free.
-  const { data: me } = useSWR<User>("/me", () => api.me(), {
-    revalidateOnFocus: false,
-    shouldRetryOnError: false,
-  });
-  const isInstanceAdmin = me?.isInstanceAdmin === true;
-
   // Settings IA. Synapse is open-source self-hosted — Cloud-only concerns
   // (Billing, Usage, Referrals, Applications, paid-tier SSO) are not on
   // the roadmap and would just be dead UI. Audit Log lives at
   // /teams/{ref}/audit (top-level link in the team header) so it's not
   // duplicated here either.
-  //
-  // The "Instance" group is host-wide configuration that's only meaningful
-  // when you own the box Synapse runs on. We hide the whole group for
-  // non-admins — leaving an empty section header behind looks broken.
   const groups: { label?: string; items: NavItem[] }[] = [
     {
       items: [
@@ -53,18 +40,6 @@ export default function TeamSettingsLayout({
       ],
     },
   ];
-  if (isInstanceAdmin) {
-    groups.push({
-      label: "Instance",
-      items: [
-        {
-          href: `${base}/host-domain`,
-          label: "Host domain",
-          testid: "settings-nav-host-domain",
-        },
-      ],
-    });
-  }
 
   return (
     <div className="space-y-6">

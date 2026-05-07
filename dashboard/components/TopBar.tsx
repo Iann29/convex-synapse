@@ -28,6 +28,15 @@ export function TopBar() {
     setUser(getCurrentUser());
   }, []);
 
+  // /me carries is_instance_admin; getCurrentUser() reads from local
+  // storage which may be stale on the flag if the user was promoted
+  // after their last login. SWR fetches fresh; null while not logged in.
+  const { data: me } = useSWR<User>(user ? "/me" : null, () => api.me(), {
+    revalidateOnFocus: false,
+    shouldRetryOnError: false,
+  });
+  const isInstanceAdmin = me?.isInstanceAdmin === true;
+
   const logout = () => {
     clearAuth();
     router.push("/login");
@@ -70,6 +79,21 @@ export function TopBar() {
         )}
 
         <div className="ml-auto flex items-center gap-1">
+          {isInstanceAdmin && (
+            <Link
+              href="/admin/host-domain"
+              data-testid="topnav-admin-link"
+              className={clsx(
+                "hidden rounded-md px-3 py-1.5 text-xs transition-colors sm:inline-block",
+                pathname?.startsWith("/admin")
+                  ? "bg-violet-500/10 text-violet-200"
+                  : "text-violet-300 hover:bg-violet-500/10 hover:text-violet-200",
+              )}
+              title="Host-wide configuration (instance admin)"
+            >
+              Admin
+            </Link>
+          )}
           <a
             href="https://github.com/get-convex/convex-backend"
             target="_blank"
