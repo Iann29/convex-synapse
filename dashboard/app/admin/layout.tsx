@@ -60,6 +60,11 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
 
   const navItems = [
     { href: "/admin/host-domain", label: "Host domain", testid: "admin-nav-host-domain" },
+    {
+      href: "/admin/dns-credentials",
+      label: "DNS credentials",
+      testid: "admin-nav-dns-credentials",
+    },
   ];
 
   return (

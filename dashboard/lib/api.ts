@@ -235,6 +235,12 @@ export type CreateDeployKeyResponse = DeployKey & {
 // SYNAPSE_PUBLIC_IP unconfigured), 'active' (A record matches the
 // configured public IP), 'failed' (lookup error or wrong IP — see
 // lastDnsError for details).
+//
+// `autoConfigured` and `dnsCredentialId` are populated when the row was
+// created via POST /domains/{id}/auto_configure — Synapse pushed an A
+// record into the operator's Cloudflare zone using a stored credential.
+// The dashboard surfaces a Cloudflare chip on auto-configured rows so the
+// operator knows the DNS provider is wired up rather than manual.
 export type DeploymentDomain = {
   id: string;
   deploymentId: string;
@@ -245,6 +251,42 @@ export type DeploymentDomain = {
   lastDnsError?: string;
   createdAt: string;
   updatedAt: string;
+  autoConfigured?: boolean;
+  dnsCredentialId?: string;
+};
+
+// DNSProvider is what GET /v1/internal/dns_provider returns. Public
+// (no auth) — the Add Domain dialog hits it as the operator types so
+// we can offer Cloudflare auto-config when applicable. `provider` is
+// derived server-side from the apex domain's NS records; "unknown"
+// covers the resolution-failed and not-recognised cases alike.
+// `nameservers` is shown verbatim so the operator can spot a typo.
+export type DNSProviderDetection = {
+  provider:
+    | "cloudflare"
+    | "route53"
+    | "google"
+    | "namecheap"
+    | "godaddy"
+    | "unknown";
+  nameservers: string[];
+};
+
+// DNSCredential mirrors models.DNSCredential on the backend. The token
+// itself is never returned — Synapse keeps the secret encrypted at rest
+// and only surfaces label + zones for display. `zones` is populated by
+// the backend at create time by hitting Cloudflare's /zones endpoint
+// with the provided token; an empty list usually means the token's
+// scope is too narrow.
+export type DNSCredential = {
+  id: string;
+  provider: "cloudflare";
+  label: string;
+  zones: { id: string; name: string }[];
+  createdBy?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  lastError?: string;
 };
 
 export type EnvVar = {
@@ -922,6 +964,21 @@ export const api = {
         { method: "POST", body: {} },
       );
     },
+    // Auto-configure DNS for a domain via a stored DNSCredential. The
+    // backend pushes an A record into the matching zone (Cloudflare for
+    // now) and stamps `autoConfigured=true` on the row. credentialId is
+    // optional — when omitted the backend picks the first credential
+    // whose zones match the domain's apex.
+    autoConfigureDomain(
+      name: string,
+      domainId: string,
+      credentialId?: string,
+    ): Promise<DeploymentDomain> {
+      return request<DeploymentDomain>(
+        `/v1/deployments/${encodeURIComponent(name)}/domains/${encodeURIComponent(domainId)}/auto_configure`,
+        { method: "POST", body: credentialId ? { credentialId } : {} },
+      );
+    },
   },
 
   // First-run wizard probe. Public — no auth, hit pre-login. firstRun
@@ -960,6 +1017,17 @@ export const api = {
     },
   },
 
+  // Public DNS helpers. No auth — used by the Add Domain dialog to
+  // detect the apex domain's nameserver provider as the operator types.
+  dns: {
+    detectProvider(domain: string): Promise<DNSProviderDetection> {
+      return request<DNSProviderDetection>(
+        `/v1/internal/dns_provider?domain=${encodeURIComponent(domain)}`,
+        { auth: false },
+      );
+    },
+  },
+
   // Instance-level admin operations: version_check + auto-upgrade.
   // Gated to users.is_instance_admin — see synapse/internal/api/admin.go.
   admin: {
@@ -992,6 +1060,28 @@ export const api = {
       status(jobId: string): Promise<HostDomainJobStatus> {
         return request<HostDomainJobStatus>(
           `/v1/admin/host_domain/status/${encodeURIComponent(jobId)}`,
+        );
+      },
+    },
+    // DNS credentials — instance-admin only. Stored credentials let
+    // Synapse push records into the operator's DNS zone when adding a
+    // custom domain to a deployment, instead of asking the operator to
+    // edit DNS by hand. Cloudflare is the only supported provider in
+    // v1.4.x; the shape leaves room for route53 / google / etc.
+    dnsCredentials: {
+      list(): Promise<DNSCredential[]> {
+        return request<DNSCredential[]>("/v1/admin/dns_credentials");
+      },
+      addCloudflare(token: string, label: string): Promise<DNSCredential> {
+        return request<DNSCredential>("/v1/admin/dns_credentials/cloudflare", {
+          method: "POST",
+          body: { token, label },
+        });
+      },
+      delete(id: string): Promise<void> {
+        return request<void>(
+          `/v1/admin/dns_credentials/${encodeURIComponent(id)}`,
+          { method: "DELETE" },
         );
       },
     },

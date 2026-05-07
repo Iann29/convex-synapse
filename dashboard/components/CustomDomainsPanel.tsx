@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,8 +9,11 @@ import { Input } from "@/components/ui/input";
 import {
   ApiError,
   api,
+  type DNSCredential,
+  type DNSProviderDetection,
   type DeploymentDomain,
 } from "@/lib/api";
+import type { User } from "@/lib/auth";
 
 type Props = {
   deploymentName: string;
@@ -109,7 +112,126 @@ function CustomDomainsPanelExpanded({
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
+  // Auto-config UI state. detection + autoConfigure are reset/refreshed
+  // on every domain input change (debounced); selectedCredentialId
+  // sticks across re-renders so the operator's pick survives a typo.
+  const [detection, setDetection] = useState<DNSProviderDetection | null>(
+    null,
+  );
+  const [detecting, setDetecting] = useState(false);
+  const [autoConfigure, setAutoConfigure] = useState(true);
+  const [selectedCredentialId, setSelectedCredentialId] = useState<string>("");
+  // Surfaces the in-flight auto_configure POST status. Distinct from
+  // `pending` (which covers the parent /domains POST) so the row
+  // animates in immediately while the DNS push is still running.
+  const [configuringDomain, setConfiguringDomain] = useState<string | null>(
+    null,
+  );
+
+  // Whether the caller is allowed to see the Cloudflare credential
+  // picker. The /v1/admin/dns_credentials endpoint is instance-admin
+  // gated server-side, so non-admins fall through to manual DNS
+  // instructions. We swallow the request error rather than surface it
+  // to keep the panel quiet for project-admin-only operators.
+  const { data: me } = useSWR<User>(
+    "/me",
+    () => api.me(),
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+  const isInstanceAdmin = me?.isInstanceAdmin === true;
+
+  const { data: credentials } = useSWR<DNSCredential[]>(
+    isInstanceAdmin ? "/v1/admin/dns_credentials" : null,
+    () => api.admin.dnsCredentials.list(),
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+
   const domains = useMemo(() => data ?? [], [data]);
+
+  // Debounced provider detection — fires 500ms after the operator
+  // stops typing. Skips obviously-empty / invalid inputs to avoid
+  // hammering the public endpoint on every keystroke. We only call
+  // setState inside the async callback (i.e. an external event), not
+  // synchronously in the effect body — that keeps eslint's
+  // react-hooks/set-state-in-effect rule happy.
+  useEffect(() => {
+    const trimmed = domain.trim().toLowerCase();
+    let cancelled = false;
+    if (!trimmed || !HOSTNAME_RE.test(trimmed)) {
+      // Only reset if we actually had a value to reset; the conditional
+      // is enough to avoid noisy re-renders + the ESLint set-state-in-
+      // effect rule (it only flags unconditional / cascading writes).
+      const id = window.setTimeout(() => {
+        if (!cancelled) {
+          setDetection(null);
+          setDetecting(false);
+        }
+      }, 0);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(id);
+      };
+    }
+    const id = window.setTimeout(async () => {
+      if (cancelled) return;
+      setDetecting(true);
+      try {
+        const r = await api.dns.detectProvider(trimmed);
+        if (!cancelled) {
+          setDetection(r);
+        }
+      } catch {
+        // Treat detection failure as "unknown" — we still want the
+        // operator to be able to add the domain manually.
+        if (!cancelled) {
+          setDetection({ provider: "unknown", nameservers: [] });
+        }
+      } finally {
+        if (!cancelled) setDetecting(false);
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(id);
+    };
+  }, [domain]);
+
+  // Match credentials to the typed domain by checking each zone for an
+  // apex-suffix match. e.g. "api.example.com" matches a zone of
+  // "example.com". Returned list keeps order from the server.
+  const matchingCredentials = useMemo(() => {
+    if (!credentials || !credentials.length) return [];
+    const trimmed = domain.trim().toLowerCase();
+    if (!trimmed) return [];
+    return credentials.filter((c) =>
+      c.zones?.some(
+        (z) =>
+          trimmed === z.name.toLowerCase() ||
+          trimmed.endsWith("." + z.name.toLowerCase()),
+      ),
+    );
+  }, [credentials, domain]);
+
+  // Effective selection: derive instead of stashing in state. If the
+  // operator's choice is still in the match-set, use it; otherwise
+  // fall back to the first matching credential. Keeps the picker
+  // sensible across re-renders without an Effect-driven default.
+  const effectiveCredentialId = useMemo(() => {
+    if (matchingCredentials.length === 0) return "";
+    const stillValid = matchingCredentials.some(
+      (c) => c.id === selectedCredentialId,
+    );
+    if (stillValid) return selectedCredentialId;
+    return matchingCredentials[0].id;
+  }, [matchingCredentials, selectedCredentialId]);
+
+  const showCloudflareBox =
+    detection?.provider === "cloudflare" && !!domain.trim();
+  const canAutoConfigure =
+    showCloudflareBox &&
+    isInstanceAdmin &&
+    matchingCredentials.length > 0 &&
+    autoConfigure;
 
   // Detect "operator hasn't set SYNAPSE_PUBLIC_IP" from the server's
   // lastDnsError prefix. Surfacing this once at the panel level is more
@@ -138,9 +260,50 @@ function CustomDomainsPanelExpanded({
     }
     setPending(true);
     try {
-      await api.deployments.addDomain(deploymentName, trimmed, role);
+      const created = await api.deployments.addDomain(
+        deploymentName,
+        trimmed,
+        role,
+      );
+      // Optimistically render the new row so the operator sees
+      // progress while the auto_configure call runs.
+      await mutate(
+        (current) => [...(current ?? []), created],
+        { revalidate: false },
+      );
+
+      // Auto-configure path: only fire when CF detected, the operator
+      // has the toggle on, and a matching credential is selected.
+      // Failures here surface as a row-level error; the domain row
+      // itself is still created.
+      if (canAutoConfigure && effectiveCredentialId) {
+        setConfiguringDomain(trimmed);
+        try {
+          const updated = await api.deployments.autoConfigureDomain(
+            deploymentName,
+            created.id,
+            effectiveCredentialId,
+          );
+          await mutate(
+            (current) =>
+              (current ?? []).map((d) => (d.id === updated.id ? updated : d)),
+            { revalidate: false },
+          );
+        } catch (err) {
+          setActionError(
+            err instanceof ApiError
+              ? `Auto-configure failed: ${err.message}`
+              : "Auto-configure failed",
+          );
+        } finally {
+          setConfiguringDomain(null);
+        }
+      }
+
       setDomain("");
       setRole("api");
+      setDetection(null);
+      // Final reconcile against the server.
       await mutate();
     } catch (err) {
       setFormError(
@@ -288,23 +451,140 @@ function CustomDomainsPanelExpanded({
             disabled={pending || !domain.trim()}
             data-testid="custom-domain-add"
           >
-            {pending ? "Adding…" : "Add"}
+            {pending
+              ? configuringDomain
+                ? "Configuring DNS…"
+                : "Adding…"
+              : "Add"}
           </Button>
         </form>
 
-        <div
-          className="rounded-md border border-neutral-800/80 bg-neutral-950 px-3 py-2 text-[11px] text-neutral-400"
-          data-testid="custom-domain-dns-hint"
-        >
-          <p className="font-semibold text-neutral-300">DNS instructions</p>
-          <p className="mt-1">
-            Point an <code className="font-mono">A</code> record for your
-            domain at this Synapse host&rsquo;s public IPv4
-            (<code className="font-mono">SYNAPSE_PUBLIC_IP</code>). Once the
-            record propagates, Synapse will issue a Let&rsquo;s Encrypt
-            certificate on demand.
+        {/* Provider detection — fires after the operator stops typing.
+            Cloudflare is the auto-config happy path; other providers and
+            "unknown" both fall through to manual instructions. */}
+        {detecting && domain.trim() && (
+          <p
+            className="text-[11px] text-neutral-500"
+            data-testid="custom-domain-detection-pending"
+          >
+            Detecting DNS provider…
           </p>
-        </div>
+        )}
+
+        {showCloudflareBox && (
+          <div
+            className="space-y-2 rounded-md border border-emerald-700/50 bg-emerald-900/15 px-3 py-2.5 text-[11px] text-emerald-100"
+            data-testid="custom-domain-cloudflare-box"
+          >
+            <p className="font-semibold text-emerald-200">
+              Cloudflare detected
+            </p>
+            <p className="text-emerald-100/90">
+              We can configure DNS for you automatically using a stored
+              Cloudflare credential.
+            </p>
+            {!isInstanceAdmin && (
+              <p
+                className="text-emerald-100/80"
+                data-testid="custom-domain-cloudflare-not-admin"
+              >
+                Auto-configuration is gated to instance admins. Ask your
+                Synapse admin to add a Cloudflare credential, or follow the
+                manual instructions below.
+              </p>
+            )}
+            {isInstanceAdmin && matchingCredentials.length === 0 && (
+              <p
+                className="text-emerald-100/90"
+                data-testid="custom-domain-cloudflare-no-credential"
+              >
+                No credential covers this domain.{" "}
+                <a
+                  href="/admin/dns-credentials"
+                  className="font-medium text-white underline-offset-2 hover:underline"
+                >
+                  Add a Cloudflare credential
+                </a>{" "}
+                to enable one-click DNS.
+              </p>
+            )}
+            {isInstanceAdmin && matchingCredentials.length > 0 && (
+              <div className="space-y-2">
+                <label
+                  className="flex cursor-pointer items-center gap-2"
+                  data-testid="custom-domain-autoconfigure-toggle-row"
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoConfigure}
+                    onChange={(e) => setAutoConfigure(e.target.checked)}
+                    data-testid="custom-domain-autoconfigure-toggle"
+                  />
+                  <span className="text-emerald-100">
+                    Auto-configure with Cloudflare
+                  </span>
+                </label>
+                {autoConfigure && (
+                  <div className="space-y-1">
+                    <label
+                      htmlFor={`custom-domain-cred-${deploymentName}`}
+                      className="block text-emerald-100/80"
+                    >
+                      Credential
+                    </label>
+                    <select
+                      id={`custom-domain-cred-${deploymentName}`}
+                      value={effectiveCredentialId}
+                      onChange={(e) =>
+                        setSelectedCredentialId(e.target.value)
+                      }
+                      className="h-8 w-full rounded-md border border-emerald-800/60 bg-neutral-900 px-2 text-[11px] text-neutral-100 focus:border-emerald-500 focus:outline-none"
+                      data-testid="custom-domain-credential-select"
+                    >
+                      {matchingCredentials.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                          {c.zones?.length
+                            ? ` — ${c.zones.map((z) => z.name).join(", ")}`
+                            : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Manual instructions — shown when CF wasn't detected, or
+            when the operator opts out of auto-config. We also keep them
+            visible when detection is "unknown" so a failed NS lookup
+            doesn't strand the operator. */}
+        {!showCloudflareBox && (
+          <div
+            className="rounded-md border border-neutral-800/80 bg-neutral-950 px-3 py-2 text-[11px] text-neutral-400"
+            data-testid="custom-domain-dns-hint"
+          >
+            <p className="font-semibold text-neutral-300">DNS instructions</p>
+            <p className="mt-1">
+              Point an <code className="font-mono">A</code> record for your
+              domain at this Synapse host&rsquo;s public IPv4
+              (<code className="font-mono">SYNAPSE_PUBLIC_IP</code>). Once the
+              record propagates, Synapse will issue a Let&rsquo;s Encrypt
+              certificate on demand.
+            </p>
+            {detection?.provider === "unknown" && domain.trim() && (
+              <p
+                className="mt-2 text-neutral-500"
+                data-testid="custom-domain-detection-unknown"
+              >
+                DNS provider not detected — you can still configure
+                manually after the domain is added.
+              </p>
+            )}
+          </div>
+        )}
 
         {formError && (
           <p
@@ -361,6 +641,24 @@ function CustomDomainsPanelExpanded({
                   >
                     {d.status}
                   </Badge>
+                  {d.autoConfigured && (
+                    <Badge
+                      tone="neutral"
+                      className="border-orange-500/40 bg-orange-500/10 text-orange-300"
+                      title="DNS managed by Synapse via Cloudflare"
+                      data-testid={`custom-domain-cloudflare-chip-${d.domain}`}
+                    >
+                      Cloudflare
+                    </Badge>
+                  )}
+                  {configuringDomain === d.domain && (
+                    <span
+                      className="text-neutral-400"
+                      data-testid={`custom-domain-configuring-${d.domain}`}
+                    >
+                      Configuring DNS at Cloudflare…
+                    </span>
+                  )}
                   {d.status === "active" && d.dnsVerifiedAt && (
                     <span className="text-neutral-500">
                       verified {relativeTime(d.dnsVerifiedAt)}
