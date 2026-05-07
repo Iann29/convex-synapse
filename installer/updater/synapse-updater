@@ -201,37 +201,69 @@ def run_upgrade(ref: str) -> None:
 # needing to expose a per-job /status route. Lock file keeps two
 # reconfigures from racing the same compose stack.
 
-def _resolve_postgres_url() -> str:
-    """Find the POSTGRES_URL the api server reads. We re-read the file
-    each call so an operator who edits .env between calls sees the new
-    value. Returns "" if no .env / no POSTGRES_URL — caller treats that
-    as "skip the DB writeback" (the api will see state='queued' until
-    something flips it manually)."""
+def _resolve_env_var(key: str) -> str:
+    """Read a single KEY=value line out of $INSTALL_DIR/.env. We re-read
+    the file each call so an operator who edits .env between calls sees
+    the new value. Returns "" if no .env / no key — caller treats that
+    as "skip" (the api will see state='queued' until something flips it
+    manually)."""
     env_path = INSTALL_DIR / ".env"
     if not env_path.exists():
         return ""
     try:
+        prefix = key + "="
         for line in env_path.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if line.startswith("POSTGRES_URL="):
-                return line[len("POSTGRES_URL="):].strip().strip('"').strip("'")
+            if line.startswith(prefix):
+                return line[len(prefix):].strip().strip('"').strip("'")
     except OSError:
         return ""
     return ""
 
 
+def _resolve_postgres_dsn() -> str:
+    """Resolve the metadata-DB DSN the api server uses. Reads the
+    canonical SYNAPSE_DB_URL key (written by env.tmpl since v0.6) with a
+    POSTGRES_URL fallback for any operator who customized the env (and
+    backward compat for early dev installs that used POSTGRES_URL)."""
+    return _resolve_env_var("SYNAPSE_DB_URL") or _resolve_env_var("POSTGRES_URL")
+
+
+# Compose service name of the metadata Postgres container. Stable in
+# docker-compose.yml and unlikely to change without coordinated work
+# elsewhere; hard-coded here so the daemon doesn't need to parse the
+# compose file. Override via $SYNAPSE_POSTGRES_CONTAINER if you ever
+# rename it, but doing so silently breaks the api side too.
+POSTGRES_CONTAINER = os.environ.get("SYNAPSE_POSTGRES_CONTAINER", "synapse-postgres")
+
+
 def _psql_exec(sql: str, params: list, log_path: Path) -> None:
-    """Best-effort psql shell-out. Failures are logged to the per-job
-    log file but don't crash the daemon — losing a row update is
-    preferable to losing the run itself."""
-    url = _resolve_postgres_url()
-    if not url:
+    """Best-effort writeback via `docker exec synapse-postgres psql ...`.
+
+    Why not host psql against the DSN: the DSN's hostname is `postgres`
+    (the compose service name), only resolvable inside synapse-network.
+    The daemon runs on the host as a systemd unit so it cannot resolve
+    that name, and the postgres container's port binding may also be
+    locked to 127.0.0.1. Furthermore, fresh Hetzner / Ubuntu hosts ship
+    without psql on PATH. Going through `docker exec` avoids both
+    problems — docker is already in the daemon's trust boundary
+    (setup.sh --upgrade shells out to `docker compose` constantly).
+
+    We still resolve the DSN to derive the postgres user/db (so a
+    custom POSTGRES_USER / POSTGRES_DB in .env is honoured); falling
+    back to the compose defaults if the DSN isn't parseable. Failures
+    are logged to the per-job log file but don't crash the daemon —
+    losing a row update is preferable to losing the run itself."""
+    docker = shutil.which("docker")
+    if not docker:
         return
-    psql = shutil.which("psql")
-    if not psql:
-        return
+    user, db = _parse_postgres_credentials()
+    cmd = [
+        docker, "exec", "-i", POSTGRES_CONTAINER,
+        "psql", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1",
+    ]
     # Use parameterised "$1, $2..." via -v-style is not supported; we
     # build the values via the env-and-format pattern. For safety with
     # untrusted input we shell-quote each param. Since we control all
@@ -249,10 +281,10 @@ def _psql_exec(sql: str, params: list, log_path: Path) -> None:
     rendered = sql
     for i, q in enumerate(quoted, start=1):
         rendered = rendered.replace(f"${i}", q)
+    cmd.extend(["-c", rendered])
     try:
         subprocess.run(
-            [psql, url, "-v", "ON_ERROR_STOP=1", "-c", rendered],
-            capture_output=True, text=True, timeout=10, check=False,
+            cmd, capture_output=True, text=True, timeout=10, check=False,
         )
     except (subprocess.SubprocessError, OSError) as e:
         try:
@@ -260,6 +292,30 @@ def _psql_exec(sql: str, params: list, log_path: Path) -> None:
                 logf.write(f"\n[synapse-updater] psql writeback failed: {e}\n".encode())
         except OSError:
             pass
+
+
+def _parse_postgres_credentials() -> tuple[str, str]:
+    """Extract (user, db) from SYNAPSE_DB_URL, falling back to the
+    POSTGRES_USER / POSTGRES_DB env entries, then to the compose
+    defaults (synapse / synapse). Best-effort parse — a malformed DSN
+    shouldn't take down the daemon."""
+    user = _resolve_env_var("POSTGRES_USER")
+    db = _resolve_env_var("POSTGRES_DB")
+    if user and db:
+        return user, db
+    dsn = _resolve_postgres_dsn()
+    if dsn:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(dsn)
+            if parsed.username and not user:
+                user = parsed.username
+            # path is "/dbname"; strip the leading slash.
+            if parsed.path and len(parsed.path) > 1 and not db:
+                db = parsed.path.lstrip("/")
+        except Exception:  # noqa: BLE001 — parse failure -> defaults
+            pass
+    return user or "synapse", db or "synapse"
 
 
 def run_reconfigure(job_id: str, payload: dict) -> None:

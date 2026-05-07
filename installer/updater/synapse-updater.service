@@ -41,7 +41,13 @@ RuntimeDirectory=synapse
 RuntimeDirectoryMode=0755
 
 Environment=SYNAPSE_UPDATER_SOCKET=/run/synapse/updater.sock
-Environment=SYNAPSE_INSTALL_DIR=/opt/synapse
+# {{INSTALL_DIR}} is rendered by installer/install/updater.sh::phase_install_updater
+# from the operator's --install-dir flag (default /opt/synapse). Hard-coding
+# /opt/synapse here would break any custom install path because the daemon
+# resolves setup.sh, .env, and VERSION relative to this value. The unit on
+# disk always has a real absolute path; the placeholder only lives in the
+# repo source.
+Environment=SYNAPSE_INSTALL_DIR={{INSTALL_DIR}}
 
 [Install]
 WantedBy=multi-user.target

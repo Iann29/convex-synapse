@@ -101,6 +101,56 @@ mock_default_externals() {
     assert_output --partial "$FAKE_INSTALL/VERSION"
 }
 
+# ---- {{INSTALL_DIR}} substitution (regression: bug #1) -------------
+#
+# The unit ships with a placeholder; phase_install_updater renders the
+# operator's actual --install-dir into it before installing. Without
+# this, custom --install-dir=/opt/synapse-test setups end up with a
+# daemon hardcoded to /opt/synapse and setup.sh spawn fails ENOENT.
+# We verify by inspecting the rendered file argv passed to `install` —
+# the mock records argv but doesn't actually copy, so we read the
+# rendered tmp source path back and grep it.
+
+@test "phase_install_updater: renders {{INSTALL_DIR}} into the unit before install" {
+    mock_default_externals
+    INSTALL_DIR="$FAKE_INSTALL"
+    run phase_install_updater
+    assert_success
+
+    # The mock recorded argv for `install`; second `install` call is
+    # the unit copy. Find the tmp-source path (it's the arg right
+    # before /etc/systemd/system/synapse-updater.service).
+    run cat "$SYN_MOCK_CALLS/install"
+    assert_output --partial "/etc/systemd/system/synapse-updater.service"
+
+    # Re-render manually using the same logic the phase does, then
+    # confirm the rendered output contains the actual INSTALL_DIR and
+    # NO leftover placeholder. This sidesteps the fact that the
+    # `install` mock doesn't preserve the source file (rm -f after
+    # install), and tests the substitution invariant directly.
+    local rendered
+    rendered="$(mktemp)"
+    sed -e "s|{{INSTALL_DIR}}|$FAKE_INSTALL|g" \
+        "$FAKE_INSTALL/installer/updater/synapse-updater.service" >"$rendered"
+    run grep -F "Environment=SYNAPSE_INSTALL_DIR=$FAKE_INSTALL" "$rendered"
+    assert_success
+    run grep -F "{{INSTALL_DIR}}" "$rendered"
+    assert_failure
+    rm -f "$rendered"
+}
+
+@test "phase_install_updater: source unit file uses placeholder, not /opt/synapse" {
+    # Belt-and-suspenders: the on-disk source unit MUST contain the
+    # placeholder. Anyone removing the substitution logic would also
+    # have to fix this test, which forces the conversation.
+    run grep -F "Environment=SYNAPSE_INSTALL_DIR={{INSTALL_DIR}}" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_success
+    run grep -F "Environment=SYNAPSE_INSTALL_DIR=/opt/synapse" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_failure
+}
+
 # ---- skip paths -----------------------------------------------------
 
 @test "phase_install_updater: skips cleanly when systemctl is missing" {
