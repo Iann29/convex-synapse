@@ -75,9 +75,8 @@ func stubUpdater(t *testing.T, fn http.HandlerFunc) string {
 	return sock
 }
 
-// makeAdminUser returns a user that belongs to a team as admin (the
-// default role for a team creator) — that's enough to satisfy
-// /v1/admin/* gating.
+// makeAdminUser returns the first registered user. Registration promotes that
+// user to instance admin; the team keeps tests close to the dashboard path.
 func makeAdminUser(t *testing.T, h *Harness) *User {
 	t.Helper()
 	u := h.RegisterRandomUser()
@@ -123,6 +122,19 @@ func TestAdmin_VersionCheck_UpdateAvailable(t *testing.T) {
 	if atomic.LoadInt64(hits) != 1 {
 		t.Errorf("expected exactly 1 GitHub fetch, got %d", *hits)
 	}
+}
+
+func TestAdmin_FirstRegisteredUserIsInstanceAdmin(t *testing.T) {
+	gh, _ := stubGitHub(t, "v1.2.0", false)
+	h := SetupWithOpts(t, SetupOpts{
+		GitHubRepo:    "Iann29/convex-synapse",
+		GitHubAPIBase: gh.URL,
+	})
+	owner := h.RegisterRandomUser()
+
+	var got versionCheckResp
+	h.DoJSON(http.MethodGet, "/v1/admin/version_check",
+		owner.AccessToken, nil, http.StatusOK, &got)
 }
 
 func TestAdmin_VersionCheck_CacheHit(t *testing.T) {
@@ -174,10 +186,25 @@ func TestAdmin_VersionCheck_NotAdmin_403(t *testing.T) {
 		GitHubRepo:    "Iann29/convex-synapse",
 		GitHubAPIBase: gh.URL,
 	})
+	_ = makeAdminUser(t, h)
 	stranger := makeNonAdminUser(t, h)
 
 	h.AssertStatus(http.MethodGet, "/v1/admin/version_check",
 		stranger.AccessToken, nil, http.StatusForbidden)
+}
+
+func TestAdmin_VersionCheck_TeamAdminWithoutInstanceRole_403(t *testing.T) {
+	gh, _ := stubGitHub(t, "v1.0.0", false)
+	h := SetupWithOpts(t, SetupOpts{
+		GitHubRepo:    "Iann29/convex-synapse",
+		GitHubAPIBase: gh.URL,
+	})
+	_ = makeAdminUser(t, h)
+	teamAdmin := h.RegisterRandomUser()
+	createTeam(t, h, teamAdmin.AccessToken, "Tenant Admin Co")
+
+	h.AssertStatus(http.MethodGet, "/v1/admin/version_check",
+		teamAdmin.AccessToken, nil, http.StatusForbidden)
 }
 
 func TestAdmin_VersionCheck_Anonymous_401(t *testing.T) {
@@ -280,6 +307,7 @@ func TestAdmin_Upgrade_NotAdmin_403(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	_ = makeAdminUser(t, h)
 	stranger := makeNonAdminUser(t, h)
 	h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
 		stranger.AccessToken, map[string]any{}, http.StatusForbidden)

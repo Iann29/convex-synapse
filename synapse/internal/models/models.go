@@ -8,12 +8,13 @@ package models
 import "time"
 
 type User struct {
-	ID           string    `json:"id"`
-	Email        string    `json:"email"`
-	Name         string    `json:"name"`
-	PasswordHash string    `json:"-"`
-	CreatedAt    time.Time `json:"createTime"`
-	UpdatedAt    time.Time `json:"updateTime"`
+	ID              string    `json:"id"`
+	Email           string    `json:"email"`
+	Name            string    `json:"name"`
+	IsInstanceAdmin bool      `json:"isInstanceAdmin,omitempty"`
+	PasswordHash    string    `json:"-"`
+	CreatedAt       time.Time `json:"createTime"`
+	UpdatedAt       time.Time `json:"updateTime"`
 }
 
 type Team struct {

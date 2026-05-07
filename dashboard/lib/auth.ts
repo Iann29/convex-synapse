@@ -5,6 +5,7 @@ export type User = {
   id: string;
   email: string;
   name?: string;
+  isInstanceAdmin?: boolean;
 };
 
 export type AuthBundle = {

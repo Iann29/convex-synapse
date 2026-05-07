@@ -37,10 +37,10 @@ type registerReq struct {
 }
 
 type tokenPair struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	TokenType    string `json:"tokenType"`
-	ExpiresIn    int    `json:"expiresIn"` // seconds
+	AccessToken  string      `json:"accessToken"`
+	RefreshToken string      `json:"refreshToken"`
+	TokenType    string      `json:"tokenType"`
+	ExpiresIn    int         `json:"expiresIn"` // seconds
 	User         models.User `json:"user"`
 }
 
@@ -68,11 +68,28 @@ func (h *AuthHandler) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var u models.User
-	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO users (email, password_hash, name)
-		VALUES ($1, $2, $3)
-		RETURNING id, email, name, created_at, updated_at
-	`, req.Email, hash, req.Name).Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt, &u.UpdatedAt)
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		logErr("begin register", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to create user")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	// Serialise first-user promotion. Without the transaction-scoped lock,
+	// two simultaneous first-run registrations could both observe an empty
+	// users table and both become instance admins.
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext('synapse:first_instance_admin'))`); err != nil {
+		logErr("lock first instance admin", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to create user")
+		return
+	}
+
+	err = tx.QueryRow(r.Context(), `
+		INSERT INTO users (email, password_hash, name, is_instance_admin)
+		VALUES ($1, $2, $3, NOT EXISTS (SELECT 1 FROM users))
+		RETURNING id, email, name, is_instance_admin, created_at, updated_at
+	`, req.Email, hash, req.Name).Scan(&u.ID, &u.Email, &u.Name, &u.IsInstanceAdmin, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		// Detect duplicate-email collisions by SQLSTATE + constraint name
 		// rather than by string-matching the message text — Postgres minor
@@ -82,6 +99,11 @@ func (h *AuthHandler) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		logErr("create user", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to create user")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		logErr("commit create user", err)
 		writeError(w, http.StatusInternalServerError, "internal", "Failed to create user")
 		return
 	}
@@ -103,9 +125,9 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 
 	var u models.User
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT id, email, name, password_hash, created_at, updated_at
+		SELECT id, email, name, password_hash, is_instance_admin, created_at, updated_at
 		  FROM users WHERE email = $1
-	`, req.Email).Scan(&u.ID, &u.Email, &u.Name, &u.PasswordHash, &u.CreatedAt, &u.UpdatedAt)
+	`, req.Email).Scan(&u.ID, &u.Email, &u.Name, &u.PasswordHash, &u.IsInstanceAdmin, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Email or password is incorrect")
 		return
@@ -149,8 +171,8 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 
 	var u models.User
 	err = h.DB.QueryRow(r.Context(), `
-		SELECT id, email, name, created_at, updated_at FROM users WHERE id = $1
-	`, claims.UserID).Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt, &u.UpdatedAt)
+		SELECT id, email, name, is_instance_admin, created_at, updated_at FROM users WHERE id = $1
+	`, claims.UserID).Scan(&u.ID, &u.Email, &u.Name, &u.IsInstanceAdmin, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "user_not_found", "User no longer exists")
 		return

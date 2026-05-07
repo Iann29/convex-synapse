@@ -906,7 +906,7 @@ export const api = {
   },
 
   // Instance-level admin operations: version_check + auto-upgrade.
-  // Gated to "any team admin" — see synapse/internal/api/admin.go.
+  // Gated to users.is_instance_admin — see synapse/internal/api/admin.go.
   admin: {
     versionCheck(): Promise<VersionCheck> {
       return request<VersionCheck>("/v1/admin/version_check");

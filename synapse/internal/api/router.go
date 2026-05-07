@@ -100,12 +100,12 @@ type DomainCacheInvalidator interface {
 // through the create-deployment payload (operator can register a
 // different Postgres for a specific tenant).
 type HAConfig struct {
-	Enabled            bool
-	BackendPostgresURL string
-	BackendS3Endpoint  string
-	BackendS3Region    string
-	BackendS3AccessKey string
-	BackendS3SecretKey string
+	Enabled             bool
+	BackendPostgresURL  string
+	BackendS3Endpoint   string
+	BackendS3Region     string
+	BackendS3AccessKey  string
+	BackendS3SecretKey  string
 	BackendBucketPrefix string
 }
 
@@ -215,7 +215,7 @@ func NewRouter(d RouterDeps) http.Handler {
 			r.Mount("/team_invites", invitesH.Routes())
 			// /v1/admin — instance-level operations (version check + auto-
 			// upgrade). The handler's own middleware gates each route to
-			// "any team admin"; we mount inside the authenticated group
+			// users.is_instance_admin; we mount inside the authenticated group
 			// so unauthenticated probes still hit the auth 401 path.
 			adminH := &AdminHandler{
 				DB:            d.DB,

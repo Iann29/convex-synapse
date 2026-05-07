@@ -285,11 +285,12 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 // User is a minimal handle on a registered user — enough to make subsequent
 // authenticated requests on its behalf.
 type User struct {
-	ID           string
-	Email        string
-	Name         string
-	AccessToken  string
-	RefreshToken string
+	ID              string
+	Email           string
+	Name            string
+	IsInstanceAdmin bool
+	AccessToken     string
+	RefreshToken    string
 }
 
 type registerResp struct {
@@ -298,11 +299,12 @@ type registerResp struct {
 	TokenType    string `json:"tokenType"`
 	ExpiresIn    int    `json:"expiresIn"`
 	User         struct {
-		ID         string    `json:"id"`
-		Email      string    `json:"email"`
-		Name       string    `json:"name"`
-		CreateTime time.Time `json:"createTime"`
-		UpdateTime time.Time `json:"updateTime"`
+		ID              string    `json:"id"`
+		Email           string    `json:"email"`
+		Name            string    `json:"name"`
+		IsInstanceAdmin bool      `json:"isInstanceAdmin,omitempty"`
+		CreateTime      time.Time `json:"createTime"`
+		UpdateTime      time.Time `json:"updateTime"`
 	} `json:"user"`
 }
 
@@ -322,11 +324,12 @@ func (h *Harness) RegisterUser(email, password, name string) *User {
 		h.T.Fatalf("decode register: %v", err)
 	}
 	return &User{
-		ID:           rr.User.ID,
-		Email:        rr.User.Email,
-		Name:         rr.User.Name,
-		AccessToken:  rr.AccessToken,
-		RefreshToken: rr.RefreshToken,
+		ID:              rr.User.ID,
+		Email:           rr.User.Email,
+		Name:            rr.User.Name,
+		IsInstanceAdmin: rr.User.IsInstanceAdmin,
+		AccessToken:     rr.AccessToken,
+		RefreshToken:    rr.RefreshToken,
 	}
 }
 

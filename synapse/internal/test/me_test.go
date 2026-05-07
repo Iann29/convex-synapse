@@ -7,11 +7,12 @@ import (
 )
 
 type meResp struct {
-	ID         string    `json:"id"`
-	Email      string    `json:"email"`
-	Name       string    `json:"name"`
-	CreateTime time.Time `json:"createTime"`
-	UpdateTime time.Time `json:"updateTime"`
+	ID              string    `json:"id"`
+	Email           string    `json:"email"`
+	Name            string    `json:"name"`
+	IsInstanceAdmin bool      `json:"isInstanceAdmin,omitempty"`
+	CreateTime      time.Time `json:"createTime"`
+	UpdateTime      time.Time `json:"updateTime"`
 }
 
 func TestMe_UpdateProfileName_TopLevel(t *testing.T) {
