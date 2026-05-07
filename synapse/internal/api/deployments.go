@@ -117,12 +117,12 @@ type DeploymentsHandler struct {
 // TLS layers DO route HA-deployment custom domains; only the
 // CORS-rebuild restart sits out.
 //
-// `existingEnv` is what the deployment was originally provisioned
-// with — today the handler doesn't persist that, so we pass through
-// the four constant defaults plus the dynamic CORS value. If the
-// operator added per-deployment env vars via some out-of-band path
-// (no API for that today), this would clobber them; revisit if/when
-// per-project env vars become real.
+// Project default env vars are reloaded from project_env_vars on each
+// recreate so a custom-domain CORS refresh doesn't silently drop the
+// same env the provisioning worker applies at initial container create.
+// If CORS_ALLOWED_ORIGINS is itself a project env var, the active-domain
+// value wins while custom domains are active because the proxy would
+// otherwise route browser traffic that the backend refuses.
 func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deploymentID, deploymentName string, logger *slog.Logger) bool {
 	if logger == nil {
 		logger = slog.Default()
@@ -132,16 +132,20 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 	// we use a direct query so this stays cheap on the hot path.
 	var (
 		instanceSecret string
+		projectID      string
+		depType        string
 		hostPort       *int
 		adopted        bool
 		haEnabled      bool
 		status         string
 	)
 	err := h.DB.QueryRow(ctx, `
-		SELECT instance_secret, host_port, adopted, ha_enabled, status
+		SELECT instance_secret, project_id, deployment_type, host_port,
+		       adopted, ha_enabled, status
 		  FROM deployments
 		 WHERE id = $1
-	`, deploymentID).Scan(&instanceSecret, &hostPort, &adopted, &haEnabled, &status)
+	`, deploymentID).Scan(&instanceSecret, &projectID, &depType, &hostPort,
+		&adopted, &haEnabled, &status)
 	if err != nil {
 		logger.Warn("rebuild cors: load deployment failed",
 			"deployment_id", deploymentID, "name", deploymentName, "err", err)
@@ -184,7 +188,12 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 		return false
 	}
 
-	envVars := map[string]string{}
+	envVars, err := loadProjectEnvVars(ctx, h.DB, projectID, depType)
+	if err != nil {
+		logger.Warn("rebuild cors: load project env vars failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
 	if len(origins) > 0 {
 		// Comma-separated list — same shape SYNAPSE_ALLOWED_ORIGINS
 		// uses for the API server's own CORS middleware. The Convex
@@ -211,6 +220,33 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 		return false
 	}
 	return true
+}
+
+func loadProjectEnvVars(ctx context.Context, db *pgxpool.Pool, projectID, deploymentType string) (map[string]string, error) {
+	rows, err := db.Query(ctx, `
+		SELECT name, value
+		  FROM project_env_vars
+		 WHERE project_id = $1
+		   AND $2 = ANY(deployment_types)
+		 ORDER BY name ASC
+	`, projectID, deploymentType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var name, value string
+		if err := rows.Scan(&name, &value); err != nil {
+			return nil, err
+		}
+		out[name] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // loadActiveDomainOrigins reads all active domains for the deployment
