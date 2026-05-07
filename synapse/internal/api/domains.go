@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	synapsedb "github.com/Iann29/synapse/internal/db"
+	synapsedns "github.com/Iann29/synapse/internal/dns"
 	"github.com/Iann29/synapse/internal/models"
 )
 
@@ -49,6 +51,17 @@ type DomainsHandler struct {
 	// falls back to slog.Default().
 	Logger *slog.Logger
 
+	// Crypto decrypts dns_credentials.token_encrypted at the moment
+	// auto_configure runs. Optional: nil disables /auto_configure
+	// (returns 503 dns_auto_configure_unavailable) so an operator
+	// running without SYNAPSE_STORAGE_KEY just sees the manual flow.
+	Crypto SecretEnvelope
+
+	// CloudflareFactory mirrors DNSCredentialsHandler.CloudflareFactory
+	// — same factory, both handlers, so test wiring sets it once on the
+	// router deps and both surfaces hit the stubbed Cloudflare API.
+	CloudflareFactory func(token string) *synapsedns.CloudflareClient
+
 	// resolver is overridable in tests so the DNS path doesn't reach
 	// out to the real internet from the integration suite. nil =
 	// use net.DefaultResolver.
@@ -64,6 +77,11 @@ func (h *DomainsHandler) MountInDeploymentRoutes(r chi.Router) {
 	r.Post("/domains", h.createDomain)
 	r.Delete("/domains/{domainID}", h.deleteDomain)
 	r.Post("/domains/{domainID}/verify", h.verifyDomain)
+	// Auto-configure (v1.5+, migration 000015): mint the A record on
+	// the operator's behalf using a stored DNS-provider credential.
+	// Same project-admin gate as add/delete/verify; behaviour gates
+	// on PublicIP being set (we need an IP to point the record at).
+	r.Post("/domains/{domainID}/auto_configure", h.autoConfigureDomain)
 }
 
 // hostnameRegex is a sane DNS label sanity check — at least one dot
@@ -178,16 +196,22 @@ type domainResponse struct {
 
 // scanDomain is the row-shape for SELECTs on deployment_domains. Used
 // by both list + verify paths so the column list stays in one place.
+// auto_configured + dns_credential_id were added in migration 000015
+// for the Cloudflare auto-configure flow; they're nullable so older
+// rows scan as (false, nil).
 const domainSelectCols = `id, deployment_id, domain, role, status,
-	dns_verified_at, last_dns_error, created_at, updated_at`
+	dns_verified_at, last_dns_error, auto_configured, dns_credential_id,
+	created_at, updated_at`
 
 func scanDomainRow(row pgx.Row) (models.DeploymentDomain, error) {
 	var d models.DeploymentDomain
 	var verifiedAt *time.Time
 	var lastErr *string
+	var credID *string
 	if err := row.Scan(
 		&d.ID, &d.DeploymentID, &d.Domain, &d.Role, &d.Status,
-		&verifiedAt, &lastErr, &d.CreatedAt, &d.UpdatedAt,
+		&verifiedAt, &lastErr, &d.AutoConfigured, &credID,
+		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return models.DeploymentDomain{}, err
 	}
@@ -195,6 +219,7 @@ func scanDomainRow(row pgx.Row) (models.DeploymentDomain, error) {
 	if lastErr != nil {
 		d.LastDNSError = *lastErr
 	}
+	d.DNSCredentialID = credID
 	return d, nil
 }
 
@@ -415,16 +440,22 @@ func (h *DomainsHandler) deleteDomain(w http.ResponseWriter, r *http.Request) {
 	// loadDeploymentForRequest check is defense-in-depth on top).
 	// We also pull `status` so we know whether to recreate the
 	// container — only 'active' rows were live in the proxy, so
-	// removing a 'pending' / 'failed' row needs no restart.
+	// removing a 'pending' / 'failed' row needs no restart. The
+	// auto_configured + dns_credential_id columns inform the post-
+	// delete Cloudflare cleanup: if Synapse minted the A record on
+	// the operator's behalf, we tear it down on delete (best-effort)
+	// so their Cloudflare zone stays clean.
 	var (
-		domain string
-		status string
+		domain          string
+		status          string
+		autoConfigured  bool
+		dnsCredentialID *string
 	)
 	err := h.DB.QueryRow(r.Context(), `
 		DELETE FROM deployment_domains
 		WHERE id = $1 AND deployment_id = $2
-		RETURNING domain, status
-	`, domainID, d.ID).Scan(&domain, &status)
+		RETURNING domain, status, auto_configured, dns_credential_id
+	`, domainID, d.ID).Scan(&domain, &status, &autoConfigured, &dnsCredentialID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "domain_not_found",
@@ -435,6 +466,14 @@ func (h *DomainsHandler) deleteDomain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"Failed to delete domain")
 		return
+	}
+
+	// Best-effort Cloudflare cleanup: if we minted the A record, tear
+	// it down. We log on error and continue — the deployment_domains
+	// row is already gone, so a stale Cloudflare record is the lesser
+	// evil vs leaving the operator's domain row half-deleted.
+	if autoConfigured && dnsCredentialID != nil {
+		h.cleanupAutoConfiguredRecord(r.Context(), *dnsCredentialID, domain)
 	}
 
 	uid, _ := auth.UserID(r.Context())
@@ -569,4 +608,375 @@ func (h *DomainsHandler) verifyDomain(w http.ResponseWriter, r *http.Request) {
 		DeploymentDomain:           updated,
 		DeploymentRestartTriggered: restartTriggered,
 	})
+}
+
+// ---------- POST /v1/deployments/{name}/domains/{domainID}/auto_configure ----------
+
+type autoConfigureDomainReq struct {
+	// Optional. When omitted, the handler picks the unique credential
+	// whose zone list covers the domain's apex. Required when more
+	// than one credential matches (the dashboard offers a picker).
+	CredentialID string `json:"credentialId,omitempty"`
+}
+
+func (h *DomainsHandler) autoConfigureDomain(w http.ResponseWriter, r *http.Request) {
+	d, _, t, role, ok := h.Deployments.loadDeploymentForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canEditProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Viewers cannot manage domains; ask a project admin or member")
+		return
+	}
+	if h.Crypto == nil {
+		writeError(w, http.StatusServiceUnavailable, "dns_auto_configure_unavailable",
+			"DNS auto-configure requires SYNAPSE_STORAGE_KEY to be set on the Synapse host")
+		return
+	}
+	if h.PublicIP == "" {
+		writeError(w, http.StatusServiceUnavailable, "public_ip_not_configured",
+			"SYNAPSE_PUBLIC_IP is not set; can't point an A record at this host")
+		return
+	}
+
+	domainID := chi.URLParam(r, "domainID")
+	if domainID == "" {
+		writeError(w, http.StatusBadRequest, "missing_id", "domain id is required")
+		return
+	}
+
+	var req autoConfigureDomainReq
+	if r.ContentLength > 0 {
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+
+	// Load the row we're configuring.
+	var domainName string
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT domain FROM deployment_domains
+		WHERE id = $1 AND deployment_id = $2
+	`, domainID, d.ID).Scan(&domainName)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "domain_not_found",
+				"Domain not found or belongs to a different deployment")
+			return
+		}
+		logErr("load domain for auto-configure", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to load domain")
+		return
+	}
+
+	// Resolve the credential. With CredentialID set we look up that
+	// row directly; otherwise we ask the DB to find the unique
+	// credential whose zones cover this domain's apex.
+	cred, code, msg, status := h.resolveCredentialForDomain(r.Context(), req.CredentialID, domainName)
+	if code != "" {
+		writeError(w, status, code, msg)
+		return
+	}
+
+	// Decrypt the token. Failure here is a 500 — it means
+	// SYNAPSE_STORAGE_KEY rotated without re-encrypting the rows, or
+	// the column was tampered with. Either way the operator should
+	// hear about it loudly.
+	plaintextToken, err := h.Crypto.DecryptString(cred.tokenEncrypted)
+	if err != nil {
+		logErr("decrypt cloudflare token", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to decrypt DNS credential token")
+		return
+	}
+
+	zoneName, recordName, ok := longestMatchingZone(domainName, cred.zones)
+	if !ok {
+		// We already filtered on this in resolveCredentialForDomain
+		// when no credential_id was supplied; explicit credential_id
+		// can still hit this when the picked credential doesn't
+		// actually cover the domain.
+		writeError(w, http.StatusBadRequest, "no_credential_for_zone",
+			"The selected credential's zones don't cover "+domainName)
+		return
+	}
+
+	client := h.cloudflareClient(plaintextToken)
+	if err := client.UpsertARecord(r.Context(), zoneName, recordName, h.PublicIP); err != nil {
+		// Token revoked or wrong scopes → 400 + persist last_error
+		// onto the credential row so the dashboard surfaces it
+		// without another round-trip.
+		if errors.Is(err, synapsedns.ErrUnauthorized) {
+			h.recordCredentialError(r.Context(), cred.id, err.Error())
+			writeError(w, http.StatusBadRequest, "token_invalid_or_revoked",
+				"Cloudflare rejected the stored token; rotate the credential")
+			return
+		}
+		// Any other error is upstream / network — 502 keeps the
+		// dashboard's error banner short and re-tryable.
+		h.recordCredentialError(r.Context(), cred.id, err.Error())
+		writeError(w, http.StatusBadGateway, "cloudflare_api_error",
+			"Cloudflare API error: "+err.Error())
+		return
+	}
+
+	// Mark the row auto-configured. Status stays 'pending' — the
+	// existing /verify endpoint flips to 'active' on a successful DNS
+	// match (PR C automates this with a polling loop).
+	row := h.DB.QueryRow(r.Context(), `
+		UPDATE deployment_domains
+		SET auto_configured = true,
+		    dns_credential_id = $2,
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING `+domainSelectCols, domainID, cred.id)
+	updated, err := scanDomainRow(row)
+	if err != nil {
+		logErr("update domain after auto-configure", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"A record created but failed to update the domain row")
+		return
+	}
+
+	// Mark the credential successful — bumps last_used_at, clears
+	// any stale last_error from a previous failed attempt.
+	_, _ = h.DB.Exec(r.Context(), `
+		UPDATE dns_credentials
+		SET last_used_at = now(), last_error = NULL
+		WHERE id = $1
+	`, cred.id)
+
+	uid, _ := auth.UserID(r.Context())
+	teamID := ""
+	if t != nil {
+		teamID = t.ID
+	}
+	_ = audit.Record(r.Context(), h.DB, audit.Options{
+		TeamID:     teamID,
+		ActorID:    uid,
+		Action:     audit.ActionAutoConfigureDomain,
+		TargetType: audit.TargetDomain,
+		TargetID:   domainID,
+		Metadata: map[string]any{
+			"deploymentId":   d.ID,
+			"deploymentName": d.Name,
+			"domain":         domainName,
+			"credentialId":   cred.id,
+			"zone":           zoneName,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, domainResponse{DeploymentDomain: updated})
+}
+
+// dnsCredentialForAuto is the subset of dns_credentials a single
+// auto-configure call needs: id, zones, encrypted token. We don't
+// pull last_used_at / last_error / created_by because they're
+// observability fields the handler only writes back to.
+type dnsCredentialForAuto struct {
+	id             string
+	zones          []models.ZoneInfo
+	tokenEncrypted []byte
+}
+
+// resolveCredentialForDomain implements the credential-selection rules
+// described in the brief:
+//
+//   - credential_id provided → fetch that row, error 404 if missing
+//   - credential_id empty + exactly one credential whose zone covers
+//     the domain → use it
+//   - credential_id empty + zero matches → 400 no_credential_for_zone
+//   - credential_id empty + 2+ matches → 400 credential_required
+//
+// Returns either a populated dnsCredentialForAuto OR (code, msg, status)
+// for writeError. The dual-return shape mirrors validateDomain in the
+// same file.
+func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credentialID, domainName string) (dnsCredentialForAuto, string, string, int) {
+	if credentialID != "" {
+		var c dnsCredentialForAuto
+		var zonesRaw []byte
+		err := h.DB.QueryRow(ctx, `
+			SELECT id, zones, token_encrypted FROM dns_credentials
+			WHERE id = $1
+		`, credentialID).Scan(&c.id, &zonesRaw, &c.tokenEncrypted)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return dnsCredentialForAuto{}, "credential_not_found",
+					"DNS credential not found", http.StatusNotFound
+			}
+			logErr("load credential", err)
+			return dnsCredentialForAuto{}, "internal",
+				"Failed to load DNS credential", http.StatusInternalServerError
+		}
+		if len(zonesRaw) > 0 {
+			_ = json.Unmarshal(zonesRaw, &c.zones)
+		}
+		return c, "", "", 0
+	}
+
+	// Auto-pick: list all credentials, walk in-memory. The set is
+	// expected to be tiny (single-tenant operator is the target),
+	// so a SQL-level zone match isn't worth the JSONB query
+	// complexity.
+	rows, err := h.DB.Query(ctx, `
+		SELECT id, zones, token_encrypted FROM dns_credentials
+	`)
+	if err != nil {
+		logErr("list credentials for auto-pick", err)
+		return dnsCredentialForAuto{}, "internal",
+			"Failed to list DNS credentials", http.StatusInternalServerError
+	}
+	defer rows.Close()
+
+	var matches []dnsCredentialForAuto
+	for rows.Next() {
+		var c dnsCredentialForAuto
+		var zonesRaw []byte
+		if err := rows.Scan(&c.id, &zonesRaw, &c.tokenEncrypted); err != nil {
+			logErr("scan credential", err)
+			return dnsCredentialForAuto{}, "internal",
+				"Failed to read DNS credentials", http.StatusInternalServerError
+		}
+		if len(zonesRaw) > 0 {
+			_ = json.Unmarshal(zonesRaw, &c.zones)
+		}
+		if _, _, ok := longestMatchingZone(domainName, c.zones); ok {
+			matches = append(matches, c)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return dnsCredentialForAuto{}, "no_credential_for_zone",
+			"No saved DNS credential covers the apex of " + domainName, http.StatusBadRequest
+	case 1:
+		return matches[0], "", "", 0
+	default:
+		return dnsCredentialForAuto{}, "credential_required",
+			"Multiple DNS credentials cover this domain; pass credentialId to disambiguate",
+			http.StatusBadRequest
+	}
+}
+
+// longestMatchingZone walks `zones` looking for the entry whose Name
+// is the longest suffix of `domain`. Returns the zone name (e.g.
+// "fechasul.com.br") and the relative record name (e.g. "api" for
+// "api.fechasul.com.br"; "@" for the apex).
+//
+// Returns ok=false when nothing matches. Comparison is case-
+// insensitive — Cloudflare normalises both sides.
+func longestMatchingZone(domain string, zones []models.ZoneInfo) (zoneName, recordName string, ok bool) {
+	d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	bestZone := ""
+	for _, z := range zones {
+		zn := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(z.Name), "."))
+		if zn == "" {
+			continue
+		}
+		if d == zn {
+			if len(zn) > len(bestZone) {
+				bestZone = zn
+			}
+			continue
+		}
+		if strings.HasSuffix(d, "."+zn) {
+			if len(zn) > len(bestZone) {
+				bestZone = zn
+			}
+		}
+	}
+	if bestZone == "" {
+		return "", "", false
+	}
+	if d == bestZone {
+		// Apex record. libdns/cloudflare accepts "@" and translates
+		// it to the bare zone name on the wire.
+		return bestZone, "@", true
+	}
+	rec := strings.TrimSuffix(d, "."+bestZone)
+	return bestZone, rec, true
+}
+
+// recordCredentialError stamps last_error on the credential row so
+// the dashboard can show "Cloudflare rejected this token" without
+// another API round-trip. Best-effort — the auto_configure response
+// is more important than this hint.
+func (h *DomainsHandler) recordCredentialError(ctx context.Context, credID, msg string) {
+	if credID == "" || msg == "" {
+		return
+	}
+	if len(msg) > 1024 {
+		msg = msg[:1024]
+	}
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE dns_credentials
+		SET last_error = $2, last_used_at = now()
+		WHERE id = $1
+	`, credID, msg); err != nil {
+		// Logged but not surfaced — the parent handler already
+		// returned a structured error to the user.
+		logErr("record credential error", err)
+	}
+}
+
+// cloudflareClient builds (or reuses, via injected factory) a
+// CloudflareClient for the given plaintext token.
+func (h *DomainsHandler) cloudflareClient(token string) *synapsedns.CloudflareClient {
+	if h.CloudflareFactory != nil {
+		return h.CloudflareFactory(token)
+	}
+	return &synapsedns.CloudflareClient{Token: token}
+}
+
+// cleanupAutoConfiguredRecord deletes the A record we minted on the
+// operator's Cloudflare account when the deployment_domains row is
+// removed. Best-effort: any failure is logged + swallowed because
+// the deployment_domains row is already gone (returning 5xx now would
+// confuse the operator into thinking the delete didn't take).
+func (h *DomainsHandler) cleanupAutoConfiguredRecord(ctx context.Context, credID, domain string) {
+	if h.Crypto == nil {
+		// Auto_configured rows shouldn't exist without Crypto, but
+		// defense-in-depth: if SYNAPSE_STORAGE_KEY rotated out we
+		// silently skip the cleanup.
+		return
+	}
+	logger := h.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	var (
+		zonesRaw       []byte
+		tokenEncrypted []byte
+	)
+	err := h.DB.QueryRow(ctx, `
+		SELECT zones, token_encrypted FROM dns_credentials WHERE id = $1
+	`, credID).Scan(&zonesRaw, &tokenEncrypted)
+	if err != nil {
+		logger.Warn("dns cleanup: load credential",
+			"credentialId", credID, "domain", domain, "err", err)
+		return
+	}
+	var zones []models.ZoneInfo
+	if len(zonesRaw) > 0 {
+		_ = json.Unmarshal(zonesRaw, &zones)
+	}
+	zoneName, recordName, ok := longestMatchingZone(domain, zones)
+	if !ok {
+		logger.Warn("dns cleanup: no matching zone",
+			"credentialId", credID, "domain", domain)
+		return
+	}
+	plaintext, err := h.Crypto.DecryptString(tokenEncrypted)
+	if err != nil {
+		logger.Warn("dns cleanup: decrypt token",
+			"credentialId", credID, "err", err)
+		return
+	}
+	client := h.cloudflareClient(plaintext)
+	if err := client.DeleteARecord(ctx, zoneName, recordName); err != nil {
+		logger.Warn("dns cleanup: delete A record",
+			"credentialId", credID, "domain", domain, "err", err)
+	}
 }

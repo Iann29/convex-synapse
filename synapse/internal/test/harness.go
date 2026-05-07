@@ -39,6 +39,7 @@ import (
 	cryptopkg "github.com/Iann29/synapse/internal/crypto"
 	"github.com/Iann29/synapse/internal/db"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
+	synapsedns "github.com/Iann29/synapse/internal/dns"
 	"github.com/Iann29/synapse/internal/provisioner"
 )
 
@@ -148,6 +149,18 @@ type SetupOpts struct {
 	// HostDomainResolver lets host-domain tests inject a fake DNS
 	// resolver. nil = use the system resolver (production wiring).
 	HostDomainResolver api.HostDomainResolver
+
+	// DNSEnvelope opts the test into the DNS-credentials path. Pass
+	// a real *crypto.SecretBox to exercise encrypt+decrypt; leave
+	// nil to drive the "crypto_not_configured" 503 path.
+	DNSEnvelope api.SecretEnvelope
+	// CloudflareFactory wires the dns_credentials handler + the
+	// auto-configure handler at a stubbed Cloudflare API. Tests pass
+	// `func(token string) *dns.CloudflareClient { return &dns.CloudflareClient{Token: token, BaseURL: stub.URL} }`.
+	CloudflareFactory func(token string) *synapsedns.CloudflareClient
+	// DNSProviderLookup wires /v1/internal/dns_provider at a stubbed
+	// resolver so the test suite doesn't need real-internet DNS.
+	DNSProviderLookup func(ctx context.Context, domain string) (string, []string, error)
 }
 
 // stubResolverFunc adapts a closure to api.HostDomainResolver.
@@ -248,6 +261,9 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		GitHubAPIBase:         opts.GitHubAPIBase,
 		PublicIP:              opts.PublicIP,
 		HostDomainResolver:    opts.HostDomainResolver,
+		DNSEnvelope:           opts.DNSEnvelope,
+		CloudflareFactory:     opts.CloudflareFactory,
+		DNSProviderLookup:     opts.DNSProviderLookup,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a

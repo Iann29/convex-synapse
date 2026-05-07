@@ -86,9 +86,20 @@ const (
 	// level. Matches the existing "<verb><Noun>" pattern with a
 	// concrete noun ("Domain") so audit_events queries can pick out
 	// the resource without joining target_id.
-	ActionAddDomain      = "domain.added"
-	ActionRemoveDomain   = "domain.removed"
-	ActionVerifyDomain   = "domain.verified"
+	ActionAddDomain    = "domain.added"
+	ActionRemoveDomain = "domain.removed"
+	ActionVerifyDomain = "domain.verified"
+	// Cloudflare DNS auto-configure (v1.5+, migration 000015).
+	// Emitted when an operator clicks "auto-configure" on a domain
+	// row and Synapse mints/updates the A record on their behalf.
+	ActionAutoConfigureDomain = "domain.auto_configured"
+
+	// DNS-provider credentials (v1.5+, migration 000015). Stored at
+	// the instance level (gated to instance_admin); the metadata
+	// scope identifies the provider so audit queries can filter by
+	// "all cloudflare credential changes" cheaply.
+	ActionAddDNSCredential    = "dns_credential.added"
+	ActionRemoveDNSCredential = "dns_credential.removed"
 
 	// Instance-level upgrade flow (v1.1.0+). Synapse-original — Cloud has
 	// no per-customer upgrade because Cloud is the platform.
@@ -116,6 +127,8 @@ const (
 	TargetDomain = "domain"
 	// TargetSynapse is the instance itself — used by upgrade events.
 	TargetSynapse = "synapse"
+	// TargetDNSCredential is a dns_credentials row.
+	TargetDNSCredential = "dnsCredential"
 )
 
 // Options collects the optional fields of an audit event. Empty strings are

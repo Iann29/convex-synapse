@@ -60,6 +60,11 @@ type AdminHandler struct {
 	// integration suite. nil = use net.DefaultResolver.
 	HostDomainResolver HostDomainResolver
 
+	// DNSCredentials, when non-nil, mounts /dns_credentials sub-routes
+	// under /v1/admin. Wired by router.go so the credential handler
+	// inherits requireInstanceAdmin without duplicating the gate.
+	DNSCredentials *DNSCredentialsHandler
+
 	// Cache for the latest-release fetch. GitHub's unauthenticated API limit
 	// is 60 req/hour; with this 15min cache, a busy dashboard with N admin
 	// pollers stays well under that.
@@ -94,6 +99,13 @@ func (h *AdminHandler) Routes() chi.Router {
 	r.Get("/host_domain", h.getHostDomain)
 	r.Post("/host_domain", h.postHostDomain)
 	r.Get("/host_domain/status/{jobID}", h.getHostDomainStatus)
+	// DNS-provider credentials (v1.5+, migration 000015). Mounted as
+	// a child of /admin so everything below /admin shares the
+	// requireInstanceAdmin gate. Nil means router wired without DNS
+	// support; the dashboard probes feature availability via 404.
+	if h.DNSCredentials != nil {
+		r.Mount("/dns_credentials", h.DNSCredentials.Routes())
+	}
 	return r
 }
 
