@@ -9,12 +9,17 @@ import { truncateAll } from "./helpers/db";
 
 const API_BASE = process.env.SYNAPSE_API_URL || "http://localhost:8080";
 
-// Host-domain admin panel — exercises components/HostDomainPanel.tsx.
+// Host-domain admin panel — exercises components/HostDomainPanel.tsx,
+// mounted at /admin/host-domain (instance-admin-only).
 //
-// The full apply path runs setup.sh on the host, which we obviously can't
-// invoke from a Playwright run. Instead, we mock /v1/admin/host_domain at
-// the page-route level so we can drive the form + confirm modal without
-// the backend needing to be wired up. (The PR that ships the backend half
+// Layout under /admin/* enforces the gate: non-admins are redirected to
+// /teams. The Admin link in the top nav is conditional on
+// is_instance_admin, so non-admins never see it either.
+//
+// The full apply path runs setup.sh on the host, which we can't invoke
+// from a Playwright run. Instead, we mock /v1/admin/host_domain at the
+// page-route level so we can drive the form + confirm modal without the
+// backend needing to be wired up. (The PR that ships the backend half
 // has its own Go integration coverage; this spec covers the UI wiring.)
 //
 // The actual end-to-end (real DNS swap → real Caddy reload → real
@@ -57,21 +62,6 @@ async function seedSecondUser(
   }
 }
 
-// Bookmark a team so the user has somewhere to land — the settings
-// sidebar lives under /teams/<slug>/settings and we need a real team
-// to navigate to. Returns the slug.
-async function createTeam(page: Page, name: string): Promise<string> {
-  await page.getByRole("button", { name: "Create team" }).click();
-  const dialog = page.getByRole("dialog");
-  await dialog.locator("#team-name").fill(name);
-  await dialog.getByRole("button", { name: "Create", exact: true }).click();
-  await page.getByRole("link", { name: new RegExp(name, "i") }).click();
-  // URL: /teams/<slug>
-  const url = page.url();
-  const m = url.match(/\/teams\/([^/?#]+)/);
-  return m?.[1] ?? name.toLowerCase().replace(/\s+/g, "-");
-}
-
 // Page-level mock for /v1/admin/host_domain GET. Drops the response we
 // want into the dashboard's network without touching the real backend.
 async function mockHostDomainGet(
@@ -96,7 +86,7 @@ test.beforeEach(async () => {
   await truncateAll();
 });
 
-test("non-admin user does not see the Host Domain nav item", async ({
+test("non-admin user sees no Admin link and is redirected from /admin", async ({
   page,
   request,
 }) => {
@@ -109,11 +99,7 @@ test("non-admin user does not see the Host Domain nav item", async ({
   await page.getByRole("button", { name: "Create account" }).click();
   await expect(page).toHaveURL(/\/teams\b/);
 
-  // Create a team while still admin so the non-admin has somewhere
-  // to navigate to.
-  const slug = await createTeam(page, "Acme");
-
-  // Log out. Easiest path: clear localStorage and bounce to /login.
+  // Log out.
   await page.evaluate(() => window.localStorage.clear());
 
   // Register a second user via API + log in via UI.
@@ -124,48 +110,20 @@ test("non-admin user does not see the Host Domain nav item", async ({
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(/\/teams\b/);
 
-  // The member is NOT in the admin's team — they're an island user
-  // until invited. So push them to the admin's team settings via URL
-  // (they'll get a 403 on the team page itself, but the SETTINGS nav
-  // is what we're checking — does the host-domain link appear at all?
-  // Layout pulls /me; non-admin /me lacks isInstanceAdmin → no link).
-  //
-  // We point at /teams (which the member CAN see) and confirm the link
-  // is absent there. The settings nav is per-team but the gate is
-  // is_instance_admin which is global — so its presence is consistent
-  // across any settings sidebar the member can see.
-  //
-  // To exercise the actual sidebar, the member needs a team. Easiest:
-  // give them their own team.
-  await page.getByRole("button", { name: "Create team" }).click();
-  const dialog = page.getByRole("dialog");
-  await dialog.locator("#team-name").fill("Member Team");
-  await dialog.getByRole("button", { name: "Create", exact: true }).click();
-  await page.getByRole("link", { name: /member team/i }).click();
-  await page.goto(`/teams/member-team/settings/general`);
+  // Top nav: the Admin link is absent for non-admins.
+  await expect(page.getByTestId("topnav-admin-link")).toHaveCount(0);
 
-  // Sidebar exists, but the Host Domain entry should not.
-  await expect(
-    page.getByRole("navigation", { name: "Team settings sections" }),
-  ).toBeVisible();
-  await expect(
-    page.getByTestId("settings-nav-host-domain"),
-  ).toHaveCount(0);
-
-  // Direct URL access still bounces to the not-authorised card.
-  await page.goto(`/teams/member-team/settings/host-domain`);
-  await expect(page.getByTestId("host-domain-not-admin")).toBeVisible();
-  // And the panel proper does NOT render.
+  // Direct URL access to /admin/host-domain bounces to /teams.
+  await page.goto("/admin/host-domain");
+  await expect(page).toHaveURL(/\/teams\b/);
+  // The host-domain panel never rendered.
   await expect(page.getByTestId("host-domain-panel")).toHaveCount(0);
-
-  // Confirm: just making sure the admin's team isn't somehow leaking
-  // into this member's view either.
-  expect(slug).not.toEqual("member-team");
 });
 
-test("admin sees the panel and the current configuration", async ({ page }) => {
+test("admin sees the Admin link and the panel renders the current configuration", async ({
+  page,
+}) => {
   await registerAdmin(page);
-  const slug = await createTeam(page, "Acme");
 
   await mockHostDomainGet(page, {
     mode: "tls",
@@ -176,10 +134,13 @@ test("admin sees the panel and the current configuration", async ({ page }) => {
     fallbackUrls: ["http://1.2.3.4"],
   });
 
-  await page.goto(`/teams/${slug}/settings/host-domain`);
+  // Top nav exposes the Admin link to instance admins.
+  await expect(page.getByTestId("topnav-admin-link")).toBeVisible();
+  await page.getByTestId("topnav-admin-link").click();
+  await expect(page).toHaveURL(/\/admin\/host-domain\b/);
 
-  // Sidebar entry visible to admins.
-  await expect(page.getByTestId("settings-nav-host-domain")).toBeVisible();
+  // Sidebar entry under /admin
+  await expect(page.getByTestId("admin-nav-host-domain")).toBeVisible();
 
   // Panel mounts and reads from the mocked endpoint.
   await expect(page.getByTestId("host-domain-panel")).toBeVisible();
@@ -202,7 +163,6 @@ test("admin enters an invalid domain and the form rejects it", async ({
   page,
 }) => {
   await registerAdmin(page);
-  const slug = await createTeam(page, "Acme");
 
   await mockHostDomainGet(page, {
     mode: "plain",
@@ -211,7 +171,7 @@ test("admin enters an invalid domain and the form rejects it", async ({
     fallbackUrls: ["http://1.2.3.4"],
   });
 
-  await page.goto(`/teams/${slug}/settings/host-domain`);
+  await page.goto("/admin/host-domain");
   await expect(page.getByTestId("host-domain-panel")).toBeVisible();
 
   // Open the change form.
@@ -236,7 +196,6 @@ test("admin enters a valid domain and the confirm modal appears", async ({
   page,
 }) => {
   await registerAdmin(page);
-  const slug = await createTeam(page, "Acme");
 
   await mockHostDomainGet(page, {
     mode: "plain",
@@ -245,7 +204,7 @@ test("admin enters a valid domain and the confirm modal appears", async ({
     fallbackUrls: ["http://1.2.3.4"],
   });
 
-  await page.goto(`/teams/${slug}/settings/host-domain`);
+  await page.goto("/admin/host-domain");
   await page.getByTestId("host-domain-change-open").click();
   await page.getByTestId("host-domain-mode-tls").click();
   await page
@@ -276,7 +235,6 @@ test("cancelling the confirm modal returns to the form unchanged", async ({
   page,
 }) => {
   await registerAdmin(page);
-  const slug = await createTeam(page, "Acme");
 
   await mockHostDomainGet(page, {
     mode: "plain",
@@ -285,7 +243,7 @@ test("cancelling the confirm modal returns to the form unchanged", async ({
     fallbackUrls: ["http://1.2.3.4"],
   });
 
-  await page.goto(`/teams/${slug}/settings/host-domain`);
+  await page.goto("/admin/host-domain");
   await page.getByTestId("host-domain-change-open").click();
   await page.getByTestId("host-domain-mode-tls").click();
   await page
