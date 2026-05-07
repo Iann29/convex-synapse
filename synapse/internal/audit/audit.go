@@ -93,6 +93,13 @@ const (
 	// Instance-level upgrade flow (v1.1.0+). Synapse-original — Cloud has
 	// no per-customer upgrade because Cloud is the platform.
 	ActionUpgradeStarted = "upgradeStarted"
+
+	// Host-domain reconfigure flow (v1.4+). Emitted on a successful POST
+	// /v1/admin/host_domain — the actual setup.sh --reconfigure run is
+	// asynchronous, so this captures "operator clicked apply" not
+	// "reconfigure succeeded". Pair with /v1/admin/host_domain/status/<id>
+	// for outcome.
+	ActionHostDomainChangeInitiated = "host_domain.change_initiated"
 )
 
 // Target type names.

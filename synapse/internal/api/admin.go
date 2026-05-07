@@ -47,6 +47,19 @@ type AdminHandler struct {
 	// keeps the default; empty falls through to the official endpoint.
 	GitHubAPIBase string
 
+	// PublicURL / BaseDomain / PublicIP mirror RouterDeps so GET
+	// /v1/admin/host_domain can return the running config without
+	// re-reading os.Getenv. POST validation also uses PublicIP for the
+	// DNS preflight against the configured public IP.
+	PublicURL  string
+	BaseDomain string
+	PublicIP   string
+
+	// HostDomainResolver is overridable in tests so the host-domain
+	// DNS preflight doesn't reach out to the real internet from the
+	// integration suite. nil = use net.DefaultResolver.
+	HostDomainResolver HostDomainResolver
+
 	// Cache for the latest-release fetch. GitHub's unauthenticated API limit
 	// is 60 req/hour; with this 15min cache, a busy dashboard with N admin
 	// pollers stays well under that.
@@ -73,6 +86,14 @@ func (h *AdminHandler) Routes() chi.Router {
 	r.Get("/version_check", h.versionCheck)
 	r.Post("/upgrade", h.upgrade)
 	r.Get("/upgrade/status", h.upgradeStatus)
+	// Host-domain reconfigure (v1.4+). GET surfaces the current
+	// config so the dashboard can pre-fill the form; POST hands the
+	// requested change off to the synapse-updater daemon; status reads
+	// the admin_jobs row the daemon updates. Same instance-admin gate
+	// as the rest of /v1/admin.
+	r.Get("/host_domain", h.getHostDomain)
+	r.Post("/host_domain", h.postHostDomain)
+	r.Get("/host_domain/status/{jobID}", h.getHostDomainStatus)
 	return r
 }
 

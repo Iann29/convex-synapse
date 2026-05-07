@@ -21,11 +21,17 @@ Endpoints:
   GET  /status               → 200 status JSON              (idle | running | success | failed)
   POST /upgrade {ref?: str}  → 202 {"started": true}
                                409 if upgrade already in progress
+  POST /reconfigure_host_domain {jobId, domain?, baseDomain?, plainHttp?, acmeEmail?}
+                             → 202 {"started": true, "jobId": "<id>"}
+                               409 if a reconfigure is already in progress
+                               (writes back to the admin_jobs row via psql)
 
 State files (persisted across daemon restarts):
-  /var/lib/synapse-updater/status.json  — last known state
-  /var/lib/synapse-updater/upgrade.lock — present while a child is running
-  /var/log/synapse-updater/<utc>.log    — full log of the last/current upgrade
+  /var/lib/synapse-updater/status.json     — last known upgrade state
+  /var/lib/synapse-updater/upgrade.lock    — present while an upgrade child is running
+  /var/lib/synapse-updater/reconfigure.lock — present while a reconfigure child is running
+  /var/log/synapse-updater/<utc>.log       — full log of the last/current upgrade
+  /var/log/synapse-updater/reconfigure-<utc>.log — full log of the last/current reconfigure
 
 Run as root (User=root in the systemd unit) — setup.sh writes to /opt/synapse,
 talks to /var/run/docker.sock, and may call apt-get; sub-rooting that to a
@@ -57,8 +63,10 @@ SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 STATUS_FILE = STATE_DIR / "status.json"
 LOCK_FILE = STATE_DIR / "upgrade.lock"
+RECONFIGURE_LOCK_FILE = STATE_DIR / "reconfigure.lock"
 
 upgrade_lock = threading.Lock()
+reconfigure_lock = threading.Lock()
 
 
 def utc_now() -> str:
@@ -185,6 +193,160 @@ def run_upgrade(ref: str) -> None:
         pass
 
 
+# ---------- reconfigure_host_domain ----------
+#
+# A second job kind that drives `setup.sh --reconfigure ...`. Unlike
+# /upgrade, the daemon updates an admin_jobs row in Postgres so the
+# Synapse api can render progress to the operator without the daemon
+# needing to expose a per-job /status route. Lock file keeps two
+# reconfigures from racing the same compose stack.
+
+def _resolve_postgres_url() -> str:
+    """Find the POSTGRES_URL the api server reads. We re-read the file
+    each call so an operator who edits .env between calls sees the new
+    value. Returns "" if no .env / no POSTGRES_URL — caller treats that
+    as "skip the DB writeback" (the api will see state='queued' until
+    something flips it manually)."""
+    env_path = INSTALL_DIR / ".env"
+    if not env_path.exists():
+        return ""
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("POSTGRES_URL="):
+                return line[len("POSTGRES_URL="):].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _psql_exec(sql: str, params: list, log_path: Path) -> None:
+    """Best-effort psql shell-out. Failures are logged to the per-job
+    log file but don't crash the daemon — losing a row update is
+    preferable to losing the run itself."""
+    url = _resolve_postgres_url()
+    if not url:
+        return
+    psql = shutil.which("psql")
+    if not psql:
+        return
+    # Use parameterised "$1, $2..." via -v-style is not supported; we
+    # build the values via the env-and-format pattern. For safety with
+    # untrusted input we shell-quote each param. Since we control all
+    # callers, this is sufficient.
+    quoted = []
+    for p in params:
+        if p is None:
+            quoted.append("NULL")
+        else:
+            # psql accepts $$...$$ as a delimited literal; safer than
+            # single-quoting ourselves because it sidesteps escape
+            # concerns. We pick a unique tag to avoid collisions in
+            # log payloads (which can contain $$).
+            quoted.append("$tag$" + str(p) + "$tag$")
+    rendered = sql
+    for i, q in enumerate(quoted, start=1):
+        rendered = rendered.replace(f"${i}", q)
+    try:
+        subprocess.run(
+            [psql, url, "-v", "ON_ERROR_STOP=1", "-c", rendered],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        try:
+            with open(log_path, "ab") as logf:
+                logf.write(f"\n[synapse-updater] psql writeback failed: {e}\n".encode())
+        except OSError:
+            pass
+
+
+def run_reconfigure(job_id: str, payload: dict) -> None:
+    """Worker thread for /reconfigure_host_domain. Writes admin_jobs
+    state transitions via psql + captures stdout/stderr to a per-run
+    log file. The api serves /v1/admin/host_domain/status/<id> by
+    reading the same row, so we don't need to expose a daemon-side
+    /status for this path."""
+    started_at_iso = utc_now()
+    log_path = LOG_DIR / f"reconfigure-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.log"
+
+    _psql_exec(
+        "UPDATE admin_jobs SET state = 'running', started_at = now() WHERE id = $1",
+        [job_id], log_path,
+    )
+
+    cmd = [str(INSTALL_DIR / "setup.sh"), "--reconfigure", "--non-interactive"]
+    if payload.get("plainHttp"):
+        cmd.append("--no-tls")
+    else:
+        if payload.get("domain"):
+            cmd.append(f"--domain={payload['domain']}")
+        if payload.get("baseDomain"):
+            cmd.append(f"--base-domain={payload['baseDomain']}")
+        if payload.get("acmeEmail"):
+            cmd.append(f"--acme-email={payload['acmeEmail']}")
+
+    child_env = dict(os.environ)
+    child_env["SYNAPSE_UPDATER_NO_RESTART"] = "1"
+
+    exit_code = 1
+    try:
+        with open(log_path, "wb") as logf:
+            logf.write(
+                f"[synapse-updater] starting: {' '.join(shlex.quote(c) for c in cmd)}\n".encode()
+            )
+            logf.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                cwd=str(INSTALL_DIR),
+                env=child_env,
+            )
+            exit_code = proc.wait()
+    except (OSError, subprocess.SubprocessError) as e:
+        try:
+            with open(log_path, "ab") as logf:
+                logf.write(f"\n[synapse-updater] spawn error: {e}\n".encode())
+        except OSError:
+            pass
+        exit_code = 1
+
+    final_state = "succeeded" if exit_code == 0 else "failed"
+    log_excerpt = ""
+    try:
+        log_excerpt = log_path.read_text(errors="replace")
+        # Cap the log we write back to the DB so a runaway setup.sh
+        # doesn't bloat the row past comfortable JSON-payload sizes.
+        if len(log_excerpt) > 64 * 1024:
+            log_excerpt = "...\n" + log_excerpt[-64 * 1024:]
+    except OSError:
+        pass
+
+    error_msg = ""
+    if final_state == "failed":
+        # Grab the last non-empty line as a one-line summary the
+        # dashboard can render in a banner; full log stays in `log`.
+        for line in reversed(log_excerpt.splitlines()):
+            line = line.strip()
+            if line:
+                error_msg = line[:500]
+                break
+        if not error_msg:
+            error_msg = f"setup.sh --reconfigure exited with code {exit_code}"
+
+    _psql_exec(
+        "UPDATE admin_jobs SET state = $1, finished_at = now(), log = $2, error = $3 WHERE id = $4",
+        [final_state, log_excerpt, error_msg or None, job_id], log_path,
+    )
+
+    try:
+        RECONFIGURE_LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "synapse-updater/1.0"
     # Quiet the default access log — systemd journal already captures stderr.
@@ -223,16 +385,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/upgrade":
-            return self._json(404, {"error": "not_found"})
+        if self.path == "/upgrade":
+            return self._handle_upgrade()
+        if self.path == "/reconfigure_host_domain":
+            return self._handle_reconfigure()
+        return self._json(404, {"error": "not_found"})
 
+    def _read_body(self) -> tuple[dict, str]:
         length = int(self.headers.get("Content-Length", "0") or 0)
-        body = {}
-        if length > 0:
-            try:
-                body = json.loads(self.rfile.read(length).decode())
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return self._json(400, {"error": "invalid_json"})
+        if length <= 0:
+            return {}, ""
+        try:
+            return json.loads(self.rfile.read(length).decode()), ""
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}, "invalid_json"
+
+    def _handle_upgrade(self) -> None:
+        body, err = self._read_body()
+        if err:
+            return self._json(400, {"error": err})
 
         ref = (body.get("ref") or "").strip()
         # ref must be a tag/branch — block shell metachars defensively.
@@ -254,6 +425,56 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Thread(target=run_upgrade, args=(ref,), daemon=True).start()
         return self._json(202, {"started": True, "ref": ref or "latest"})
+
+    def _handle_reconfigure(self) -> None:
+        body, err = self._read_body()
+        if err:
+            return self._json(400, {"error": err})
+
+        job_id = (body.get("jobId") or "").strip()
+        if not job_id:
+            return self._json(400, {"error": "missing_job_id"})
+        # jobId is a UUID written by the api — defensive sanity-check.
+        if not all(c in "0123456789abcdef-" for c in job_id.lower()) or len(job_id) > 64:
+            return self._json(400, {"error": "invalid_job_id"})
+
+        # plainHttp + (domain | baseDomain) are mutually exclusive
+        # — same rule the api enforces, mirrored here so a malformed
+        # caller doesn't reach setup.sh with a contradictory flag set.
+        plain = bool(body.get("plainHttp"))
+        domain = (body.get("domain") or "").strip()
+        base = (body.get("baseDomain") or "").strip()
+        acme = (body.get("acmeEmail") or "").strip()
+        if plain and (domain or base):
+            return self._json(400, {"error": "invalid_payload"})
+        if not plain and not domain and not base:
+            return self._json(400, {"error": "invalid_payload"})
+
+        # Block shell metacharacters in any forwarded value — setup.sh
+        # quotes its own args but a hostname with backticks would
+        # already fail validateDomain on the api side; this is
+        # defense-in-depth against a future api regression.
+        for v in (domain, base, acme):
+            if v and any(c in v for c in " \t\n\r\\\"'`$;|&<>"):
+                return self._json(400, {"error": "invalid_payload"})
+
+        if not reconfigure_lock.acquire(blocking=False):
+            return self._json(409, {"error": "reconfigure_in_progress"})
+        try:
+            if RECONFIGURE_LOCK_FILE.exists():
+                return self._json(409, {"error": "reconfigure_in_progress"})
+            RECONFIGURE_LOCK_FILE.write_text(f"{os.getpid()} {job_id} {utc_now()}\n")
+        finally:
+            reconfigure_lock.release()
+
+        payload = {
+            "domain": domain,
+            "baseDomain": base,
+            "plainHttp": plain,
+            "acmeEmail": acme,
+        }
+        threading.Thread(target=run_reconfigure, args=(job_id, payload), daemon=True).start()
+        return self._json(202, {"started": True, "jobId": job_id})
 
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
