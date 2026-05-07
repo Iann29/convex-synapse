@@ -48,6 +48,9 @@ type Provisioner interface {
 	// custom-domains flow to apply an updated CORS_ALLOWED_ORIGINS env
 	// without losing SQLite state. Single-replica only.
 	Recreate(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
+	// RecreateReplica is the HA-aware variant used by custom domains to
+	// roll CORS_ALLOWED_ORIGINS across replicas one at a time.
+	RecreateReplica(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 }
 
 // DeploymentsHandler exposes the deployment lifecycle: create (which provisions
@@ -103,19 +106,14 @@ type DeploymentsHandler struct {
 // active rows in deployment_domains and recreates the deployment's
 // container so the new value takes effect. Returns true when a
 // restart was actually triggered (so the caller can surface that to
-// the operator), false when we deliberately skipped (HA, adopted,
+// the operator), false when we deliberately skipped (adopted,
 // non-running, missing fields).
 //
-// Trade-off: this is a ~15s hard restart per call (stop + start +
-// healthcheck). Custom-domain add/delete/verify-success are rare
-// operations, so the simplicity wins over a more surgical "patch
-// container env" path that Docker doesn't natively support anyway.
-//
-// HA deployments are skipped here — they need per-replica
-// orchestration (and a rolling restart so the proxy keeps serving)
-// that the v1.1 custom-domains slice deliberately ducks. The proxy +
-// TLS layers DO route HA-deployment custom domains; only the
-// CORS-rebuild restart sits out.
+// Trade-off: single-replica deployments take a ~15s hard restart. HA
+// deployments roll one replica at a time, preserving service as long as
+// at least one sibling remains healthy. Custom-domain add/delete/verify
+// are rare, so this beats a more surgical "patch container env" path
+// that Docker doesn't natively support anyway.
 //
 // Project default env vars are reloaded from project_env_vars on each
 // recreate so a custom-domain CORS refresh doesn't silently drop the
@@ -159,25 +157,12 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 			"deployment_id", deploymentID, "name", deploymentName)
 		return false
 	}
-	// HA deployments need a per-replica orchestration (rolling
-	// restart, encrypted storage env, replica index per container).
-	// Out of scope for v1.1 custom-domains.
-	if haEnabled {
-		logger.Info("rebuild cors: skipping HA deployment",
-			"deployment_id", deploymentID, "name", deploymentName)
-		return false
-	}
 	// Only restart deployments that are actually up. Provisioning /
 	// failed / stopped rows: leave alone — the next successful
 	// provision will pick up the active domains via the same query.
 	if status != models.DeploymentStatusRunning {
 		logger.Info("rebuild cors: deployment not running, skipping restart",
 			"deployment_id", deploymentID, "name", deploymentName, "status", status)
-		return false
-	}
-	if hostPort == nil || *hostPort == 0 {
-		logger.Warn("rebuild cors: deployment has no host port, skipping",
-			"deployment_id", deploymentID, "name", deploymentName)
 		return false
 	}
 
@@ -201,6 +186,16 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 		// when it's set. Empty list → leave the env unset so the
 		// backend falls back to its defaults.
 		envVars["CORS_ALLOWED_ORIGINS"] = strings.Join(origins, ",")
+	}
+
+	if haEnabled {
+		return h.rebuildHACORSAndRestart(ctx, deploymentID, deploymentName, instanceSecret, envVars, len(origins), logger)
+	}
+
+	if hostPort == nil || *hostPort == 0 {
+		logger.Warn("rebuild cors: deployment has no host port, skipping",
+			"deployment_id", deploymentID, "name", deploymentName)
+		return false
 	}
 
 	spec := dockerprov.DeploymentSpec{
@@ -249,6 +244,109 @@ func loadProjectEnvVars(ctx context.Context, db *pgxpool.Pool, projectID, deploy
 	return out, nil
 }
 
+func (h *DeploymentsHandler) rebuildHACORSAndRestart(ctx context.Context, deploymentID, deploymentName, instanceSecret string, envVars map[string]string, activeDomains int, logger *slog.Logger) bool {
+	storage, err := h.loadStorageEnvForRestart(ctx, deploymentID)
+	if err != nil {
+		logger.Warn("rebuild cors: load HA storage failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+
+	rows, err := h.DB.Query(ctx, `
+		SELECT replica_index, host_port
+		  FROM deployment_replicas
+		 WHERE deployment_id = $1
+		   AND status = 'running'
+		 ORDER BY replica_index ASC
+	`, deploymentID)
+	if err != nil {
+		logger.Warn("rebuild cors: load HA replicas failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+	defer rows.Close()
+
+	type replica struct {
+		index    int
+		hostPort *int
+	}
+	var replicas []replica
+	for rows.Next() {
+		var r replica
+		if err := rows.Scan(&r.index, &r.hostPort); err != nil {
+			logger.Warn("rebuild cors: scan HA replica failed",
+				"deployment_id", deploymentID, "name", deploymentName, "err", err)
+			return false
+		}
+		if r.hostPort == nil || *r.hostPort == 0 {
+			logger.Warn("rebuild cors: HA replica has no host port, skipping rebuild",
+				"deployment_id", deploymentID, "name", deploymentName, "replica", r.index)
+			return false
+		}
+		replicas = append(replicas, r)
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn("rebuild cors: HA replicas rows failed",
+			"deployment_id", deploymentID, "name", deploymentName, "err", err)
+		return false
+	}
+	if len(replicas) == 0 {
+		logger.Warn("rebuild cors: HA deployment has no running replicas",
+			"deployment_id", deploymentID, "name", deploymentName)
+		return false
+	}
+
+	for _, r := range replicas {
+		spec := dockerprov.DeploymentSpec{
+			Name:                  deploymentName,
+			InstanceSecret:        instanceSecret,
+			HostPort:              *r.hostPort,
+			EnvVars:               envVars,
+			HealthcheckViaNetwork: h.HealthcheckViaNetwork,
+			HAReplica:             true,
+			ReplicaIndex:          r.index,
+			Storage:               storage,
+		}
+		logger.Info("rebuild cors: recreating HA replica",
+			"deployment_id", deploymentID, "name", deploymentName,
+			"replica", r.index, "active_domains", activeDomains)
+		info, err := h.Docker.RecreateReplica(ctx, spec)
+		if err != nil {
+			logger.Error("rebuild cors: recreate HA replica failed",
+				"deployment_id", deploymentID, "name", deploymentName,
+				"replica", r.index, "err", err)
+			return false
+		}
+		if _, err := h.DB.Exec(ctx, `
+			UPDATE deployment_replicas
+			   SET container_id = $1,
+			       host_port = $2,
+			       status = 'running'
+			 WHERE deployment_id = $3
+			   AND replica_index = $4
+		`, info.ContainerID, info.HostPort, deploymentID, r.index); err != nil {
+			logger.Error("rebuild cors: update HA replica after recreate failed",
+				"deployment_id", deploymentID, "name", deploymentName,
+				"replica", r.index, "err", err)
+			return false
+		}
+		if r.index == 0 {
+			if _, err := h.DB.Exec(ctx, `
+				UPDATE deployments
+				   SET container_id = $1,
+				       host_port = $2,
+				       deployment_url = $3
+				 WHERE id = $4
+			`, info.ContainerID, info.HostPort, info.DeploymentURL, deploymentID); err != nil {
+				logger.Error("rebuild cors: update deployment after HA recreate failed",
+					"deployment_id", deploymentID, "name", deploymentName, "err", err)
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // loadActiveDomainOrigins reads all active domains for the deployment
 // and formats each as `https://<domain>` so the result can be dropped
 // into CORS_ALLOWED_ORIGINS as-is. Result order is by created_at ASC
@@ -276,6 +374,73 @@ func loadActiveDomainOrigins(ctx context.Context, db *pgxpool.Pool, deploymentID
 		out = append(out, "https://"+d)
 	}
 	return out, rows.Err()
+}
+
+func (h *DeploymentsHandler) loadStorageEnvForRestart(ctx context.Context, deploymentID string) (*dockerprov.StorageEnv, error) {
+	dec, ok := h.Crypto.(secretDecrypter)
+	if !ok || dec == nil {
+		return nil, fmt.Errorf("storage key unavailable")
+	}
+
+	var (
+		dbURLEnc        []byte
+		s3AccessKeyEnc  []byte
+		s3SecretKeyEnc  []byte
+		s3Endpoint      string
+		s3Region        string
+		bucketFiles     string
+		bucketModules   string
+		bucketSearch    string
+		bucketExports   string
+		bucketSnapshots string
+	)
+	err := h.DB.QueryRow(ctx, `
+		SELECT db_url_enc, s3_access_key_enc, s3_secret_key_enc,
+		       s3_endpoint, s3_region,
+		       s3_bucket_files, s3_bucket_modules, s3_bucket_search,
+		       s3_bucket_exports, s3_bucket_snapshots
+		  FROM deployment_storage
+		 WHERE deployment_id = $1
+	`, deploymentID).Scan(&dbURLEnc, &s3AccessKeyEnc, &s3SecretKeyEnc,
+		&s3Endpoint, &s3Region,
+		&bucketFiles, &bucketModules, &bucketSearch,
+		&bucketExports, &bucketSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("read deployment_storage: %w", err)
+	}
+
+	dbURL, err := dec.DecryptString(dbURLEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt db_url: %w", err)
+	}
+	s3Access, err := dec.DecryptString(s3AccessKeyEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt s3_access_key: %w", err)
+	}
+	s3Secret, err := dec.DecryptString(s3SecretKeyEnc)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt s3_secret_key: %w", err)
+	}
+
+	return &dockerprov.StorageEnv{
+		PostgresURL:     dbURL,
+		DoNotRequireSSL: !postgresURLRequiresSSL(dbURL),
+		S3Endpoint:      s3Endpoint,
+		S3Region:        s3Region,
+		S3AccessKey:     s3Access,
+		S3SecretKey:     s3Secret,
+		BucketFiles:     bucketFiles,
+		BucketModules:   bucketModules,
+		BucketSearch:    bucketSearch,
+		BucketExports:   bucketExports,
+		BucketSnapshots: bucketSnapshots,
+	}, nil
+}
+
+func postgresURLRequiresSSL(url string) bool {
+	return strings.Contains(url, "sslmode=require") ||
+		strings.Contains(url, "sslmode=verify-ca") ||
+		strings.Contains(url, "sslmode=verify-full")
 }
 
 // publicDeploymentURL returns the URL a *remote* caller (the operator's
@@ -367,6 +532,10 @@ func (h *DeploymentsHandler) cliDeploymentURL(d *models.Deployment) string {
 // SecretEncrypter is the *crypto.SecretBox subset the handler needs.
 type SecretEncrypter interface {
 	EncryptString(s string) ([]byte, error)
+}
+
+type secretDecrypter interface {
+	DecryptString(ciphertext []byte) (string, error)
 }
 
 func (h *DeploymentsHandler) Routes() chi.Router {

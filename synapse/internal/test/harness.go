@@ -533,6 +533,7 @@ type FakeDocker struct {
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 	RecreateFn         func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	MigrateSnapshotFn  func(ctx context.Context, spec dockerprov.SnapshotMigrationSpec) error
+	RecreateReplicaFn  func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 
 	mu                sync.Mutex
 	Provisioned       []dockerprov.DeploymentSpec
@@ -695,6 +696,33 @@ func (f *FakeDocker) Recreate(ctx context.Context, spec dockerprov.DeploymentSpe
 	}
 	return &dockerprov.DeploymentInfo{
 		ContainerID:   "fake-container-" + spec.Name,
+		HostPort:      spec.HostPort,
+		DeploymentURL: fmt.Sprintf("http://127.0.0.1:%d", spec.HostPort),
+	}, nil
+}
+
+// RecreateReplica is the HA-aware variant used by custom-domain CORS
+// rebuilds. It records into the same Recreated slice as Recreate so tests
+// can assert the full rolling restart order in one place.
+func (f *FakeDocker) RecreateReplica(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error) {
+	f.mu.Lock()
+	f.Recreated = append(f.Recreated, spec)
+	f.mu.Unlock()
+	if f.RecreateReplicaFn != nil {
+		return f.RecreateReplicaFn(ctx, spec)
+	}
+	if f.RecreateFn != nil {
+		return f.RecreateFn(ctx, spec)
+	}
+	if f.ProvisionFn != nil {
+		return f.ProvisionFn(ctx, spec)
+	}
+	containerID := "fake-container-" + spec.Name
+	if spec.HAReplica {
+		containerID = fmt.Sprintf("fake-container-%s-%d", spec.Name, spec.ReplicaIndex)
+	}
+	return &dockerprov.DeploymentInfo{
+		ContainerID:   containerID,
 		HostPort:      spec.HostPort,
 		DeploymentURL: fmt.Sprintf("http://127.0.0.1:%d", spec.HostPort),
 	}, nil
