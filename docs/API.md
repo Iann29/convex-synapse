@@ -431,9 +431,34 @@ npx convex dev --once
 npx convex deploy
 ```
 
-### `POST /v1/deployments/{name}/create_deploy_key` ✅ (admins only)
+### `POST /v1/deployments/{name}/upgrade_to_ha` 🔧 (admins only, reserved)
 
-Body: `{name?}`. Returns `{id, name, token}`. Token is shown ONCE — store it.
+The route exists and performs auth/config/state validation, but the
+SQLite-to-Postgres/S3 data migration worker is not implemented. Valid
+requests currently return `501 ha_upgrade_not_yet_implemented`.
+
+The safe implementation requires exporting a snapshot from the live
+single-replica backend, provisioning the new shared-storage replicas,
+importing that snapshot, and then atomically swapping traffic. Synapse does
+not run that export/import runtime in the API container today.
+
+### `POST /v1/deployments/{name}/deploy_keys` ✅ (admins only)
+
+Body: `{name}`. Returns `{id, name, adminKey, prefix, envSnippet,
+exportSnippet}`. `adminKey` is shown once. Deploy keys are supported only
+for running, Synapse-managed, single-replica deployments.
+
+### `GET /v1/deployments/{name}/deploy_keys` ✅ (admins only)
+
+Lists active deploy keys as `{deployKeys:[{id, name, prefix, createdBy?,
+createdByName?, createTime}]}`. The full key is never returned after create.
+
+### `POST /v1/deployments/{name}/deploy_keys/{id}/revoke` ✅ (admins only)
+
+Revocation is deployment-wide. The current runtime rotates the deployment
+as a whole to invalidate previously minted admin keys; older checkouts only
+hid revoked rows because Convex admin keys are statelessly verified against
+`INSTANCE_SECRET`.
 
 ### `POST /v1/deployments/{name}/access_tokens` ✅ (admins only)
 
@@ -493,7 +518,7 @@ when the target isn't on the project's team yet.
 | PUT update project (name/slug) | ❌ | ❌ | ✅ |
 | POST delete / transfer project | ❌ | ❌ | ✅ |
 | POST adopt deployment | ❌ | ❌ | ✅ |
-| POST upgrade deployment to HA | ❌ | ❌ | ✅ |
+| POST upgrade deployment to HA (reserved; returns 501 until worker lands) | ❌ | ❌ | ✅ |
 | POST create deploy key | ❌ | ❌ | ✅ |
 | POST add / update / remove project member | ❌ | ❌ | ✅ |
 | POST issue project / app access tokens | ❌ | ❌ | ✅ |
@@ -712,3 +737,7 @@ they bump the `--upgrade` target.
 | Version | Change |
 |---|---|
 | v1.0.0 | initial stable surface (this doc) |
+| v1.0.1 | added public `GET /v1/install_status` for the first-run dashboard wizard |
+| v1.0.3 | added deployment deploy-key endpoints under `/v1/deployments/{name}/deploy_keys` |
+| v1.1.0 | added instance-admin self-update endpoints under `/v1/admin/version_check`, `/v1/admin/upgrade`, and `/v1/admin/upgrade/status` |
+| v1.2.0 | installer/runtime release; no intentional public `/v1` breaking change |

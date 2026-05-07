@@ -6,7 +6,8 @@ You're stepping into a session where the previous agent shipped:
 - ✅ **v1.0 custom domains** — `SYNAPSE_BASE_DOMAIN`, Caddy on-demand TLS, `/v1/internal/tls_ask` gate, host-header proxy routing. Real-VPS validated.
 - ✅ **v1.0 S3 backup** — `setup.sh --backup --to-s3=s3://...` and `--restore=s3://...` via `curl --aws-sigv4`. AWS + S3-compatible (Backblaze, R2, Wasabi, MinIO).
 
-Test counts: **305 bats + 146 Go integration + 24 Playwright e2e**, all green in CI on every push. shellcheck `-x` clean across 12 `.sh` files.
+Current checkout test inventory: **396 bats + 317 Go test functions + 50
+Playwright e2e tests**. shellcheck `-x` stays the installer baseline.
 
 **Your mission, one sentence:** push OpenAPI compatibility from ~70-75% to **as close to 100% of the self-hosted-relevant subset as possible**, in priority order.
 
@@ -355,7 +356,9 @@ If a tool depends on these, document the gap in `docs/ARCHITECTURE.md` and tell 
 ## Final notes
 
 - The operator is hyped: "DEU DE PREGUIÇA". Match the energy with disciplined, parallelizable work. Don't bloat scope.
-- v1.0 is in progress. After this OpenAPI push lands, the roadmap-blockers are RBAC and OIDC. Don't dive without the operator confirming.
+- This handoff is archival context from the OpenAPI push. Check
+  `docs/ROADMAP.md` for current milestone state before treating any
+  priority list here as live.
 - Subagents are valuable for parallel slices. Spawn one per priority-tier PR if context budget allows.
 - The 5k-stars goal is alive: "first 30 seconds of using Synapse is the installer" + "every operator pain point in self-hosting Convex is something we already solved". Drop-in OpenAPI is a step toward the second.
 

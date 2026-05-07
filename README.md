@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/Iann29/convex-synapse?label=release&color=blueviolet)](https://github.com/Iann29/convex-synapse/releases/latest)
 [![CI](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/Iann29/convex-synapse/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
+[![Go](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev/)
 [![Next.js](https://img.shields.io/badge/next.js-16-000?logo=next.js)](https://nextjs.org/)
 
 **The complete self-hosted [Convex](https://www.convex.dev/) platform.** Teams, projects, custom domains with auto-TLS, RBAC, S3 backups, audit trail, the official Convex Dashboard embedded with an in-iframe deployment picker. **One curl, three minutes, fully working.**
@@ -110,13 +110,14 @@ With a domain you get TLS via Caddy + Let's Encrypt automatically; without one, 
 | OpenAPI parity | 100% of self-hosted-relevant subset; ~60 cloud-only paths return structured `404 not_supported_in_self_hosted` |
 | API stability | semver on the `/v1/...` surface; deprecation policy + change log in [`docs/API.md`](docs/API.md) |
 
-**Tests:** 238 Go integration tests + 46 Playwright e2e + 305 bats unit
-tests, all green in CI on every push.
+**Tests:** current checkout has 317 Go test functions + 50 Playwright e2e
+tests + 396 bats unit cases, all expected green in CI on every push.
 
 ## Releases
 
-Latest: [**v1.0.0** — "Safe to depend on"](https://github.com/Iann29/convex-synapse/releases/tag/v1.0.0)
-(2026-05-02).
+Latest release:
+[`github.com/Iann29/convex-synapse/releases/latest`](https://github.com/Iann29/convex-synapse/releases/latest).
+This checkout's installer version is `1.2.0` (`setup.sh --version`).
 
 `./setup.sh --upgrade` queries
 [`/releases/latest`](https://github.com/Iann29/convex-synapse/releases/latest)
