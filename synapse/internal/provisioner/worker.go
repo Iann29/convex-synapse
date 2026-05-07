@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,6 +36,15 @@ import (
 type Provisioner interface {
 	Provision(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	Destroy(ctx context.Context, deploymentName string) error
+	DestroyReplica(ctx context.Context, deploymentName string, replicaIndex int, keepVolume bool) error
+	Stop(ctx context.Context, deploymentName string) error
+}
+
+// SnapshotMigrator is implemented by the Docker client in production and by
+// FakeDocker in integration tests. It owns the Convex CLI export/import hop
+// so the worker can stay focused on DB state and container orchestration.
+type SnapshotMigrator interface {
+	MigrateSnapshot(ctx context.Context, spec dockerprov.SnapshotMigrationSpec) error
 }
 
 // Config controls the worker's polling cadence and failure-recovery window.
@@ -65,6 +75,13 @@ type Config struct {
 	// HealthcheckViaNetwork mirrors api.RouterDeps.HealthcheckViaNetwork —
 	// the worker passes it through to dockerprov.DeploymentSpec.
 	HealthcheckViaNetwork bool
+
+	// Port range used by upgrade_to_ha when it provisions two replacement HA
+	// replicas in-place. create_deployment does its allocation in the API
+	// handler; upgrade_to_ha is worker-owned, so the worker needs the same
+	// bounds here.
+	PortRangeMin int
+	PortRangeMax int
 }
 
 func (c Config) sane() Config {
@@ -81,6 +98,12 @@ func (c Config) sane() Config {
 	if out.NodeID == "" {
 		out.NodeID = "synapse"
 	}
+	if out.PortRangeMin == 0 {
+		out.PortRangeMin = 3210
+	}
+	if out.PortRangeMax == 0 {
+		out.PortRangeMax = 3500
+	}
 	return out
 }
 
@@ -89,10 +112,11 @@ func (c Config) sane() Config {
 // FOR UPDATE SKIP LOCKED handles cross-process coordination, no advisory
 // lock needed.
 type Worker struct {
-	DB     *pgxpool.Pool
-	Docker Provisioner
-	Config Config
-	Logger *slog.Logger
+	DB               *pgxpool.Pool
+	Docker           Provisioner
+	SnapshotMigrator SnapshotMigrator
+	Config           Config
+	Logger           *slog.Logger
 
 	// Crypto, when non-nil, decrypts the per-deployment Postgres + S3
 	// secrets in deployment_storage. Required for HA deployments;
@@ -115,6 +139,15 @@ type SecretDecrypter interface {
 type Execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
+
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+const (
+	jobKindProvision   = "provision"
+	jobKindUpgradeToHA = "upgrade_to_ha"
+)
 
 // Enqueue inserts a 'provision' job for deploymentID. The caller is expected
 // to have just inserted (or about to insert in the same txn) the matching
@@ -146,6 +179,19 @@ func EnqueueReplica(ctx context.Context, db Execer, deploymentID, replicaID stri
 		VALUES ($1, $2, 'provision', 'pending', $3)
 	`, deploymentID, replicaID, healthcheckViaNetwork)
 	return err
+}
+
+// EnqueueUpgradeToHA inserts the long-running upgrade job. The caller stores
+// encrypted deployment_storage in the same transaction before enqueuing; the
+// worker decrypts that row when it claims the job.
+func EnqueueUpgradeToHA(ctx context.Context, db queryRower, deploymentID string, healthcheckViaNetwork bool) (int64, error) {
+	var id int64
+	err := db.QueryRow(ctx, `
+		INSERT INTO provisioning_jobs (deployment_id, kind, status, healthcheck_via_network)
+		VALUES ($1, 'upgrade_to_ha', 'pending', $2)
+		RETURNING id
+	`, deploymentID, healthcheckViaNetwork).Scan(&id)
+	return id, err
 }
 
 // Run blocks until ctx is cancelled. On entry, performs a one-shot
@@ -241,17 +287,32 @@ func (w *Worker) processOne(ctx context.Context, logger *slog.Logger, cfg Config
 	jobCtx, cancel := context.WithTimeout(context.Background(), cfg.JobTimeout)
 	defer cancel()
 
-	w.runJob(jobCtx, logger, job)
+	switch job.Kind {
+	case jobKindProvision:
+		w.runJob(jobCtx, logger, job)
+	case jobKindUpgradeToHA:
+		w.runUpgradeToHA(jobCtx, logger, cfg, job)
+	default:
+		logger.Error("provisioner: unknown job kind",
+			"job_id", job.JobID, "deployment_id", job.DeploymentID, "kind", job.Kind)
+		w.markJobFailed(job.JobID, "unknown provisioning job kind: "+job.Kind)
+	}
 	return true
 }
 
 type claimedJob struct {
 	JobID                 int64
+	Kind                  string
 	DeploymentID          string
+	ProjectID             string
 	Name                  string
+	DeploymentType        string
 	HostPort              int
+	ContainerID           string
+	AdminKey              string
 	InstanceSecret        string
 	HealthcheckViaNetwork bool
+	EnvVars               map[string]string
 
 	// Replica targeting (v0.5+). When ReplicaID is empty, this is a
 	// pre-v0.5 single-replica job; the worker treats it as
@@ -307,9 +368,11 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 	var replicaIDStr *string
 	var replicaHostPort *int
 	var deploymentHostPort *int
+	var deploymentContainerID *string
 	err = tx.QueryRow(ctx, `
-		SELECT j.id, j.deployment_id, j.replica_id::text,
-		       d.name, d.host_port, d.instance_secret, d.ha_enabled,
+		SELECT j.id, j.kind, j.deployment_id, j.replica_id::text,
+		       d.project_id::text, d.name, d.deployment_type,
+		       d.host_port, d.container_id, d.admin_key, d.instance_secret, d.ha_enabled,
 		       r.replica_index, r.host_port,
 		       j.healthcheck_via_network
 		  FROM provisioning_jobs j
@@ -319,8 +382,9 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 		 ORDER BY j.created_at ASC
 		 FOR UPDATE OF j SKIP LOCKED
 		 LIMIT 1
-	`).Scan(&j.JobID, &j.DeploymentID, &replicaIDStr,
-		&j.Name, &deploymentHostPort, &j.InstanceSecret, &j.HAEnabled,
+	`).Scan(&j.JobID, &j.Kind, &j.DeploymentID, &replicaIDStr,
+		&j.ProjectID, &j.Name, &j.DeploymentType,
+		&deploymentHostPort, &deploymentContainerID, &j.AdminKey, &j.InstanceSecret, &j.HAEnabled,
 		&replicaIndex, &replicaHostPort,
 		&j.HealthcheckViaNetwork)
 	_ = replicaID
@@ -340,6 +404,9 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 	} else if deploymentHostPort != nil {
 		j.HostPort = *deploymentHostPort
 	}
+	if deploymentContainerID != nil {
+		j.ContainerID = *deploymentContainerID
+	}
 	if replicaIDStr != nil && *replicaIDStr != "" {
 		j.ReplicaID = *replicaIDStr
 		if replicaIndex != nil {
@@ -350,7 +417,7 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 	// Load decrypted storage env vars for HA deployments. Failure is
 	// terminal — without storage we can't provision; mark the job
 	// failed and let the worker move on.
-	if j.HAEnabled {
+	if j.HAEnabled || j.Kind == jobKindUpgradeToHA {
 		if w.Crypto == nil {
 			logger.Error("provisioner: HA job seen but worker has no crypto helper",
 				"job_id", j.JobID, "deployment_id", j.DeploymentID)
@@ -368,6 +435,14 @@ func (w *Worker) claimNext(ctx context.Context, logger *slog.Logger, cfg Config)
 		}
 		j.Storage = storage
 	}
+
+	envVars, loadErr := loadRuntimeEnvVars(ctx, tx, j.ProjectID, j.DeploymentID, j.DeploymentType)
+	if loadErr != nil {
+		logger.Error("provisioner: load runtime env vars failed",
+			"job_id", j.JobID, "deployment_id", j.DeploymentID, "err", loadErr)
+		return claimedJob{}, false
+	}
+	j.EnvVars = envVars
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE provisioning_jobs
@@ -451,6 +526,69 @@ func loadStorage(ctx context.Context, tx pgx.Tx, dec SecretDecrypter, deployment
 		BucketExports:   bucketExports,
 		BucketSnapshots: bucketSnapshots,
 	}, nil
+}
+
+func loadRuntimeEnvVars(ctx context.Context, tx pgx.Tx, projectID, deploymentID, deploymentType string) (map[string]string, error) {
+	env := map[string]string{}
+	if projectID != "" {
+		rows, err := tx.Query(ctx, `
+			SELECT name, value
+			  FROM project_env_vars
+			 WHERE project_id = $1
+			   AND $2 = ANY(deployment_types)
+			 ORDER BY name ASC
+		`, projectID, deploymentType)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name, value string
+			if err := rows.Scan(&name, &value); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			env[name] = value
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	origins, err := loadActiveDomainOrigins(ctx, tx, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(origins) > 0 {
+		env["CORS_ALLOWED_ORIGINS"] = strings.Join(origins, ",")
+	}
+	return env, nil
+}
+
+func loadActiveDomainOrigins(ctx context.Context, tx pgx.Tx, deploymentID string) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT domain
+		  FROM deployment_domains
+		 WHERE deployment_id = $1
+		   AND status = 'active'
+		   AND role = 'api'
+		 ORDER BY created_at ASC
+	`, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			return nil, err
+		}
+		out = append(out, "https://"+domain)
+	}
+	return out, rows.Err()
 }
 
 func hasSSLPrefix(url string) bool {
@@ -538,7 +676,7 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		Name:                  j.Name,
 		InstanceSecret:        j.InstanceSecret,
 		HostPort:              j.HostPort,
-		EnvVars:               map[string]string{},
+		EnvVars:               j.EnvVars,
 		HealthcheckViaNetwork: j.HealthcheckViaNetwork,
 		HAReplica:             j.HAEnabled,
 		ReplicaIndex:          j.ReplicaIndex,
@@ -567,51 +705,14 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		return
 	}
 
-	// Update both the replica (when one is targeted) and the deployment
-	// row. Single-replica deployments (legacy + v0.5 single mode) only
-	// have replica_index=0; we still write its replica row so the proxy
-	// resolver and health worker can read uniformly from
-	// deployment_replicas.
-	if j.ReplicaID != "" {
-		w.markReplicaRunning(ctx, logger, j.ReplicaID, info.ContainerID)
-	}
-
-	// Atomic UPDATE WHERE status='provisioning' — if /delete flipped the
-	// row to 'deleted' while we were creating, this matches 0 rows and
-	// we know to tear down.
-	tag, err := w.DB.Exec(ctx, `
-		UPDATE deployments
-		   SET status         = $1,
-		       container_id   = COALESCE(container_id, $2),
-		       deployment_url = COALESCE(deployment_url, $3),
-		       last_deploy_at = now()
-		 WHERE id = $4
-		   AND status = 'provisioning'
-	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL, j.DeploymentID)
+	running, alreadyRunning, err := w.markProvisionRunning(ctx, j, info)
 	if err != nil {
 		logger.Error("provisioner: update deployment", "err", err, "job_id", j.JobID)
 		w.markFailed(j.JobID, j.DeploymentID, err.Error())
 		return
 	}
 
-	if tag.RowsAffected() == 0 {
-		// HA: status may already be "running" because a sibling replica
-		// finished first — that's fine, leave it. Only treat 0 rows as
-		// "deployment was deleted" when there's no other running replica.
-		if j.HAEnabled {
-			var runningReplicas int
-			_ = w.DB.QueryRow(ctx, `
-				SELECT count(*) FROM deployment_replicas
-				 WHERE deployment_id = $1 AND status = 'running'
-			`, j.DeploymentID).Scan(&runningReplicas)
-			if runningReplicas > 0 {
-				w.markDone(j.JobID)
-				logger.Info("provisioner: replica ready (sibling already running)",
-					"deployment_id", j.DeploymentID, "name", j.Name,
-					"replica", j.ReplicaIndex, "job_id", j.JobID)
-				return
-			}
-		}
+	if !running {
 		logger.Warn("provisioner: deployment no longer provisioning; cleaning up",
 			"deployment_id", j.DeploymentID, "name", j.Name)
 		if j.HAEnabled {
@@ -628,26 +729,366 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 	}
 
 	w.markDone(j.JobID)
+	if alreadyRunning {
+		logger.Info("provisioner: replica ready (deployment already running)",
+			"deployment_id", j.DeploymentID, "name", j.Name,
+			"replica", j.ReplicaIndex, "job_id", j.JobID)
+		return
+	}
 	logger.Info("provisioner: deployment ready",
 		"deployment_id", j.DeploymentID, "name", j.Name,
 		"replica", j.ReplicaIndex, "job_id", j.JobID)
 }
 
-// markReplicaRunning flips a deployment_replicas row to 'running' once
-// the worker's Provision call returns. Best-effort: a transient DB
-// error is logged but doesn't fail the job — the next health-worker
-// sweep will reconcile if the row drifts.
-func (w *Worker) markReplicaRunning(ctx context.Context, logger *slog.Logger, replicaID, containerID string) {
-	if _, err := w.DB.Exec(ctx, `
-		UPDATE deployment_replicas
-		   SET status = 'running',
-		       container_id = $1
-		 WHERE id = $2
-		   AND status = 'provisioning'
-	`, containerID, replicaID); err != nil {
-		logger.Warn("provisioner: mark replica running",
-			"replica_id", replicaID, "err", err)
+type upgradeReplica struct {
+	Index int
+	Port  int
+	Info  *dockerprov.DeploymentInfo
+}
+
+// runUpgradeToHA performs the one-shot SQLite -> Postgres/S3 migration for an
+// existing single-replica deployment. The old container keeps serving while the
+// backup is exported and the new HA replicas are provisioned. Only after the
+// import succeeds do we swap the DB rows to point the proxy at the HA pair.
+func (w *Worker) runUpgradeToHA(ctx context.Context, logger *slog.Logger, cfg Config, j claimedJob) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("provisioner: upgrade_to_ha panicked",
+				"job_id", j.JobID,
+				"deployment", j.Name,
+				"panic", rec,
+				"stack", string(debug.Stack()))
+			w.markJobFailed(j.JobID, "panic in upgrade_to_ha worker")
+		}
+	}()
+
+	if w.SnapshotMigrator == nil {
+		w.markJobFailed(j.JobID, "snapshot migrator not configured")
+		return
 	}
+	if j.Storage == nil {
+		w.markJobFailed(j.JobID, "deployment_storage missing for upgrade_to_ha")
+		return
+	}
+	if j.AdminKey == "" || j.InstanceSecret == "" {
+		w.markJobFailed(j.JobID, "deployment credentials missing for upgrade_to_ha")
+		return
+	}
+	if err := w.ensureUpgradeable(ctx, j); err != nil {
+		w.markJobFailed(j.JobID, err.Error())
+		return
+	}
+
+	ports, err := w.allocatePorts(ctx, cfg, 2)
+	if err != nil {
+		logger.Error("provisioner: upgrade_to_ha allocate ports failed",
+			"job_id", j.JobID, "deployment", j.Name, "err", err)
+		w.markJobFailed(j.JobID, err.Error())
+		return
+	}
+
+	replicas := make([]upgradeReplica, 0, 2)
+	for idx, port := range ports {
+		info, err := w.Docker.Provision(ctx, dockerprov.DeploymentSpec{
+			Name:                  j.Name,
+			InstanceSecret:        j.InstanceSecret,
+			HostPort:              port,
+			EnvVars:               j.EnvVars,
+			HealthcheckViaNetwork: j.HealthcheckViaNetwork,
+			HAReplica:             true,
+			ReplicaIndex:          idx,
+			Storage:               storageToDocker(j.Storage),
+		})
+		if err != nil {
+			logger.Error("provisioner: upgrade_to_ha provision replica failed",
+				"job_id", j.JobID, "deployment", j.Name, "replica", idx, "err", err)
+			w.cleanupUpgradeReplicas(context.Background(), logger, j.Name, replicas)
+			w.markJobFailed(j.JobID, err.Error())
+			return
+		}
+		replicas = append(replicas, upgradeReplica{Index: idx, Port: port, Info: info})
+	}
+
+	targetURLs := []string{
+		"http://" + dockerprov.ContainerName(j.Name, 0, true) + ":3210",
+		"http://" + dockerprov.ContainerName(j.Name, 1, true) + ":3210",
+	}
+	if err := w.SnapshotMigrator.MigrateSnapshot(ctx, dockerprov.SnapshotMigrationSpec{
+		DeploymentName: j.Name,
+		SourceURL:      "http://" + dockerprov.ContainerName(j.Name, 0, false) + ":3210",
+		SourceAdminKey: j.AdminKey,
+		TargetURLs:     targetURLs,
+		TargetAdminKey: j.AdminKey,
+	}); err != nil {
+		logger.Error("provisioner: upgrade_to_ha snapshot migration failed",
+			"job_id", j.JobID, "deployment", j.Name, "err", err)
+		w.cleanupUpgradeReplicas(context.Background(), logger, j.Name, replicas)
+		w.markJobFailed(j.JobID, err.Error())
+		return
+	}
+
+	if err := w.finishUpgradeSwap(ctx, j, replicas); err != nil {
+		logger.Error("provisioner: upgrade_to_ha swap failed",
+			"job_id", j.JobID, "deployment", j.Name, "err", err)
+		w.cleanupUpgradeReplicas(context.Background(), logger, j.Name, replicas)
+		w.markJobFailed(j.JobID, err.Error())
+		return
+	}
+
+	if err := w.Docker.Stop(context.Background(), j.Name); err != nil {
+		logger.Warn("provisioner: upgrade_to_ha stop old replica failed",
+			"job_id", j.JobID, "deployment", j.Name, "err", err)
+	}
+	logger.Info("provisioner: deployment upgraded to HA",
+		"deployment_id", j.DeploymentID, "name", j.Name, "job_id", j.JobID)
+}
+
+func storageToDocker(s *Storage) *dockerprov.StorageEnv {
+	if s == nil {
+		return nil
+	}
+	return &dockerprov.StorageEnv{
+		PostgresURL:     s.PostgresURL,
+		DoNotRequireSSL: s.DoNotRequireSSL,
+		S3Endpoint:      s.S3Endpoint,
+		S3Region:        s.S3Region,
+		S3AccessKey:     s.S3AccessKey,
+		S3SecretKey:     s.S3SecretKey,
+		BucketFiles:     s.BucketFiles,
+		BucketModules:   s.BucketModules,
+		BucketSearch:    s.BucketSearch,
+		BucketExports:   s.BucketExports,
+		BucketSnapshots: s.BucketSnapshots,
+	}
+}
+
+func (w *Worker) ensureUpgradeable(ctx context.Context, j claimedJob) error {
+	var status string
+	var haEnabled bool
+	var adopted bool
+	err := w.DB.QueryRow(ctx, `
+		SELECT status, ha_enabled, adopted
+		  FROM deployments
+		 WHERE id = $1
+	`, j.DeploymentID).Scan(&status, &haEnabled, &adopted)
+	if err != nil {
+		return fmt.Errorf("load deployment before upgrade: %w", err)
+	}
+	switch {
+	case adopted:
+		return errors.New("cannot upgrade adopted deployment")
+	case haEnabled:
+		return errors.New("deployment already upgraded to HA")
+	case status != models.DeploymentStatusRunning:
+		return fmt.Errorf("deployment must be running to upgrade; current status: %s", status)
+	}
+	return nil
+}
+
+func (w *Worker) allocatePorts(ctx context.Context, cfg Config, n int) ([]int, error) {
+	rows, err := w.DB.Query(ctx, `
+		WITH used AS (
+		  SELECT host_port FROM deployments
+		   WHERE host_port IS NOT NULL AND status <> 'deleted'
+		  UNION
+		  SELECT host_port FROM deployment_replicas
+		   WHERE host_port IS NOT NULL AND status <> 'stopped' AND status <> 'failed'
+		)
+		SELECT p FROM (
+		  SELECT generate_series($1::int, $2::int) AS p
+		) candidates
+		 WHERE p NOT IN (SELECT host_port FROM used)
+		 ORDER BY p
+		 LIMIT $3
+	`, cfg.PortRangeMin, cfg.PortRangeMax, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]int, 0, n)
+	for rows.Next() {
+		var p int
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) < n {
+		return nil, fmt.Errorf("allocate ports: only %d of %d requested ports free in range [%d,%d]",
+			len(out), n, cfg.PortRangeMin, cfg.PortRangeMax)
+	}
+	return out, nil
+}
+
+func (w *Worker) cleanupUpgradeReplicas(ctx context.Context, logger *slog.Logger, deploymentName string, replicas []upgradeReplica) {
+	for _, r := range replicas {
+		if err := w.Docker.DestroyReplica(ctx, deploymentName, r.Index, true); err != nil {
+			logger.Warn("provisioner: cleanup upgrade replica failed",
+				"deployment", deploymentName, "replica", r.Index, "err", err)
+		}
+	}
+}
+
+func (w *Worker) finishUpgradeSwap(ctx context.Context, j claimedJob, replicas []upgradeReplica) error {
+	if len(replicas) != 2 {
+		return fmt.Errorf("upgrade swap requires 2 replicas, got %d", len(replicas))
+	}
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	var haEnabled bool
+	var adopted bool
+	if err := tx.QueryRow(ctx, `
+		SELECT status, ha_enabled, adopted
+		  FROM deployments
+		 WHERE id = $1
+		 FOR UPDATE
+	`, j.DeploymentID).Scan(&status, &haEnabled, &adopted); err != nil {
+		return err
+	}
+	if adopted {
+		return errors.New("deployment became adopted during upgrade")
+	}
+	if haEnabled {
+		return errors.New("deployment already upgraded during upgrade")
+	}
+	if status != models.DeploymentStatusRunning {
+		return fmt.Errorf("deployment status changed during upgrade: %s", status)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE deployment_replicas
+		   SET replica_index = -1,
+		       status = 'stopped',
+		       host_port = NULL,
+		       last_seen_active_at = NULL
+		 WHERE deployment_id = $1
+		   AND replica_index = 0
+	`, j.DeploymentID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("missing legacy replica row during upgrade swap")
+	}
+
+	for _, r := range replicas {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO deployment_replicas (deployment_id, replica_index, container_id, host_port, status)
+			VALUES ($1, $2, $3, $4, 'running')
+		`, j.DeploymentID, r.Index, r.Info.ContainerID, r.Port); err != nil {
+			return err
+		}
+	}
+
+	primary := replicas[0]
+	if _, err := tx.Exec(ctx, `
+		UPDATE deployments
+		   SET ha_enabled = true,
+		       replica_count = 2,
+		       host_port = $1,
+		       container_id = $2,
+		       deployment_url = $3,
+		       status = 'running',
+		       last_deploy_at = now()
+		 WHERE id = $4
+	`, primary.Port, primary.Info.ContainerID, primary.Info.DeploymentURL, j.DeploymentID); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE provisioning_jobs
+		   SET status = 'done', finished_at = now()
+		 WHERE id = $1
+	`, j.JobID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// markProvisionRunning flips the replica and deployment rows in one
+// transaction once Docker has returned a live container. The deployment
+// UPDATE is still guarded by status='provisioning' so a concurrent delete
+// wins. If the row is already 'running', another reconciler or sibling
+// replica beat us to the aggregate update; that is a benign race as long as
+// the replica row we just updated is running too.
+func (w *Worker) markProvisionRunning(ctx context.Context, j claimedJob, info *dockerprov.DeploymentInfo) (running bool, alreadyRunning bool, err error) {
+	tx, err := w.DB.Begin(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if j.ReplicaID != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE deployment_replicas
+			   SET status = 'running',
+			       container_id = $1
+			 WHERE id = $2
+			   AND status = 'provisioning'
+		`, info.ContainerID, j.ReplicaID); err != nil {
+			return false, false, err
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE deployments
+		   SET status         = $1,
+		       container_id   = COALESCE(container_id, $2),
+		       deployment_url = COALESCE(deployment_url, $3),
+		       last_deploy_at = now()
+		 WHERE id = $4
+		   AND status = 'provisioning'
+	`, models.DeploymentStatusRunning, info.ContainerID, info.DeploymentURL, j.DeploymentID)
+	if err != nil {
+		return false, false, err
+	}
+
+	if tag.RowsAffected() == 0 {
+		var status string
+		if err := tx.QueryRow(ctx, `
+			SELECT status FROM deployments WHERE id = $1
+		`, j.DeploymentID).Scan(&status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, false, nil
+			}
+			return false, false, err
+		}
+		if status != models.DeploymentStatusRunning {
+			return false, false, nil
+		}
+		if j.ReplicaID != "" {
+			var replicaStatus string
+			if err := tx.QueryRow(ctx, `
+				SELECT status FROM deployment_replicas WHERE id = $1
+			`, j.ReplicaID).Scan(&replicaStatus); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return false, false, nil
+				}
+				return false, false, err
+			}
+			if replicaStatus != models.DeploymentStatusRunning {
+				return false, false, nil
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, false, err
+		}
+		return true, true, nil
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
 }
 
 func (w *Worker) markDone(jobID int64) {
@@ -662,7 +1103,7 @@ func (w *Worker) markDone(jobID int64) {
 	}
 }
 
-func (w *Worker) markFailed(jobID int64, deploymentID, errStr string) {
+func (w *Worker) markJobFailed(jobID int64, errStr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := w.DB.Exec(ctx, `
@@ -670,8 +1111,14 @@ func (w *Worker) markFailed(jobID int64, deploymentID, errStr string) {
 		   SET status = 'failed', error = $1, finished_at = now()
 		 WHERE id = $2
 	`, errStr, jobID); err != nil {
-		slog.Default().Error("provisioner: mark failed", "job_id", jobID, "err", err)
+		slog.Default().Error("provisioner: mark job failed", "job_id", jobID, "err", err)
 	}
+}
+
+func (w *Worker) markFailed(jobID int64, deploymentID, errStr string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	w.markJobFailed(jobID, errStr)
 	// Mirror to the deployment row so the API surfaces the failure.
 	if _, err := w.DB.Exec(ctx, `
 		UPDATE deployments

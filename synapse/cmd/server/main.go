@@ -239,13 +239,16 @@ func run() error {
 			nodeID = "synapse"
 		}
 		pworker := &provisioner.Worker{
-			DB:     pool,
-			Docker: dockerClient,
+			DB:               pool,
+			Docker:           dockerClient,
+			SnapshotMigrator: dockerClient,
 			Config: provisioner.Config{
 				PollInterval:          time.Second,
 				JobTimeout:            5 * time.Minute,
 				NodeID:                nodeID,
 				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
+				PortRangeMin:          cfg.PortRangeMin,
+				PortRangeMax:          cfg.PortRangeMax,
 			},
 			Logger: logger,
 			Crypto: secretBox, // nil when HA is off — single-replica jobs don't read it

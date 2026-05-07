@@ -1384,15 +1384,16 @@ type upgradeToHAReq struct {
 	HAOverrides *haOverrides `json:"haOverrides,omitempty"`
 }
 
+type upgradeToHAResp struct {
+	DeploymentName string `json:"deploymentName"`
+	Status         string `json:"status"`
+	JobID          int64  `json:"jobId"`
+}
+
 // upgradeToHA migrates an existing single-replica deployment to HA.
 // The endpoint validates + enqueues the work; the actual mechanics
 // (snapshot_export from the existing replica → provision 2 new HA
 // replicas → snapshot_import → atomic swap) live on the worker side.
-//
-// Today the worker rejects upgrade_to_ha jobs with a clear error
-// instead of corrupting state mid-migration. That makes the API
-// surface stable so operators can wire it up; the heavy lifting is
-// scheduled for v0.5.1 (see docs/V0_5_PLAN.md).
 //
 // Validation refuses early when:
 //   - HA isn't enabled on this Synapse instance
@@ -1452,16 +1453,127 @@ func (h *DeploymentsHandler) upgradeToHA(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// The worker's mechanical work isn't implemented yet — refuse with
-	// the same code we use elsewhere for the "API exists, runtime
-	// missing" pattern. Once the export/import flow lands, this branch
-	// flips to enqueueing an `upgrade_to_ha` job and returning 202.
-	writeError(w, http.StatusNotImplemented, "ha_upgrade_not_yet_implemented",
-		"upgrade_to_ha is in flight (snapshot_export → re-provision → snapshot_import → swap); "+
-			"see docs/V0_5_PLAN.md")
+	storage := derivePerDeploymentStorage(d.Name, h.HA, req.HAOverrides)
+	dbURLEnc, err := h.Crypto.EncryptString(storage.PostgresURL)
+	if err != nil {
+		logErr("encrypt db_url", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to prepare HA storage")
+		return
+	}
+	s3KeyEnc, err := h.Crypto.EncryptString(storage.S3AccessKey)
+	if err != nil {
+		logErr("encrypt s3_access_key", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to prepare HA storage")
+		return
+	}
+	s3SecretEnc, err := h.Crypto.EncryptString(storage.S3SecretKey)
+	if err != nil {
+		logErr("encrypt s3_secret_key", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to prepare HA storage")
+		return
+	}
 
-	// Audit the *attempt* even though we refused — operators trying to
-	// upgrade need a paper trail of who pinged the endpoint and when.
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		logErr("begin upgrade_to_ha", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var lockedStatus string
+	var lockedHAEnabled bool
+	var lockedAdopted bool
+	if err := tx.QueryRow(r.Context(), `
+		SELECT status, ha_enabled, adopted
+		  FROM deployments
+		 WHERE id = $1
+		 FOR UPDATE
+	`, d.ID).Scan(&lockedStatus, &lockedHAEnabled, &lockedAdopted); err != nil {
+		logErr("lock upgrade deployment", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+	if lockedHAEnabled {
+		writeError(w, http.StatusConflict, "already_ha",
+			"Deployment is already running in HA mode")
+		return
+	}
+	if lockedAdopted {
+		writeError(w, http.StatusBadRequest, "cannot_upgrade_adopted",
+			"Adopted deployments are managed externally; convert to HA on the source side and re-adopt")
+		return
+	}
+	if lockedStatus != models.DeploymentStatusRunning {
+		writeError(w, http.StatusConflict, "deployment_not_running",
+			"Deployment must be 'running' to upgrade; current status: "+lockedStatus)
+		return
+	}
+
+	var activeJob bool
+	if err := tx.QueryRow(r.Context(), `
+		SELECT EXISTS(
+		  SELECT 1 FROM provisioning_jobs
+		   WHERE deployment_id = $1
+		     AND kind = 'upgrade_to_ha'
+		     AND status IN ('pending','claimed')
+		)
+	`, d.ID).Scan(&activeJob); err != nil {
+		logErr("check upgrade job", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+	if activeJob {
+		writeError(w, http.StatusConflict, "upgrade_already_in_progress",
+			"Deployment already has an upgrade_to_ha job in progress")
+		return
+	}
+
+	if _, err := tx.Exec(r.Context(), `
+		INSERT INTO deployment_storage (deployment_id, db_kind, db_url_enc, db_schema,
+		                                 s3_endpoint, s3_region,
+		                                 s3_access_key_enc, s3_secret_key_enc,
+		                                 s3_bucket_files, s3_bucket_modules, s3_bucket_search,
+		                                 s3_bucket_exports, s3_bucket_snapshots)
+		VALUES ($1, 'postgres', $2, $3,
+		        $4, $5, $6, $7,
+		        $8, $9, $10, $11, $12)
+		ON CONFLICT (deployment_id) DO UPDATE SET
+		    db_kind = EXCLUDED.db_kind,
+		    db_url_enc = EXCLUDED.db_url_enc,
+		    db_schema = EXCLUDED.db_schema,
+		    s3_endpoint = EXCLUDED.s3_endpoint,
+		    s3_region = EXCLUDED.s3_region,
+		    s3_access_key_enc = EXCLUDED.s3_access_key_enc,
+		    s3_secret_key_enc = EXCLUDED.s3_secret_key_enc,
+		    s3_bucket_files = EXCLUDED.s3_bucket_files,
+		    s3_bucket_modules = EXCLUDED.s3_bucket_modules,
+		    s3_bucket_search = EXCLUDED.s3_bucket_search,
+		    s3_bucket_exports = EXCLUDED.s3_bucket_exports,
+		    s3_bucket_snapshots = EXCLUDED.s3_bucket_snapshots,
+		    updated_at = now()
+	`, d.ID, dbURLEnc, storage.DBSchema,
+		storage.S3Endpoint, storage.S3Region, s3KeyEnc, s3SecretEnc,
+		storage.BucketFiles, storage.BucketModules, storage.BucketSearch,
+		storage.BucketExports, storage.BucketSnapshots,
+	); err != nil {
+		logErr("store upgrade storage", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+
+	jobID, err := provisioner.EnqueueUpgradeToHA(r.Context(), tx, d.ID, h.HealthcheckViaNetwork)
+	if err != nil {
+		logErr("enqueue upgrade_to_ha", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		logErr("commit upgrade_to_ha", err)
+		writeError(w, http.StatusInternalServerError, "internal", "Failed to enqueue upgrade")
+		return
+	}
+
 	uid, _ := auth.UserID(r.Context())
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
 		TeamID:     t.ID,
@@ -1471,10 +1583,16 @@ func (h *DeploymentsHandler) upgradeToHA(w http.ResponseWriter, r *http.Request)
 		TargetID:   d.ID,
 		Metadata: map[string]any{
 			"name":   d.Name,
-			"status": "rejected_not_yet_implemented",
+			"status": "queued",
+			"jobId":  jobID,
 		},
 	})
-	_ = req
+
+	writeJSON(w, http.StatusAccepted, upgradeToHAResp{
+		DeploymentName: d.Name,
+		Status:         "queued",
+		JobID:          jobID,
+	})
 }
 
 // ---------- POST /v1/deployments/{name}/delete ----------

@@ -71,6 +71,58 @@ func TestProvisioner_EnqueueAndExecute(t *testing.T) {
 	}
 }
 
+func TestProvisioner_ReplicaJobDoesNotDestroyAlreadyRunningDeployment(t *testing.T) {
+	h := Setup(t)
+
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Health Race Co")
+	project := createProject(t, h, owner.AccessToken, team.Slug, "App")
+	depID := h.SeedDeployment(project.ID, "hr-cat-1234", "dev",
+		"running", false, owner.ID, 4102, "k")
+
+	var replicaID string
+	if err := h.DB.QueryRow(context.Background(), `
+		UPDATE deployment_replicas
+		   SET status = 'provisioning'
+		 WHERE deployment_id = $1
+		   AND replica_index = 0
+		RETURNING id::text
+	`, depID).Scan(&replicaID); err != nil {
+		t.Fatalf("seed provisioning replica: %v", err)
+	}
+
+	if err := provisioner.EnqueueReplica(context.Background(), h.DB, depID, replicaID, false); err != nil {
+		t.Fatalf("EnqueueReplica: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var depStatus, replicaStatus, jobStatus string
+	for time.Now().Before(deadline) {
+		_ = h.DB.QueryRow(context.Background(),
+			`SELECT status FROM deployments WHERE id = $1`, depID).Scan(&depStatus)
+		_ = h.DB.QueryRow(context.Background(),
+			`SELECT status FROM deployment_replicas WHERE id = $1`, replicaID).Scan(&replicaStatus)
+		_ = h.DB.QueryRow(context.Background(),
+			`SELECT status FROM provisioning_jobs WHERE deployment_id = $1`, depID).Scan(&jobStatus)
+		if depStatus == "running" && replicaStatus == "running" && jobStatus == "done" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if depStatus != "running" {
+		t.Errorf("deployment status: got %q want running", depStatus)
+	}
+	if replicaStatus != "running" {
+		t.Errorf("replica status: got %q want running", replicaStatus)
+	}
+	if jobStatus != "done" {
+		t.Errorf("job status: got %q want done", jobStatus)
+	}
+	if destroyed := h.Docker.DestroyedNames(); len(destroyed) != 0 {
+		t.Fatalf("expected no cleanup destroy for already-running deployment, got %v", destroyed)
+	}
+}
+
 // Provision returns an error: deployment row marked failed, job marked failed
 // with the error message captured.
 func TestProvisioner_FailureMarksRowAndJob(t *testing.T) {

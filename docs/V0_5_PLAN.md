@@ -7,10 +7,9 @@
 > "how do I run this?" walkthrough see [HA_TESTING.md](HA_TESTING.md).
 > For the chunk-by-chunk landing log see [ROADMAP.md](ROADMAP.md).
 >
-> The mechanical pieces deferred to **v0.5.1** are listed at the bottom
-> of [ROADMAP.md](ROADMAP.md): the `upgrade_to_ha` worker, the
-> real-backend `docker kill` failover test, and the active health
-> probe in the proxy.
+> The remaining mechanical pieces deferred to **v0.5.1** are listed at
+> the bottom of [ROADMAP.md](ROADMAP.md): the real-backend `docker kill`
+> failover test and the active health probe in the proxy.
 
 Scoping document for the v0.5 milestone (active-passive failover per
 deployment). Authored by an investigation pass.
@@ -198,9 +197,9 @@ it explicit:
      DB+buckets
   3. Run `convex import` into the new active
   4. Atomically swap: set `ha_enabled=true`, flip `replica_count`,
-     mark old replica `stopped` (keep it 24h for rollback), invalidate
-     proxy cache
-  5. Audit-log the whole thing
+     mark old replica `stopped`, stop the old SQLite container without
+     removing its volume, invalidate proxy cache
+  5. Audit-log the enqueue; worker failures are recorded on the job row
 - Synchronous job (queue kind `'upgrade_to_ha'`). Failure rolls back to
   the SQLite replica; the new resources get reaped.
 - Existing deployments stay 1-replica + SQLite forever unless an

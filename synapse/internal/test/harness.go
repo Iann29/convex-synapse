@@ -243,12 +243,15 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 	// snappily within test timeouts.
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	pworker := &provisioner.Worker{
-		DB:     pool,
-		Docker: fake,
+		DB:               pool,
+		Docker:           fake,
+		SnapshotMigrator: fake,
 		Config: provisioner.Config{
 			PollInterval: 50 * time.Millisecond,
 			JobTimeout:   30 * time.Second,
 			NodeID:       "test-" + dbName,
+			PortRangeMin: 3210,
+			PortRangeMax: 3500,
 		},
 		Logger: logger,
 	}
@@ -476,14 +479,24 @@ func randHex(n int) string {
 type FakeDocker struct {
 	ProvisionFn        func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
 	DestroyFn          func(ctx context.Context, name string) error
+	DestroyReplicaFn   func(ctx context.Context, name string, replicaIndex int, keepVolume bool) error
+	StopFn             func(ctx context.Context, name string) error
 	StatusFn           func(ctx context.Context, name string) (string, error)
 	StatusReplicaFn    func(ctx context.Context, name string, replicaIndex int) (string, error)
 	GenerateAdminKeyFn func(ctx context.Context, name, secret string) (string, error)
 	RecreateFn         func(ctx context.Context, spec dockerprov.DeploymentSpec) (*dockerprov.DeploymentInfo, error)
+	MigrateSnapshotFn  func(ctx context.Context, spec dockerprov.SnapshotMigrationSpec) error
 
-	mu          sync.Mutex
-	Provisioned []dockerprov.DeploymentSpec
-	Destroyed   []string
+	mu                sync.Mutex
+	Provisioned       []dockerprov.DeploymentSpec
+	Destroyed         []string
+	DestroyedReplicas []struct {
+		Name         string
+		ReplicaIndex int
+		KeepVolume   bool
+	}
+	Stopped    []string
+	Migrations []dockerprov.SnapshotMigrationSpec
 	// Recreated is the ordered list of specs the handler asked us to
 	// recreate. Tests assert on this for the custom-domains restart-on-
 	// add/delete/verify flow. Reads + writes are mutex-guarded so tests
@@ -519,6 +532,40 @@ func (f *FakeDocker) Destroy(ctx context.Context, name string) error {
 	return nil
 }
 
+func (f *FakeDocker) DestroyReplica(ctx context.Context, name string, replicaIndex int, keepVolume bool) error {
+	f.mu.Lock()
+	f.DestroyedReplicas = append(f.DestroyedReplicas, struct {
+		Name         string
+		ReplicaIndex int
+		KeepVolume   bool
+	}{Name: name, ReplicaIndex: replicaIndex, KeepVolume: keepVolume})
+	f.mu.Unlock()
+	if f.DestroyReplicaFn != nil {
+		return f.DestroyReplicaFn(ctx, name, replicaIndex, keepVolume)
+	}
+	return nil
+}
+
+func (f *FakeDocker) Stop(ctx context.Context, name string) error {
+	f.mu.Lock()
+	f.Stopped = append(f.Stopped, name)
+	f.mu.Unlock()
+	if f.StopFn != nil {
+		return f.StopFn(ctx, name)
+	}
+	return nil
+}
+
+func (f *FakeDocker) MigrateSnapshot(ctx context.Context, spec dockerprov.SnapshotMigrationSpec) error {
+	f.mu.Lock()
+	f.Migrations = append(f.Migrations, spec)
+	f.mu.Unlock()
+	if f.MigrateSnapshotFn != nil {
+		return f.MigrateSnapshotFn(ctx, spec)
+	}
+	return nil
+}
+
 // ProvisionedSpecs / DestroyedNames return mutex-guarded snapshots of
 // the recorded calls. Tests that read these fields directly still work
 // (the existing tests don't run under -race in CI), but new code should
@@ -537,6 +584,22 @@ func (f *FakeDocker) DestroyedNames() []string {
 	defer f.mu.Unlock()
 	out := make([]string, len(f.Destroyed))
 	copy(out, f.Destroyed)
+	return out
+}
+
+func (f *FakeDocker) StoppedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.Stopped))
+	copy(out, f.Stopped)
+	return out
+}
+
+func (f *FakeDocker) MigrationSpecs() []dockerprov.SnapshotMigrationSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]dockerprov.SnapshotMigrationSpec, len(f.Migrations))
+	copy(out, f.Migrations)
 	return out
 }
 

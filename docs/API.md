@@ -431,16 +431,39 @@ npx convex dev --once
 npx convex deploy
 ```
 
-### `POST /v1/deployments/{name}/upgrade_to_ha` 🔧 (admins only, reserved)
+### `POST /v1/deployments/{name}/upgrade_to_ha` ✅ (admins only)
 
-The route exists and performs auth/config/state validation, but the
-SQLite-to-Postgres/S3 data migration worker is not implemented. Valid
-requests currently return `501 ha_upgrade_not_yet_implemented`.
+Queues a one-shot migration from the legacy SQLite single-replica backend to
+two HA replicas backed by the configured Postgres + S3 storage. Requires
+`SYNAPSE_HA_ENABLED=true` and `SYNAPSE_STORAGE_KEY`.
 
-The safe implementation requires exporting a snapshot from the live
-single-replica backend, provisioning the new shared-storage replicas,
-importing that snapshot, and then atomically swapping traffic. Synapse does
-not run that export/import runtime in the API container today.
+Body: `{haOverrides?}` with the same optional storage override fields accepted
+by `create_deployment`.
+
+Response (202):
+
+```json
+{
+  "deploymentName": "happy-cat-1234",
+  "status": "queued",
+  "jobId": 42
+}
+```
+
+The worker exports a Convex backup from the old replica with the official CLI,
+provisions two HA containers, imports the backup with `--replace`, swaps the
+replica rows, then stops the old SQLite container without removing its volume.
+
+Errors:
+
+| code | status | meaning |
+|---|---|---|
+| `ha_disabled` | 400 | HA is disabled on this Synapse instance |
+| `ha_misconfigured` | 400 | HA storage or encryption config is incomplete |
+| `cannot_upgrade_adopted` | 400 | adopted deployments are managed externally |
+| `already_ha` | 409 | deployment is already HA |
+| `deployment_not_running` | 409 | deployment must be running before migration |
+| `upgrade_already_in_progress` | 409 | pending/claimed upgrade job already exists |
 
 ### `POST /v1/deployments/{name}/deploy_keys` ✅ (admins only)
 

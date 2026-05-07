@@ -86,7 +86,7 @@ PR #1 on 2026-04-29.
 - [x] **Chunks 6 + 7** — Replica-aware provisioner worker + `create_deployment ha:true` happy path
 - [x] **Chunk 8** — Dashboard HA toggle in the create-deployment dialog + `HA ×N` badge on deployment rows
 - [x] **Chunk 9** — Gated real-backend HA e2e (`SYNAPSE_HA_E2E=1`) + `ha` compose profile (backend-postgres + minio)
-- [x] **Chunk 10** — `POST /v1/deployments/{name}/upgrade_to_ha` endpoint with full validation (`ha_disabled` / `ha_misconfigured` / `already_ha` / `cannot_upgrade_adopted` / `deployment_not_running`); worker mechanics deferred to v0.5.1
+- [x] **Chunk 10** — `POST /v1/deployments/{name}/upgrade_to_ha` endpoint with full validation (`ha_disabled` / `ha_misconfigured` / `already_ha` / `cannot_upgrade_adopted` / `deployment_not_running`)
 - [x] Test counts: ~101 → ~131 Go (added crypto/ha provisioner/proxy/upgrade integration); 16 → 20 Playwright (HA toggle + badge specs)
 
 ## v0.6 — "Auto-installer" ✅ DONE
@@ -132,17 +132,17 @@ Three minutes later, the operator's VPS has Synapse running on `https://<their-d
 - [x] Test counts after the full v0.6.x: 211 → 266 bats + 136 → 139 Go + 20 → 24 Playwright; shellcheck `-x` clean across 12 .sh files. All real-VPS validated end-to-end on `synapse-vps` (Hetzner CPX22).
 - ~~v0.6.4 — Cloud images (stretch)~~ — deprioritized 2026-05-01; bookmarked for v0.7+ if it surfaces as a real operator ask.
 
-## v0.5.1 — "HA polish" 📋 DEFERRED
+## v0.5.1 — "HA polish" 📋 PARTIAL
 
 Bookmarked but lower priority than v0.6. Both pieces are behind
 already-shipped APIs (the wire surface exists — only the runtime
 behind it needs to land), so adding them is a runtime-only change.
 
-- [ ] Worker handler for `upgrade_to_ha` jobs: stream `snapshot_export`
-  from the existing replica, provision 2 new HA replicas, run
-  `snapshot_import` into the new pair, atomic swap (flip `ha_enabled`,
-  mark old replica `stopped`, invalidate proxy cache, audit). Endpoint
-  flips from `501` to `202` once the worker accepts the new `kind`.
+- [x] Worker handler for `upgrade_to_ha` jobs: export a Convex backup
+  from the existing replica, provision 2 new HA replicas, run CLI
+  import with `--replace` into the new pair, swap the replica rows, and
+  stop the old SQLite container without removing its volume. Endpoint
+  now returns `202` once the job is queued.
 - [ ] Real-backend failover e2e: extend `synapsetest.Setup` with an
   option to inject `*dockerprov.Client` instead of `FakeDocker`, then
   drive `docker kill` against the active replica from the
