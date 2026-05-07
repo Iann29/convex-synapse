@@ -723,13 +723,20 @@ func (h *DomainsHandler) autoConfigureDomain(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Mark the row auto-configured. Status stays 'pending' — the
-	// existing /verify endpoint flips to 'active' on a successful DNS
-	// match (PR C automates this with a polling loop).
+	// Mark the row auto-configured AND reset status back to 'pending'
+	// so the verification loop (internal/dns.Verifier) picks it up.
+	// The createDomain handler may have stamped 'failed' synchronously
+	// when the operator first added the row (DNS hadn't propagated
+	// yet) — that's a stale verdict the moment we mint the A record.
+	// Clear last_dns_error too so the dashboard renders "auto-
+	// configured, awaiting propagation" instead of the old failure.
 	row := h.DB.QueryRow(r.Context(), `
 		UPDATE deployment_domains
 		SET auto_configured = true,
 		    dns_credential_id = $2,
+		    status = 'pending',
+		    dns_verified_at = NULL,
+		    last_dns_error = NULL,
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING `+domainSelectCols, domainID, cred.id)

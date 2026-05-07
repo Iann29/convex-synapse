@@ -27,6 +27,13 @@ const (
 	// simultaneously would each issue the same UPDATE; the lock ensures
 	// only one runs it.
 	LockOrphanSweep int64 = 0xC0DE0002
+
+	// LockDNSVerifier guards the periodic dns.Verifier sweep that flips
+	// auto-configured deployment_domains rows from 'pending' to 'active'
+	// once the operator's freshly-minted A record propagates. Multi-node
+	// coordination: at most one verifier runs per tick across the fleet;
+	// followers observe acquired=false and skip silently.
+	LockDNSVerifier int64 = 0xC0DE0003
 )
 
 // WithTryAdvisoryLock attempts to acquire a session-level Postgres advisory
