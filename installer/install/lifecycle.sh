@@ -1288,3 +1288,461 @@ lifecycle::status() {
     ui::success "Status: OK"
     return 0
 }
+
+# ====================================================================
+# Reconfigure (v1.3+ chunk A)
+# ====================================================================
+#
+# Change the public host of an existing install without re-running the
+# full installer. Edits .env + re-renders Caddyfile + restarts the
+# Caddy / synapse-api services. Does NOT touch Postgres, deployment
+# containers, or the DB schema — those keep running through the swap.
+#
+# CLI surface (from setup.sh --reconfigure):
+#   --domain=<host>          switch to TLS-managed host
+#   --no-tls                 switch back to plain HTTP on IP:6790/8080
+#   --base-domain=<host>     add/change wildcard subdomain
+#   --acme-email=<address>   override Let's Encrypt account email
+#
+# Combination rules:
+#   - --domain and --no-tls are mutually exclusive
+#   - --base-domain can combine with either
+#   - At least one of --domain / --no-tls / --base-domain must be passed
+#
+# Error codes (printed as "<code>: <msg>" via ui::fail):
+#   bad_flags                  flag combination is invalid / missing
+#   not_installed              install dir lacks .env or compose file
+#   invalid_domain             --domain failed format validation
+#   invalid_email              --acme-email failed format validation
+#   caddy_validation_failed    rendered Caddyfile didn't `caddy validate`
+
+# lifecycle::_valid_domain <host>
+# Permissive hostname check — same shape as wizard::valid_domain so
+# operators get a consistent definition of "looks like a domain". The
+# real test is the Caddy/Let's Encrypt handshake, not us.
+lifecycle::_valid_domain() {
+    local d="${1:-}"
+    [[ -n "$d" ]] || return 1
+    [[ "$d" == *.* ]] || return 1
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+# lifecycle::_valid_email <addr>
+# Cheap RFC-5322-ish check. We're not delivering mail; we're handing
+# this to Let's Encrypt which will reject malformed addresses anyway.
+lifecycle::_valid_email() {
+    local a="${1:-}"
+    [[ -n "$a" ]] || return 1
+    [[ "$a" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+# lifecycle::_render_caddy <install_dir> <env_file> <out_path>
+# Decide which template to render and write a Caddyfile to <out_path>.
+# Reads SYNAPSE_DOMAIN / SYNAPSE_BASE_DOMAIN / SYNAPSE_ACME_EMAIL from
+# the env file and exports them so caddy::_render's placeholder
+# substitution picks them up. Returns 0 on success, 2 on render error.
+#
+# Picks the standalone template (compose-managed Caddy) when
+# RECONFIGURE_CADDY_MODE=caddy_compose, the fragment template when
+# =caddy_host. Defaults to caddy_compose since that's what the
+# auto-installer hands out for a fresh VPS.
+lifecycle::_render_caddy() {
+    local install_dir="$1" env_file="$2" out_path="$3"
+    local mode="${RECONFIGURE_CADDY_MODE:-caddy_compose}"
+
+    local domain base_domain acme_email synapse_port dashboard_port
+    domain="$(secrets::env_get "$env_file" SYNAPSE_DOMAIN)"
+    base_domain="$(secrets::env_get "$env_file" SYNAPSE_BASE_DOMAIN)"
+    acme_email="$(secrets::env_get "$env_file" SYNAPSE_ACME_EMAIL)"
+    synapse_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
+    dashboard_port="$(secrets::env_get "$env_file" DASHBOARD_PORT)"
+    synapse_port="${synapse_port:-8080}"
+    dashboard_port="${dashboard_port:-6790}"
+
+    # Export the placeholder values for caddy::_render's substitution.
+    # Variables exported here leak into the rest of the function's
+    # scope; that's fine — they get overwritten next call and the
+    # function is only entered from lifecycle::reconfigure which has
+    # no other consumers of these names.
+    export DOMAIN="$domain"
+    export SYNAPSE_BASE_DOMAIN="$base_domain"
+    export ACME_EMAIL="$acme_email"
+    export SYNAPSE_PORT="$synapse_port"
+    export DASHBOARD_PORT="$dashboard_port"
+    export CADDY_UPSTREAM_HOST="${CADDY_UPSTREAM_HOST:-synapse-api}"
+
+    local tmpl
+    case "$mode" in
+        caddy_host)
+            tmpl="${INSTALLER_TEMPLATES:-$install_dir/installer/templates}/caddy.fragment"
+            ;;
+        caddy_compose|*)
+            tmpl="${INSTALLER_TEMPLATES:-$install_dir/installer/templates}/caddy.standalone"
+            ;;
+    esac
+    if [[ ! -r "$tmpl" ]]; then
+        ui::fail "caddy template missing: $tmpl"
+        return 2
+    fi
+    local rendered
+    rendered="$(caddy::_render "$tmpl")" || return 2
+
+    if [[ -n "$base_domain" ]]; then
+        local wildcard_tmpl
+        wildcard_tmpl="${INSTALLER_TEMPLATES:-$install_dir/installer/templates}/caddy.wildcard"
+        if [[ -r "$wildcard_tmpl" ]]; then
+            local wild
+            wild="$(caddy::_render "$wildcard_tmpl")" || return 2
+            rendered+=$'\n'"$wild"
+        fi
+    fi
+
+    local tmp
+    tmp="$(mktemp "${out_path}.XXXXXX")" || return 2
+    printf '%s\n' "$rendered" >"$tmp"
+    chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$out_path"
+}
+
+# lifecycle::_validate_caddy <install_dir> <caddy_path>
+# Run `caddy validate` inside a throwaway caddy container against the
+# rendered file. Returns 0 if Caddy is happy, non-zero otherwise.
+# RECONFIGURE_VALIDATE_CMD lets tests inject a stub.
+lifecycle::_validate_caddy() {
+    local install_dir="$1" caddy_path="$2"
+    local validator="${RECONFIGURE_VALIDATE_CMD:-}"
+    if [[ -n "$validator" ]]; then
+        # Test injection: a single-arg stub that returns its rc based on
+        # the caddy_path it's handed. Keeps bats free of docker.
+        "$validator" "$caddy_path"
+        return $?
+    fi
+    local cmd="${COMPOSE_CMD:-docker}"
+    "$cmd" run --rm \
+        -v "$caddy_path:/etc/caddy/Caddyfile:ro" \
+        caddy:2-alpine \
+        caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+        >/dev/null 2>&1
+}
+
+# lifecycle::reconfigure <install_dir> [options]
+# Public entry point. Wraps `_reconfigure_inner` so we can clean up
+# any temp files no matter where the inner returns.
+lifecycle::reconfigure() {
+    local _tmp_caddy_path=""
+    local rc=0
+    lifecycle::_reconfigure_inner "$@" tmp_caddy_var=_tmp_caddy_path || rc=$?
+    if [[ -n "$_tmp_caddy_path" && -e "$_tmp_caddy_path" ]]; then
+        rm -f "$_tmp_caddy_path"
+    fi
+    return $rc
+}
+
+lifecycle::_reconfigure_inner() {
+    local install_dir="$1"
+    shift
+    local new_domain="" new_base="" new_acme="" tmp_caddy_var=""
+    local set_no_tls=0 saw_domain=0 saw_base=0 saw_acme=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --domain=*)        new_domain="${1#*=}"; saw_domain=1 ;;
+            --domain)          new_domain="${2:-}"; saw_domain=1; shift ;;
+            --no-tls)          set_no_tls=1 ;;
+            --base-domain=*)   new_base="${1#*=}"; saw_base=1 ;;
+            --base-domain)     new_base="${2:-}"; saw_base=1; shift ;;
+            --acme-email=*)    new_acme="${1#*=}"; saw_acme=1 ;;
+            --acme-email)      new_acme="${2:-}"; saw_acme=1; shift ;;
+            tmp_caddy_var=*)   tmp_caddy_var="${1#*=}" ;;
+        esac
+        shift
+    done
+
+    # ---- 1. flag-combo validation --------------------------------------
+    if (( saw_domain )) && (( set_no_tls )); then
+        ui::fail "bad_flags: --domain and --no-tls cannot be combined"
+        return 2
+    fi
+    if (( ! saw_domain )) && (( ! set_no_tls )) && (( ! saw_base )); then
+        ui::fail "bad_flags: pass at least one of --domain / --no-tls / --base-domain"
+        return 2
+    fi
+
+    # Strip leading dot from base-domain (operators sometimes type
+    # ".apps.example.com"). Empty base after strip is OK — that means
+    # "remove the base-domain wildcard".
+    new_base="${new_base#.}"
+
+    # ---- 2. install-dir preflight --------------------------------------
+    local env_file="$install_dir/.env"
+    local compose_file="$install_dir/docker-compose.yml"
+    local reconfigure_log="$install_dir/reconfigure.log"
+    if [[ ! -f "$env_file" || ! -f "$compose_file" ]]; then
+        ui::fail "not_installed: no Synapse install at $install_dir (.env or docker-compose.yml missing)"
+        return 2
+    fi
+    if [[ ! -w "$install_dir" ]]; then
+        ui::fail "not_installed: $install_dir is not writable by $(id -un 2>/dev/null || echo "this user")"
+        return 2
+    fi
+
+    # ---- 3. value validation -------------------------------------------
+    if (( saw_domain )) && [[ -n "$new_domain" ]]; then
+        if ! lifecycle::_valid_domain "$new_domain"; then
+            ui::fail "invalid_domain: '$new_domain' doesn't look like a hostname"
+            return 2
+        fi
+    fi
+    if (( saw_base )) && [[ -n "$new_base" ]]; then
+        if ! lifecycle::_valid_domain "$new_base"; then
+            ui::fail "invalid_domain: base-domain '$new_base' doesn't look like a hostname"
+            return 2
+        fi
+    fi
+    if (( saw_acme )) && [[ -n "$new_acme" ]]; then
+        if ! lifecycle::_valid_email "$new_acme"; then
+            ui::fail "invalid_email: '$new_acme' doesn't look like an email address"
+            return 2
+        fi
+    fi
+
+    # ---- 4. read current state ----------------------------------------
+    local cur_domain cur_base cur_public_url cur_acme cur_port cur_dashboard_port
+    cur_domain="$(secrets::env_get "$env_file" SYNAPSE_DOMAIN)"
+    cur_base="$(secrets::env_get "$env_file" SYNAPSE_BASE_DOMAIN)"
+    cur_public_url="$(secrets::env_get "$env_file" SYNAPSE_PUBLIC_URL)"
+    cur_acme="$(secrets::env_get "$env_file" SYNAPSE_ACME_EMAIL)"
+    cur_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
+    cur_dashboard_port="$(secrets::env_get "$env_file" DASHBOARD_PORT)"
+    cur_port="${cur_port:-8080}"
+    cur_dashboard_port="${cur_dashboard_port:-6790}"
+
+    # ---- 5. compute new state -----------------------------------------
+    # Mode resolution:
+    #   --domain=...   → tls mode, SYNAPSE_DOMAIN=<new>
+    #   --no-tls       → plain mode, clear SYNAPSE_DOMAIN
+    #   neither (just --base-domain) → keep existing tls/no-tls posture
+    local target_domain="$cur_domain"
+    local target_base="$cur_base"
+    local target_acme="$cur_acme"
+    if (( saw_domain )); then
+        target_domain="$new_domain"
+        # Auto-default ACME email to admin@<domain> when the operator
+        # didn't supply one and the existing one targeted the old host.
+        # Match install-time behavior in setup.sh::parse_flags.
+        if (( ! saw_acme )) && [[ -z "$target_acme" || "$target_acme" == "admin@${cur_domain:-x}" ]]; then
+            target_acme="admin@$new_domain"
+        fi
+    fi
+    if (( set_no_tls )); then
+        target_domain=""
+        # Plain HTTP mode doesn't need an ACME email; drop it so the
+        # next reconfigure with --domain regenerates the default.
+        target_acme=""
+    fi
+    if (( saw_base )); then
+        target_base="$new_base"
+    fi
+    if (( saw_acme )); then
+        target_acme="$new_acme"
+    fi
+
+    # Compose dependent URLs.
+    local target_public_url="" target_allowed_origins="*"
+    if [[ -n "$target_domain" ]]; then
+        target_public_url="https://$target_domain"
+        target_allowed_origins="https://$target_domain"
+    elif (( set_no_tls )); then
+        # Try to detect the public IP so the dashboard URL is reachable
+        # from a remote browser. Best-effort — empty IP means "local-only".
+        local detected_ip=""
+        if detected_ip="$(detect::public_ip 2>/dev/null)" && [[ -n "$detected_ip" ]]; then
+            target_public_url="http://${detected_ip}:${cur_port}"
+        fi
+    fi
+
+    # ---- 6. summary ----------------------------------------------------
+    ui::step "Synapse reconfigure"
+    ui::info "Install dir: $install_dir"
+    local prev_label="${cur_public_url:-(plain HTTP, local-only)}"
+    if [[ -z "$cur_public_url" && -n "$cur_domain" ]]; then
+        prev_label="https://$cur_domain"
+    fi
+    ui::info "Old: $prev_label"
+    if [[ -n "$target_domain" ]]; then
+        ui::info "New: https://${target_domain} (TLS via Caddy)"
+    elif (( set_no_tls )); then
+        ui::info "New: plain HTTP on ${target_public_url:-IP:${cur_port}/${cur_dashboard_port}}"
+    else
+        ui::info "New: ${target_public_url:-(unchanged)}"
+    fi
+    if [[ -n "$target_base" ]]; then
+        ui::info "Custom domains: *.${target_base}"
+    fi
+
+    # ---- 7. write updated .env (atomic) -------------------------------
+    # We write the whole new .env to a sibling tmp + rename — preserves
+    # secrets, matches secrets::_write_atomic semantics, and lets a
+    # later step bail (e.g. caddy validate) without a half-applied state.
+    local env_tmp
+    env_tmp="$(mktemp "${env_file}.XXXXXX")" || {
+        ui::fail "could not allocate tmp file next to $env_file"
+        return 2
+    }
+    awk \
+        -v sd="SYNAPSE_DOMAIN=$target_domain" \
+        -v sp="SYNAPSE_PUBLIC_URL=$target_public_url" \
+        -v sb="SYNAPSE_BASE_DOMAIN=$target_base" \
+        -v sa="SYNAPSE_ACME_EMAIL=$target_acme" \
+        -v ao="SYNAPSE_ALLOWED_ORIGINS=$target_allowed_origins" \
+        -v pu="PUBLIC_SYNAPSE_URL=$target_public_url" \
+        -v na="NEXT_PUBLIC_API_URL=$target_public_url" \
+        -v co="CORS_ALLOWED_ORIGINS=$target_allowed_origins" \
+        '
+        BEGIN {
+            seen["SYNAPSE_DOMAIN"]=0
+            seen["SYNAPSE_PUBLIC_URL"]=0
+            seen["SYNAPSE_BASE_DOMAIN"]=0
+            seen["SYNAPSE_ACME_EMAIL"]=0
+            seen["SYNAPSE_ALLOWED_ORIGINS"]=0
+            seen["PUBLIC_SYNAPSE_URL"]=0
+            seen["NEXT_PUBLIC_API_URL"]=0
+            seen["CORS_ALLOWED_ORIGINS"]=0
+        }
+        /^SYNAPSE_DOMAIN=/         { print sd; seen["SYNAPSE_DOMAIN"]=1; next }
+        /^SYNAPSE_PUBLIC_URL=/     { print sp; seen["SYNAPSE_PUBLIC_URL"]=1; next }
+        /^SYNAPSE_BASE_DOMAIN=/    { print sb; seen["SYNAPSE_BASE_DOMAIN"]=1; next }
+        /^SYNAPSE_ACME_EMAIL=/     { print sa; seen["SYNAPSE_ACME_EMAIL"]=1; next }
+        /^SYNAPSE_ALLOWED_ORIGINS=/{ print ao; seen["SYNAPSE_ALLOWED_ORIGINS"]=1; next }
+        /^PUBLIC_SYNAPSE_URL=/     { print pu; seen["PUBLIC_SYNAPSE_URL"]=1; next }
+        /^NEXT_PUBLIC_API_URL=/    { print na; seen["NEXT_PUBLIC_API_URL"]=1; next }
+        /^CORS_ALLOWED_ORIGINS=/   { print co; seen["CORS_ALLOWED_ORIGINS"]=1; next }
+        { print }
+        END {
+            if (!seen["SYNAPSE_DOMAIN"])          print sd
+            if (!seen["SYNAPSE_PUBLIC_URL"])      print sp
+            if (!seen["SYNAPSE_BASE_DOMAIN"])     print sb
+            if (!seen["SYNAPSE_ACME_EMAIL"])      print sa
+            if (!seen["SYNAPSE_ALLOWED_ORIGINS"]) print ao
+            if (!seen["PUBLIC_SYNAPSE_URL"])      print pu
+            if (!seen["NEXT_PUBLIC_API_URL"])     print na
+            if (!seen["CORS_ALLOWED_ORIGINS"])    print co
+        }
+        ' "$env_file" >"$env_tmp"
+
+    # Preserve perms from the existing .env (operator may have chmod 600'd it).
+    chmod --reference="$env_file" "$env_tmp" 2>/dev/null || chmod 0600 "$env_tmp"
+
+    # ---- 8. render + validate Caddyfile -------------------------------
+    # When --no-tls AND no base-domain, there's no Caddyfile to write at
+    # all — the operator is going pure plain HTTP. Caddy isn't in the
+    # default profile in that case (it's gated on the `caddy` profile).
+    local caddy_path="$install_dir/Caddyfile"
+    local need_caddy=0
+    if [[ -n "$target_domain" || -n "$target_base" ]]; then
+        need_caddy=1
+    fi
+    if (( need_caddy )); then
+        local caddy_tmp
+        caddy_tmp="$(mktemp "${caddy_path}.new.XXXXXX")" || {
+            ui::fail "could not allocate tmp Caddyfile next to $caddy_path"
+            rm -f "$env_tmp"
+            return 2
+        }
+        if [[ -n "$tmp_caddy_var" ]]; then
+            printf -v "$tmp_caddy_var" '%s' "$caddy_tmp"
+        fi
+
+        # Use the new env state (env_tmp) as the source of truth for
+        # template values — we haven't moved env_tmp into place yet, so
+        # _render_caddy reads the soon-to-be-active configuration.
+        if ! lifecycle::_render_caddy "$install_dir" "$env_tmp" "$caddy_tmp"; then
+            ui::fail "could not render Caddyfile"
+            rm -f "$env_tmp" "$caddy_tmp"
+            return 2
+        fi
+
+        if ! lifecycle::_validate_caddy "$install_dir" "$caddy_tmp"; then
+            ui::fail "caddy_validation_failed: rendered Caddyfile didn't pass 'caddy validate'"
+            ui::info "Inspect: $caddy_tmp"
+            ui::info ".env and current Caddyfile left untouched."
+            rm -f "$env_tmp"
+            # Leave caddy_tmp on disk for operator inspection; the
+            # cleanup wrapper will remove it via tmp_caddy_var.
+            return 2
+        fi
+        # Validation OK — promote the staged Caddyfile.
+        mv -f "$caddy_tmp" "$caddy_path"
+        # Clear the cleanup pointer since the file is now permanent.
+        if [[ -n "$tmp_caddy_var" ]]; then
+            printf -v "$tmp_caddy_var" '%s' ""
+        fi
+    fi
+
+    # ---- 9. promote .env ----------------------------------------------
+    mv -f "$env_tmp" "$env_file"
+    ui::success ".env updated (atomically)"
+
+    # ---- 10. apply to docker compose ----------------------------------
+    # We restart the affected services so container env / volume mounts
+    # pick up the new config. Caddy reload is preferred over recreate
+    # because it preserves the cert cache (Let's Encrypt rate limits).
+    local docker_cmd="${COMPOSE_CMD:-docker}"
+    if (( need_caddy )); then
+        # Bring caddy up under its profile (idempotent; up -d on a
+        # running service is a no-op).
+        export SYNAPSE_CADDYFILE_PATH="$caddy_path"
+        ui::spin "Starting Caddy" \
+            "$docker_cmd" compose -f "$compose_file" --profile caddy up -d --no-build caddy \
+            || ui::warn "compose up caddy returned non-zero — inspect with 'docker compose logs caddy'"
+        # Reload picks up the new file without dropping connections /
+        # losing the cert cache.
+        if ! "$docker_cmd" compose -f "$compose_file" exec -T caddy \
+                caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+            ui::warn "caddy reload failed — falling back to restart"
+            "$docker_cmd" compose -f "$compose_file" --profile caddy restart caddy >/dev/null 2>&1 \
+                || ui::warn "caddy restart also failed — check 'docker compose logs caddy'"
+        fi
+    else
+        # No-tls path: the operator wants Caddy gone so port 80/443
+        # aren't bound by us. Best-effort stop+rm; tolerated if it's
+        # already absent.
+        "$docker_cmd" compose -f "$compose_file" stop caddy >/dev/null 2>&1 || true
+        "$docker_cmd" compose -f "$compose_file" rm -f caddy >/dev/null 2>&1 || true
+    fi
+
+    # SYNAPSE_PUBLIC_URL flows into the synapse-api container env at
+    # start time; restart it (and the dashboard, which reads
+    # NEXT_PUBLIC_API_URL at build / runtime) so the new URL is the
+    # one the API surfaces in /cli_credentials and the dashboard JS
+    # uses for fetches. Best-effort — restarting a healthy stack
+    # that's already on the right env is harmless.
+    "$docker_cmd" compose -f "$compose_file" up -d --no-build synapse dashboard \
+        >/dev/null 2>&1 || true
+
+    # ---- 11. audit log + summary --------------------------------------
+    {
+        printf 'old: domain=%s base=%s public_url=%s acme=%s\n' \
+            "${cur_domain:-}" "${cur_base:-}" "${cur_public_url:-}" "${cur_acme:-}"
+        printf 'new: domain=%s base=%s public_url=%s acme=%s\n' \
+            "${target_domain:-}" "${target_base:-}" "${target_public_url:-}" "${target_acme:-}"
+    } | while IFS= read -r line; do
+        lifecycle::log "$reconfigure_log" "reconfigure: $line"
+    done
+
+    ui::success "Reconfigured Synapse host"
+    if [[ -n "$target_domain" ]]; then
+        ui::info "  Dashboard: https://${target_domain}"
+        ui::info "  API:       https://${target_domain}/v1"
+        ui::info "  TLS will be issued by Let's Encrypt on first request to https://${target_domain}/"
+    elif [[ -n "$target_public_url" ]]; then
+        ui::info "  Dashboard: ${target_public_url%:*}:${cur_dashboard_port}"
+        ui::info "  API:       ${target_public_url}"
+    else
+        ui::info "  Plain-HTTP, local-only (no public IP detected)."
+    fi
+    if [[ -n "$target_base" ]]; then
+        ui::info "  Per-deployment subdomains: *.${target_base}"
+        ui::info "  (wildcard A record *.${target_base} must point at this VPS)"
+    fi
+    return 0
+}

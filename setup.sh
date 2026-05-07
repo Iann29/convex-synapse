@@ -169,6 +169,14 @@ Options:
                              the install: containers, volumes, public
                              URL, DNS, TLS expiry, disk. Exit 0 healthy,
                              1 degraded, 2 broken.
+    --reconfigure            Change the public host of an existing
+                             install (.env + Caddyfile only — does NOT
+                             touch Postgres, deployments, or migrations).
+                             Combine with --domain / --no-tls /
+                             --base-domain / --acme-email to describe
+                             the new state. At least one of those must
+                             be passed; --domain and --no-tls are
+                             mutually exclusive.
     --install-dir=<path>     Override $INSTALL_DIR_DEFAULT.
     --no-bootstrap           Skip the curl|sh bootstrap re-exec even
                              when installer/ is missing. Useful for
@@ -213,6 +221,7 @@ parse_flags() {
     LOGS_FOLLOW=0
     LOGS_TAIL=""
     STATUS=0
+    RECONFIGURE=0
     NO_BOOTSTRAP=0
     INSTALL_DIR="$INSTALL_DIR_DEFAULT"
     # INSTALL_DIR_FROM_FLAG = 1 means the operator passed --install-dir=
@@ -249,6 +258,7 @@ parse_flags() {
             --tail=*)          LOGS_TAIL="${1#*=}" ;;
             --tail)            LOGS_TAIL="${2:-}"; shift ;;
             --status)          STATUS=1 ;;
+            --reconfigure)     RECONFIGURE=1 ;;
             --install-dir=*)   INSTALL_DIR="${1#*=}"; INSTALL_DIR_FROM_FLAG=1 ;;
             --no-bootstrap)    NO_BOOTSTRAP=1 ;;
             --version)         echo "synapse-installer $INSTALLER_VERSION"; exit 0 ;;
@@ -997,6 +1007,27 @@ main() {
     if (( STATUS )); then
         source_libs
         lifecycle::status "$INSTALL_DIR"
+        exit $?
+    fi
+    if (( RECONFIGURE )); then
+        if [[ -w "$(dirname "$LOG_FILE")" ]]; then
+            exec > >(tee -a "$LOG_FILE") 2>&1
+        fi
+        source_libs
+        local rc_args=()
+        if [[ -n "$DOMAIN" ]]; then
+            rc_args+=(--domain="$DOMAIN")
+        fi
+        if (( NO_TLS )); then
+            rc_args+=(--no-tls)
+        fi
+        if [[ -n "$BASE_DOMAIN" ]]; then
+            rc_args+=(--base-domain="$BASE_DOMAIN")
+        fi
+        if [[ -n "$ACME_EMAIL" ]]; then
+            rc_args+=(--acme-email="$ACME_EMAIL")
+        fi
+        lifecycle::reconfigure "$INSTALL_DIR" "${rc_args[@]}"
         exit $?
     fi
 
