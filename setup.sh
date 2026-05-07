@@ -223,7 +223,11 @@ parse_flags() {
     STATUS=0
     RECONFIGURE=0
     NO_BOOTSTRAP=0
-    INSTALL_DIR="$INSTALL_DIR_DEFAULT"
+    # Honour $SYNAPSE_INSTALL_DIR as a fallback when neither --install-dir=
+    # nor a wizard answer set it. The synapse-updater systemd unit exports
+    # this so the daemon can spawn setup.sh without having to thread the
+    # flag through every call site (upgrade, reconfigure, etc).
+    INSTALL_DIR="${SYNAPSE_INSTALL_DIR:-$INSTALL_DIR_DEFAULT}"
     # INSTALL_DIR_FROM_FLAG = 1 means the operator passed --install-dir=
     # explicitly. The wizard reads this to know whether to ask the
     # install-dir question (no flag = ask; flag = respect operator's
