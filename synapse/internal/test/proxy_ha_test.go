@@ -180,6 +180,87 @@ func TestResolver_HA_OrdersByLastSeen(t *testing.T) {
 	}
 }
 
+// TestProxyHealthProbe_MarksLeaseHolder exercises the active probe loop:
+// only the replica that accepts the deployment admin key gets
+// last_seen_active_at, and the resolver then prefers it.
+func TestProxyHealthProbe_MarksLeaseHolder(t *testing.T) {
+	h := Setup(t)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Probe")
+	project := createProject(t, h, owner.AccessToken, team.Slug, "App")
+	const adminKey = "probe-admin-key"
+
+	r0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/check_admin_key" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	r1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/check_admin_key" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Convex "+adminKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	t.Cleanup(r0.Close)
+	t.Cleanup(r1.Close)
+
+	depID := h.SeedDeployment(project.ID, "probe-ha-5500", "prod", "running",
+		false, owner.ID, mustPort(t, r0.URL), adminKey)
+	if _, err := h.DB.Exec(h.rootCtx,
+		`UPDATE deployments SET ha_enabled = true, replica_count = 2 WHERE id = $1`,
+		depID); err != nil {
+		t.Fatalf("flip ha: %v", err)
+	}
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO deployment_replicas (deployment_id, replica_index, container_id, host_port, status)
+		VALUES ($1, 1, 'probe-ha-5500-1', $2, 'running')
+	`, depID, mustPort(t, r1.URL)); err != nil {
+		t.Fatalf("insert replica 1: %v", err)
+	}
+
+	p := &proxy.HealthProbe{DB: h.DB, UseNetworkDNS: false, Timeout: time.Second}
+	healthy, err := p.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if healthy != 1 {
+		t.Fatalf("healthy probes=%d want 1", healthy)
+	}
+
+	var r0Seen, r1Seen bool
+	if err := h.DB.QueryRow(h.rootCtx, `
+		SELECT bool_or(replica_index = 0 AND last_seen_active_at IS NOT NULL),
+		       bool_or(replica_index = 1 AND last_seen_active_at IS NOT NULL)
+		  FROM deployment_replicas
+		 WHERE deployment_id = $1
+	`, depID).Scan(&r0Seen, &r1Seen); err != nil {
+		t.Fatalf("read last_seen: %v", err)
+	}
+	if r0Seen {
+		t.Error("replica 0 should not be marked active after a 401 probe")
+	}
+	if !r1Seen {
+		t.Error("replica 1 should be marked active after a 200 probe")
+	}
+
+	resolver := &proxy.Resolver{DB: h.DB, UseNetworkDNS: false, CacheTTL: time.Second}
+	addrs, err := resolver.ResolveAll(context.Background(), "probe-ha-5500")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	want := "127.0.0.1:" + strconv.Itoa(mustPort(t, r1.URL))
+	if addrs[0] != want {
+		t.Errorf("resolver first=%s want %s", addrs[0], want)
+	}
+}
+
 // ---------- helpers ----------
 
 func mustPort(t *testing.T, urlStr string) int {

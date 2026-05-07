@@ -725,24 +725,147 @@ func escapeJSON(s string) string {
 	return r.Replace(s)
 }
 
-// healthProbe is a 2-second probe loop that hits /version on each
-// configured replica and updates deployment_replicas.last_seen_active_at
+// HealthProbe is a probe loop that hits /api/check_admin_key on each
+// running HA replica and updates deployment_replicas.last_seen_active_at
 // when a 2xx comes back. The picker uses this column to prefer recently-
-// alive replicas, so the column is the source of truth for "who's
-// healthy right now."
+// alive replicas, so the column is the source of truth for "who currently
+// holds the Convex backend lease."
 //
 // Single goroutine, started once per Synapse process. Multi-node:
 // running this on every node is fine — last_seen_active_at converges.
-//
-// Currently a placeholder (not wired into cmd/server) — chunk 5 ships
-// the Resolver changes; the active probe loop arrives in a follow-up
-// once we have HA deployments to probe against.
-//
-// (Left here so reviewers see where the loop will live; spec deliberately
-// out-of-scope for this PR per docs/V0_5_PLAN.md.)
-type healthProbe struct {
-	DB     *pgxpool.Pool
-	Period time.Duration
+type HealthProbe struct {
+	DB            *pgxpool.Pool
+	UseNetworkDNS bool
+	Period        time.Duration
+	Timeout       time.Duration
+	Client        *http.Client
+	Logger        *slog.Logger
 }
 
-var _ = func(_ context.Context, _ *healthProbe) {}
+// Run starts the probe loop until ctx is cancelled.
+func (p *HealthProbe) Run(ctx context.Context) {
+	period := p.Period
+	if period <= 0 {
+		period = 2 * time.Second
+	}
+	logger := p.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	logger.Info("proxy health probe starting", "period", period)
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+
+	for {
+		if _, err := p.Sweep(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("proxy health probe sweep failed", "err", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Info("proxy health probe stopping")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// Sweep probes every running HA replica once. It is exported primarily so
+// tests can drive the picker update deterministically without sleeping on
+// the background ticker.
+func (p *HealthProbe) Sweep(ctx context.Context) (int, error) {
+	if p.DB == nil {
+		return 0, nil
+	}
+	timeout := p.Timeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
+	logger := p.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	rows, err := p.DB.Query(ctx, `
+		SELECT r.id, d.name, d.admin_key, d.ha_enabled,
+		       r.replica_index, r.host_port
+		  FROM deployment_replicas r
+		  JOIN deployments d ON d.id = r.deployment_id
+		 WHERE d.status = 'running'
+		   AND d.ha_enabled = true
+		   AND r.status = 'running'
+		 ORDER BY d.name, r.replica_index
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type replica struct {
+		id           string
+		name         string
+		adminKey     string
+		haEnabled    bool
+		replicaIndex int
+		hostPort     *int
+	}
+	var replicas []replica
+	for rows.Next() {
+		var r replica
+		if err := rows.Scan(&r.id, &r.name, &r.adminKey, &r.haEnabled, &r.replicaIndex, &r.hostPort); err != nil {
+			return 0, err
+		}
+		replicas = append(replicas, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	resolver := &Resolver{UseNetworkDNS: p.UseNetworkDNS}
+	healthy := 0
+	for _, r := range replicas {
+		if r.adminKey == "" {
+			continue
+		}
+		if r.hostPort == nil && !p.UseNetworkDNS {
+			continue
+		}
+		addr := resolver.addressFor(r.name, r.replicaIndex, r.haEnabled, r.hostPort)
+		if p.probeReplica(ctx, client, timeout, addr, r.adminKey) {
+			if _, err := p.DB.Exec(ctx, `
+				UPDATE deployment_replicas
+				   SET last_seen_active_at = now()
+				 WHERE id = $1
+			`, r.id); err != nil {
+				return healthy, err
+			}
+			healthy++
+			continue
+		}
+		logger.Debug("proxy health probe miss",
+			"deployment", r.name, "replica", r.replicaIndex, "addr", addr)
+	}
+	return healthy, nil
+}
+
+func (p *HealthProbe) probeReplica(ctx context.Context, client *http.Client, timeout time.Duration, addr, adminKey string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+addr+"/api/check_admin_key", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Convex "+adminKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode/100 == 2
+}
