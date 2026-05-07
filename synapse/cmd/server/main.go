@@ -226,6 +226,12 @@ func run() error {
 		GitHubRepo:    cfg.GitHubRepo,
 		PublicIP:      cfg.PublicIP,
 		DomainCache:   proxyResolver,
+		// DNS-provider credentials reuse the same SecretBox as the HA
+		// deployment_storage flow — both encrypt operator-supplied
+		// secrets-at-rest. nil when SYNAPSE_STORAGE_KEY is unset, in
+		// which case /v1/admin/dns_credentials/cloudflare returns
+		// 503 crypto_not_configured.
+		DNSEnvelope: secretBox,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the

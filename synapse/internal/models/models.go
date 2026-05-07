@@ -229,8 +229,44 @@ type DeploymentDomain struct {
 	Status        string     `json:"status"`
 	DNSVerifiedAt *time.Time `json:"dnsVerifiedAt,omitempty"`
 	LastDNSError  string     `json:"lastDnsError,omitempty"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	UpdatedAt     time.Time  `json:"updatedAt"`
+	// AutoConfigured is true when Synapse created the A record on the
+	// operator's behalf via a stored DNS-provider credential
+	// (v1.5+). Surfaced to the dashboard so a "we set this up for you"
+	// chip can render next to the row.
+	AutoConfigured bool `json:"autoConfigured"`
+	// DNSCredentialID points at the dns_credentials row that minted the
+	// A record. Nil for manually-configured domains.
+	DNSCredentialID *string   `json:"dnsCredentialId,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+}
+
+// DNSCredential is a stored API credential for a DNS provider
+// (Cloudflare today; Route53/Google planned). The plaintext token is
+// never returned over the API — only the metadata fields below.
+//
+// Zones is cached at save time so the dashboard can show "this token
+// covers: [...]" without re-calling the provider on every page load.
+// LastUsedAt + LastError are populated by the auto-configure flow and
+// surface as "credential health" indicators in the panel.
+type DNSCredential struct {
+	ID         string     `json:"id"`
+	Provider   string     `json:"provider"`
+	Label      string     `json:"label"`
+	Zones      []ZoneInfo `json:"zones"`
+	CreatedBy  *string    `json:"createdBy,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
+	LastError  string     `json:"lastError,omitempty"`
+}
+
+// ZoneInfo mirrors the shape persisted in dns_credentials.zones jsonb.
+// Kept in models/ so both api/ and dns/ can reference the same type
+// without an import cycle (api/ already imports models/; dns/ has no
+// reason to).
+type ZoneInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"` // zone apex, no trailing dot, e.g. "fechasul.com.br"
 }
 
 const (

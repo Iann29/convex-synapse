@@ -21,6 +21,8 @@ type domainResp struct {
 	Status                     string     `json:"status"`
 	DNSVerifiedAt              *time.Time `json:"dnsVerifiedAt,omitempty"`
 	LastDNSError               string     `json:"lastDnsError,omitempty"`
+	AutoConfigured             bool       `json:"autoConfigured"`
+	DNSCredentialID            *string    `json:"dnsCredentialId,omitempty"`
 	CreatedAt                  time.Time  `json:"createdAt"`
 	UpdatedAt                  time.Time  `json:"updatedAt"`
 	DeploymentRestartTriggered bool       `json:"deploymentRestartTriggered,omitempty"`

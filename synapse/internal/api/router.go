@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Iann29/synapse/internal/auth"
+	synapsedns "github.com/Iann29/synapse/internal/dns"
 	"github.com/Iann29/synapse/internal/middleware"
 )
 
@@ -90,6 +92,25 @@ type RouterDeps struct {
 	// in tests. Production wiring leaves this nil and the handler
 	// falls back to net.DefaultResolver. See AdminHandler.dnsLookupA.
 	HostDomainResolver HostDomainResolver
+
+	// DNSEnvelope is the encrypt+decrypt envelope the DNS-credentials
+	// flow uses to protect the stored Cloudflare token. Same backing
+	// SecretBox as Crypto in the HA flow; the separate field exists
+	// because the two flows have different "is this required" rules
+	// (HA refuses to start without Crypto; DNS auto-configure
+	// degrades to "503 unavailable" when nil).
+	DNSEnvelope SecretEnvelope
+
+	// CloudflareFactory is a test seam — production wiring leaves it
+	// nil and both the credentials-CRUD and the auto-configure flow
+	// build a real CloudflareClient. Tests inject a closure that
+	// points at an httptest.Server pretending to be Cloudflare.
+	CloudflareFactory func(token string) *synapsedns.CloudflareClient
+
+	// DNSProviderLookup is a test seam — production leaves it nil and
+	// /v1/internal/dns_provider delegates to the real DNS resolver.
+	// Tests can inject canned NS responses.
+	DNSProviderLookup func(ctx context.Context, domain string) (string, []string, error)
 }
 
 // DomainCacheInvalidator is the subset of *proxy.Resolver the
@@ -161,11 +182,13 @@ func NewRouter(d RouterDeps) http.Handler {
 	// deployments handler for loadDeploymentForRequest so
 	// authorisation logic stays in one place.
 	domainsH := &DomainsHandler{
-		DB:          d.DB,
-		Deployments: deploymentsH,
-		PublicIP:    d.PublicIP,
-		Cache:       d.DomainCache,
-		Logger:      d.Logger,
+		DB:                d.DB,
+		Deployments:       deploymentsH,
+		PublicIP:          d.PublicIP,
+		Cache:             d.DomainCache,
+		Logger:            d.Logger,
+		Crypto:            d.DNSEnvelope,
+		CloudflareFactory: d.CloudflareFactory,
 	}
 	deploymentsH.Domains = domainsH
 	// teamsH + projectsH carry a *DeploymentsHandler reference so their
@@ -206,6 +229,11 @@ func NewRouter(d RouterDeps) http.Handler {
 			// dashboard_proxy.go for the auth + cors discussion.
 			dashProxy := &DashboardProxyHandler{DB: d.DB, Deployments: deploymentsH}
 			r.Get("/list_deployments_for_dashboard", dashProxy.listDeploymentsForDashboard)
+			// dns_provider — looks up which DNS provider hosts a
+			// given domain so the dashboard can render the right
+			// auto-configure UI before the operator pastes a token.
+			// Public + unauthenticated; result is informational only.
+			r.Method(http.MethodGet, "/dns_provider", &DNSProviderHandler{Lookup: d.DNSProviderLookup})
 		})
 
 		// Authenticated.
@@ -233,6 +261,15 @@ func NewRouter(d RouterDeps) http.Handler {
 				PublicIP:           d.PublicIP,
 				HostDomainResolver: d.HostDomainResolver,
 			}
+			// DNS-provider credentials — mounted under /admin and
+			// gated by AdminHandler.requireInstanceAdmin. Wired here
+			// so all instance-admin surfaces stay consistent.
+			dnsCredsH := &DNSCredentialsHandler{
+				DB:                d.DB,
+				Crypto:            d.DNSEnvelope,
+				CloudflareFactory: d.CloudflareFactory,
+			}
+			adminH.DNSCredentials = dnsCredsH
 			r.Mount("/admin", adminH.Routes())
 			// Personal access tokens — flat verb-suffixed endpoints under /v1.
 			// Registered directly (not via Mount) because chi's Mount("/", ...)
