@@ -278,7 +278,15 @@ type RequestOpts = {
   auth?: boolean; // include bearer; default true
 };
 
-async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
+type ResponseWithHeaders<T> = {
+  data: T;
+  headers: Headers;
+};
+
+async function requestWithHeaders<T>(
+  path: string,
+  opts: RequestOpts = {},
+): Promise<ResponseWithHeaders<T>> {
   const { method = "GET", body, auth = true } = opts;
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -307,7 +315,9 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
     throw new ApiError(401, "unauthorized", "Session expired");
   }
 
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204) {
+    return { data: undefined as T, headers: res.headers };
+  }
 
   let json: unknown = null;
   const text = await res.text();
@@ -323,7 +333,38 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
     const j = (json ?? {}) as { code?: string; message?: string };
     throw new ApiError(res.status, j.code, j.message || res.statusText);
   }
-  return (json as T) ?? (undefined as T);
+  return { data: (json as T) ?? (undefined as T), headers: res.headers };
+}
+
+async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
+  const { data } = await requestWithHeaders<T>(path, opts);
+  return data;
+}
+
+function withQuery(path: string, params: Record<string, string | number | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== "") q.set(key, String(value));
+  }
+  const sep = path.includes("?") ? "&" : "?";
+  const qs = q.toString();
+  return qs ? `${path}${sep}${qs}` : path;
+}
+
+async function collectPaginated<R, T>(
+  path: string,
+  extract: (response: R) => T[],
+): Promise<T[]> {
+  const out: T[] = [];
+  let cursor: string | undefined;
+  do {
+    const { data, headers } = await requestWithHeaders<R>(
+      withQuery(path, { cursor, limit: 100 }),
+    );
+    out.push(...extract(data));
+    cursor = headers.get("X-Next-Cursor") ?? undefined;
+  } while (cursor);
+  return out;
 }
 
 type TokenResponse = {
@@ -387,8 +428,10 @@ export const api = {
   teams: {
     async list(): Promise<Team[]> {
       // Endpoint may return either an array or {teams: [...]}.
-      const r = await request<Team[] | { teams: Team[] }>("/v1/teams");
-      return Array.isArray(r) ? r : r.teams ?? [];
+      return collectPaginated<Team[] | { teams: Team[] }, Team>(
+        "/v1/teams",
+        (r) => (Array.isArray(r) ? r : r.teams ?? []),
+      );
     },
     create(name: string): Promise<Team> {
       return request<Team>("/v1/teams/create_team", {
@@ -400,21 +443,24 @@ export const api = {
       return request<Team>(`/v1/teams/${encodeURIComponent(ref)}`);
     },
     async listProjects(ref: string): Promise<Project[]> {
-      const r = await request<Project[] | { projects: Project[] }>(
-        `/v1/teams/${encodeURIComponent(ref)}/list_projects`
+      return collectPaginated<Project[] | { projects: Project[] }, Project>(
+        `/v1/teams/${encodeURIComponent(ref)}/list_projects`,
+        (r) => (Array.isArray(r) ? r : r.projects ?? []),
       );
-      return Array.isArray(r) ? r : r.projects ?? [];
     },
     async listDeployments(ref: string): Promise<Deployment[]> {
       // Team-scoped flat list across every project — used by the home view's
       // "Deployments" tab. Mirrors per-project list_deployments shape.
-      const r = await request<Deployment[] | { deployments: Deployment[] }>(
-        `/v1/teams/${encodeURIComponent(ref)}/list_deployments`
+      return collectPaginated<Deployment[] | { deployments: Deployment[] }, Deployment>(
+        `/v1/teams/${encodeURIComponent(ref)}/list_deployments`,
+        (r) => (Array.isArray(r) ? r : r.deployments ?? []),
       );
-      return Array.isArray(r) ? r : r.deployments ?? [];
     },
-    listMembers(ref: string): Promise<TeamMember[]> {
-      return request<TeamMember[]>(`/v1/teams/${encodeURIComponent(ref)}/list_members`);
+    async listMembers(ref: string): Promise<TeamMember[]> {
+      return collectPaginated<TeamMember[], TeamMember>(
+        `/v1/teams/${encodeURIComponent(ref)}/list_members`,
+        (r) => r,
+      );
     },
     createProject(
       ref: string,
@@ -535,10 +581,10 @@ export const api = {
       return request<Project>(`/v1/projects/${encodeURIComponent(id)}`);
     },
     async listDeployments(id: string): Promise<Deployment[]> {
-      const r = await request<Deployment[] | { deployments: Deployment[] }>(
-        `/v1/projects/${encodeURIComponent(id)}/list_deployments`
+      return collectPaginated<Deployment[] | { deployments: Deployment[] }, Deployment>(
+        `/v1/projects/${encodeURIComponent(id)}/list_deployments`,
+        (r) => (Array.isArray(r) ? r : r.deployments ?? []),
       );
-      return Array.isArray(r) ? r : r.deployments ?? [];
     },
     createDeployment(
       id: string,
