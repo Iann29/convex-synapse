@@ -47,8 +47,22 @@ phase_install_updater() {
     # there's no .git present).
     echo "$INSTALLER_VERSION" | $prefix tee "$INSTALL_DIR/VERSION" >/dev/null
 
+    # Render {{INSTALL_DIR}} into the unit before installing it. Operators
+    # using --install-dir=/opt/<custom> would otherwise end up with a
+    # daemon pointed at /opt/synapse, and setup.sh spawn would fail with
+    # ENOENT. The placeholder pattern matches installer/templates/ style.
+    local rendered_unit
+    rendered_unit="$(mktemp "${TMPDIR:-/tmp}/synapse-updater.service.XXXXXX")"
+    # sed delimiter is '|' so a path with '/' doesn't need escaping.
+    # INSTALL_DIR is operator-controlled so we still escape '|' and '&'
+    # defensively even though path chars in those values would be rare.
+    local install_dir_esc
+    install_dir_esc="$(printf '%s' "$INSTALL_DIR" | sed -e 's/[\&|]/\\&/g')"
+    sed -e "s|{{INSTALL_DIR}}|${install_dir_esc}|g" "$src_unit" >"$rendered_unit"
+
     $prefix install -m 0755 "$src_bin" /usr/local/bin/synapse-updater
-    $prefix install -m 0644 "$src_unit" /etc/systemd/system/synapse-updater.service
+    $prefix install -m 0644 "$rendered_unit" /etc/systemd/system/synapse-updater.service
+    rm -f "$rendered_unit"
     $prefix systemctl daemon-reload
     $prefix systemctl enable --now synapse-updater >/dev/null 2>&1 || true
     # If the service was already running with an older binary, restart
