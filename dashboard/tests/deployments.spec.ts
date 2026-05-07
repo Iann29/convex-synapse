@@ -1,9 +1,14 @@
 import { test, expect, type Page } from "@playwright/test";
+import { Client } from "pg";
 import { truncateAll } from "./helpers/db";
 import {
   listSynapseContainerNames,
   pruneSynapseContainers,
 } from "./helpers/docker";
+
+const DB_URL =
+  process.env.SYNAPSE_DB_URL ||
+  "postgres://synapse:synapse@localhost:5432/synapse";
 
 async function setupProject(page: Page) {
   await page.goto("/register");
@@ -28,6 +33,39 @@ async function setupProject(page: Page) {
   // Project URL uses the project UUID (the dashboard renders the slug
   // inside the card but routes by id for stability across renames).
   await expect(page).toHaveURL(/\/teams\/amage\/[0-9a-f-]{36}\b/);
+}
+
+async function seedDeploymentWithDeployKey(
+  projectId: string,
+  deploymentName: string,
+) {
+  const c = new Client({ connectionString: DB_URL });
+  await c.connect();
+  try {
+    await c.query(
+      `INSERT INTO deployments (project_id, name, deployment_type, status,
+                                admin_key, instance_secret, host_port,
+                                is_default, deployment_url, container_id)
+       VALUES ($1, $2, 'dev', 'running', 'fake-admin', 'fake-secret',
+               3499, true, 'http://127.0.0.1:3499', $3)`,
+      [projectId, deploymentName, `fake-container-${deploymentName}`],
+    );
+    await c.query(
+      `INSERT INTO deployment_replicas (deployment_id, replica_index, container_id, host_port, status)
+         SELECT id, 0, $2, 3499, 'running' FROM deployments WHERE name = $1`,
+      [deploymentName, `fake-container-${deploymentName}`],
+    );
+    await c.query(
+      `INSERT INTO deploy_keys (deployment_id, name, admin_key_prefix, admin_key_hash, created_by)
+         SELECT d.id, 'github-actions', 'abcd1234', 'hash-github-actions', u.id
+           FROM deployments d
+           JOIN users u ON u.email = 'ian@example.com'
+          WHERE d.name = $1`,
+      [deploymentName],
+    );
+  } finally {
+    await c.end();
+  }
 }
 
 test.beforeEach(async () => {
@@ -94,4 +132,32 @@ test("delete a deployment via the dashboard", async ({ page }) => {
       timeout: 15_000,
     })
     .toEqual([]);
+});
+
+test("deploy key revoke prompt explains credential rotation", async ({ page }) => {
+  await setupProject(page);
+
+  const projectId = page.url().match(/\/teams\/amage\/([0-9a-f-]{36})/)?.[1];
+  expect(projectId).toBeTruthy();
+  const deploymentName = "seeded-owl-1111";
+  await seedDeploymentWithDeployKey(projectId!, deploymentName);
+  await page.reload();
+  await expect(page.getByText(deploymentName)).toBeVisible();
+
+  await page
+    .getByRole("button", {
+      name: new RegExp(`manage deploy keys for ${deploymentName}`, "i"),
+    })
+    .click();
+
+  await expect(page.getByText("github-actions")).toBeVisible();
+
+  page.once("dialog", (d) => {
+    expect(d.message()).toContain("rotate this deployment's credentials");
+    void d.dismiss();
+  });
+  await page
+    .getByRole("button", { name: /revoke deploy key github-actions/i })
+    .click();
+  await expect(page.getByText("github-actions")).toBeVisible();
 });

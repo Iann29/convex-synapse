@@ -1811,13 +1811,11 @@ func shellQuote(s string) string {
 // Mirrors Convex Cloud's "Personal Deployment Settings → Deploy Keys"
 // UX. v1.0.3+.
 //
-// IMPORTANT — revoke is best-effort: the Convex backend authenticates
-// admin keys by signature against INSTANCE_SECRET (stateless), so we
-// cannot per-key revoke without rotating the deployment's instance
-// secret. revoked_at hides the row from the dashboard list; real
-// invalidation requires a deployment-wide rotation. The dashboard
-// surfaces that gotcha. A future "tier 2" with Synapse in the request
-// path would close the gap. See migration 000009 for the design note.
+// Revocation rotates the deployment's INSTANCE_SECRET and recreates the
+// managed container, because the Convex backend authenticates admin keys by
+// signature against that secret. That invalidates every admin key minted
+// before the rotation, so all active deploy_key rows for the deployment are
+// marked revoked together.
 
 type createDeployKeyReq struct {
 	Name string `json:"name"`
@@ -1858,6 +1856,61 @@ func deployKeyHash(adminKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (h *DeploymentsHandler) ensureDeployKeysSupported(w http.ResponseWriter, d *models.Deployment, action string) bool {
+	if d.Adopted {
+		writeError(w, http.StatusConflict, "deploy_keys_unsupported_for_adopted",
+			"Deploy keys require a Synapse-managed deployment; adopted deployments use operator-supplied credentials")
+		return false
+	}
+	if d.HAEnabled {
+		writeError(w, http.StatusConflict, "deploy_keys_unsupported_for_ha",
+			"Deploy keys are not supported for HA deployments until replica-wide credential rotation is available")
+		return false
+	}
+	if d.Status != models.DeploymentStatusRunning || d.HostPort == 0 {
+		writeError(w, http.StatusConflict, "deployment_not_running",
+			"Deploy keys can only "+action+" credentials for a running single-replica deployment")
+		return false
+	}
+	return true
+}
+
+func (h *DeploymentsHandler) runtimeEnvVarsForRecreate(ctx context.Context, d *models.Deployment) (map[string]string, error) {
+	envVars := map[string]string{}
+	if d.ProjectID != "" {
+		rows, err := h.DB.Query(ctx, `
+			SELECT name, value
+			  FROM project_env_vars
+			 WHERE project_id = $1
+			   AND $2 = ANY(deployment_types)
+			 ORDER BY name
+		`, d.ProjectID, d.DeploymentType)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name, value string
+			if err := rows.Scan(&name, &value); err != nil {
+				return nil, err
+			}
+			envVars[name] = value
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	origins, err := loadActiveDomainOrigins(ctx, h.DB, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(origins) > 0 {
+		envVars["CORS_ALLOWED_ORIGINS"] = strings.Join(origins, ",")
+	}
+	return envVars, nil
+}
+
 func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Request) {
 	d, _, t, role, ok := h.loadDeploymentForRequest(w, r)
 	if !ok {
@@ -1866,6 +1919,9 @@ func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Requ
 	if !canAdminProject(role) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"Only project admins can create deploy keys")
+		return
+	}
+	if !h.ensureDeployKeysSupported(w, d, "create") {
 		return
 	}
 	var req createDeployKeyReq
@@ -2015,22 +2071,49 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 			"Only project admins can revoke deploy keys")
 		return
 	}
+	if !h.ensureDeployKeysSupported(w, d, "revoke") {
+		return
+	}
 	keyID := chi.URLParam(r, "id")
 	if keyID == "" {
 		writeError(w, http.StatusBadRequest, "missing_id", "key id is required")
 		return
 	}
 
-	// UPDATE … RETURNING gives us the row to audit AND tells us 404 vs
-	// already-revoked vs success in one round trip. The deployment_id
-	// guard stops cross-deployment revoke attempts (defense-in-depth on
-	// top of the loadDeploymentForRequest scope check).
+	tx, err := h.DB.Begin(r.Context())
+	if err != nil {
+		logErr("begin deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to revoke deploy key")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	if err := tx.QueryRow(r.Context(), `
+		SELECT status, adopted, ha_enabled, COALESCE(host_port, 0)
+		  FROM deployments
+		 WHERE id = $1
+		 FOR UPDATE
+	`, d.ID).Scan(&d.Status, &d.Adopted, &d.HAEnabled, &d.HostPort); err != nil {
+		logErr("lock deployment for deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to revoke deploy key")
+		return
+	}
+	if !h.ensureDeployKeysSupported(w, d, "revoke") {
+		return
+	}
+
+	// SELECT … FOR UPDATE gives us the row to audit AND tells us 404 vs
+	// already-revoked vs success. The deployment_id guard stops
+	// cross-deployment revoke attempts (defense-in-depth on top of the
+	// loadDeploymentForRequest scope check).
 	var name, prefix string
-	err := h.DB.QueryRow(r.Context(), `
-		UPDATE deploy_keys
-		SET revoked_at = now()
-		WHERE id = $1 AND deployment_id = $2 AND revoked_at IS NULL
-		RETURNING name, admin_key_prefix
+	err = tx.QueryRow(r.Context(), `
+		SELECT name, admin_key_prefix
+		  FROM deploy_keys
+		 WHERE id = $1 AND deployment_id = $2 AND revoked_at IS NULL
+		 FOR UPDATE
 	`, keyID, d.ID).Scan(&name, &prefix)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2039,6 +2122,89 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		logErr("revoke deploy key", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to revoke deploy key")
+		return
+	}
+
+	envVars, err := h.runtimeEnvVarsForRecreate(r.Context(), d)
+	if err != nil {
+		logErr("load env vars for deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to prepare deployment rotation")
+		return
+	}
+	newSecret, err := dockerprov.RandomHex(32)
+	if err != nil {
+		logErr("generate rotated instance secret", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to rotate deployment credentials")
+		return
+	}
+	newAdminKey, err := h.Docker.GenerateAdminKey(r.Context(), d.Name, newSecret)
+	if err != nil {
+		logErr("generate rotated admin key", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to rotate deployment credentials")
+		return
+	}
+
+	spec := dockerprov.DeploymentSpec{
+		Name:                  d.Name,
+		InstanceSecret:        newSecret,
+		HostPort:              d.HostPort,
+		EnvVars:               envVars,
+		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
+	}
+	info, err := h.Docker.Recreate(r.Context(), spec)
+	if err != nil {
+		logErr("recreate deployment for deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to rotate deployment credentials")
+		return
+	}
+
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE deployments
+		   SET instance_secret = $1,
+		       admin_key = $2,
+		       container_id = $3,
+		       host_port = $4,
+		       deployment_url = $5,
+		       status = 'running'
+		 WHERE id = $6
+	`, newSecret, newAdminKey, info.ContainerID, info.HostPort, info.DeploymentURL, d.ID); err != nil {
+		logErr("update deployment after deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to rotate deployment credentials")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE deployment_replicas
+		   SET container_id = $1,
+		       host_port = $2,
+		       status = 'running'
+		 WHERE deployment_id = $3 AND replica_index = 0
+	`, info.ContainerID, info.HostPort, d.ID); err != nil {
+		logErr("update replica after deploy-key rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to rotate deployment credentials")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `
+		UPDATE deploy_keys
+		   SET revoked_at = now()
+		 WHERE deployment_id = $1 AND revoked_at IS NULL
+	`, d.ID)
+	if err != nil {
+		logErr("mark deploy keys revoked after rotation", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to revoke deploy key")
+		return
+	}
+	revokedCount := tag.RowsAffected()
+	if err := tx.Commit(r.Context()); err != nil {
+		logErr("commit deploy-key rotation", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"Failed to revoke deploy key")
 		return
@@ -2060,6 +2226,8 @@ func (h *DeploymentsHandler) revokeDeployKey(w http.ResponseWriter, r *http.Requ
 			"deploymentName": d.Name,
 			"name":           name,
 			"prefix":         prefix,
+			"rotated":        true,
+			"revokedCount":   revokedCount,
 		},
 	})
 	w.WriteHeader(http.StatusNoContent)

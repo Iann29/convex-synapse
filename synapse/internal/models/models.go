@@ -187,12 +187,10 @@ type ProjectMember struct {
 // gets a clean audit trail per credential. Mirrors Convex Cloud's
 // "Personal Deployment Settings → Deploy Keys" UX.
 //
-// IMPORTANT: revoke is best-effort — the Convex backend authenticates
-// admin keys by signature against INSTANCE_SECRET (stateless), so we
-// cannot per-key revoke without rotating the deployment's instance
-// secret. revoked_at hides the row from the dashboard list; real
-// invalidation requires a deployment-wide rotation. The dashboard
-// surfaces that gotcha. See migration 000009 for the full design note.
+// Revocation rotates the deployment's INSTANCE_SECRET because the Convex
+// backend authenticates admin keys by signature against that stateless
+// secret. That invalidates every deploy key minted before the rotation, so
+// revoked_at is set on all active rows for the deployment at once.
 //
 // AdminKey is non-empty *only* on the create-response struct (the operator
 // gets the value back exactly once, GitHub-PAT-style); subsequent reads

@@ -124,25 +124,96 @@ func TestDeployKeys_List_OnlyActive(t *testing.T) {
 	h.DoJSON(http.MethodPost, "/v1/deployments/dk-otter-2222/deploy_keys",
 		owner.AccessToken, map[string]any{"name": "ci-staging"}, http.StatusCreated, &k2)
 
-	// Revoke k1 — list should drop it.
+	// Revoke k1 — Synapse rotates deployment credentials, so every
+	// previously minted deploy key is invalidated and drops from the list.
 	h.AssertStatus(http.MethodPost, "/v1/deployments/dk-otter-2222/deploy_keys/"+k1.ID+"/revoke",
 		owner.AccessToken, nil, http.StatusNoContent)
 
 	var listed listDeployKeysResp
 	h.DoJSON(http.MethodGet, "/v1/deployments/dk-otter-2222/deploy_keys",
 		owner.AccessToken, nil, http.StatusOK, &listed)
-	if len(listed.DeployKeys) != 1 {
-		t.Fatalf("expected 1 active deploy key after revoke, got %d", len(listed.DeployKeys))
+	if len(listed.DeployKeys) != 0 {
+		t.Fatalf("expected 0 active deploy keys after credential rotation, got %d", len(listed.DeployKeys))
 	}
-	if listed.DeployKeys[0].ID != k2.ID {
-		t.Errorf("listed key id: got %q want %q", listed.DeployKeys[0].ID, k2.ID)
+	_ = k2
+}
+
+func TestDeployKeys_Revoke_RotatesDeploymentCredentials(t *testing.T) {
+	h := Setup(t)
+	uniqueAdminKeyDocker("dk-rotate-1111")(h.Docker)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "DK Rotate Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	deploymentID := h.SeedDeployment(proj.ID, "dk-rotate-1111", "prod", "running", true, owner.ID, 3412, "")
+
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO project_env_vars (project_id, name, value, deployment_types)
+		VALUES ($1, 'SERVICE_TOKEN', 'keep-me', ARRAY['prod'])
+	`, proj.ID); err != nil {
+		t.Fatalf("insert project env var: %v", err)
 	}
-	// List omits the actual admin key — that value is shown ONCE at
-	// creation. Drift here would silently leak credentials on every
-	// dashboard render.
-	if listed.DeployKeys[0].Name == "" || listed.DeployKeys[0].Prefix == "" {
-		t.Errorf("expected non-empty name+prefix, got %+v", listed.DeployKeys[0])
+	if _, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO deployment_domains (deployment_id, domain, role, status)
+		VALUES ($1, 'api.rotate.example.com', 'api', 'active')
+	`, deploymentID); err != nil {
+		t.Fatalf("insert active domain: %v", err)
 	}
+
+	var k1, k2 deployKeyResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/dk-rotate-1111/deploy_keys",
+		owner.AccessToken, map[string]any{"name": "vercel"}, http.StatusCreated, &k1)
+	h.DoJSON(http.MethodPost, "/v1/deployments/dk-rotate-1111/deploy_keys",
+		owner.AccessToken, map[string]any{"name": "github"}, http.StatusCreated, &k2)
+
+	var oldSecret, oldAdminKey string
+	if err := h.DB.QueryRow(h.rootCtx, `
+		SELECT instance_secret, admin_key FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&oldSecret, &oldAdminKey); err != nil {
+		t.Fatalf("read old deployment credentials: %v", err)
+	}
+
+	h.AssertStatus(http.MethodPost, "/v1/deployments/dk-rotate-1111/deploy_keys/"+k1.ID+"/revoke",
+		owner.AccessToken, nil, http.StatusNoContent)
+
+	var newSecret, newAdminKey string
+	if err := h.DB.QueryRow(h.rootCtx, `
+		SELECT instance_secret, admin_key FROM deployments WHERE id = $1
+	`, deploymentID).Scan(&newSecret, &newAdminKey); err != nil {
+		t.Fatalf("read new deployment credentials: %v", err)
+	}
+	if newSecret == "" || newSecret == oldSecret {
+		t.Fatalf("instance secret was not rotated: old=%q new=%q", oldSecret, newSecret)
+	}
+	if newAdminKey == "" || newAdminKey == oldAdminKey {
+		t.Fatalf("admin key was not rotated: old=%q new=%q", oldAdminKey, newAdminKey)
+	}
+
+	specs := h.Docker.RecreatedSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("expected one container recreate, got %d", len(specs))
+	}
+	spec := specs[0]
+	if spec.InstanceSecret != newSecret {
+		t.Fatalf("recreate used secret %q, want rotated secret %q", spec.InstanceSecret, newSecret)
+	}
+	if spec.EnvVars["SERVICE_TOKEN"] != "keep-me" {
+		t.Fatalf("recreate dropped project env vars: %+v", spec.EnvVars)
+	}
+	if spec.EnvVars["CORS_ALLOWED_ORIGINS"] != "https://api.rotate.example.com" {
+		t.Fatalf("recreate CORS=%q", spec.EnvVars["CORS_ALLOWED_ORIGINS"])
+	}
+
+	var active int
+	if err := h.DB.QueryRow(h.rootCtx, `
+		SELECT count(*) FROM deploy_keys
+		 WHERE deployment_id = $1 AND revoked_at IS NULL
+	`, deploymentID).Scan(&active); err != nil {
+		t.Fatalf("count active deploy keys: %v", err)
+	}
+	if active != 0 {
+		t.Fatalf("expected all deploy keys to be revoked after rotation, got %d active", active)
+	}
+	_ = k2
 }
 
 func TestDeployKeys_Create_DuplicateName_Conflict(t *testing.T) {
@@ -198,6 +269,33 @@ func TestDeployKeys_Create_ValidationErrors(t *testing.T) {
 		owner.AccessToken, map[string]any{"name": long}, http.StatusBadRequest)
 	if env.Code != "name_too_long" {
 		t.Errorf("long name: got code %q want name_too_long", env.Code)
+	}
+}
+
+func TestDeployKeys_Create_UnsupportedDeploymentKinds(t *testing.T) {
+	h := Setup(t)
+	uniqueAdminKeyDocker("dk-unsupported")(h.Docker)
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "DK Unsupported Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	adoptedID := h.SeedDeployment(proj.ID, "dk-adopted-1111", "prod", "running", true, owner.ID, 3413, "")
+	haID := h.SeedDeployment(proj.ID, "dk-ha-1111", "prod", "running", true, owner.ID, 3414, "")
+	if _, err := h.DB.Exec(h.rootCtx, `UPDATE deployments SET adopted = true WHERE id = $1`, adoptedID); err != nil {
+		t.Fatalf("mark adopted: %v", err)
+	}
+	if _, err := h.DB.Exec(h.rootCtx, `UPDATE deployments SET ha_enabled = true, replica_count = 2 WHERE id = $1`, haID); err != nil {
+		t.Fatalf("mark ha: %v", err)
+	}
+
+	env := h.AssertStatus(http.MethodPost, "/v1/deployments/dk-adopted-1111/deploy_keys",
+		owner.AccessToken, map[string]any{"name": "ci"}, http.StatusConflict)
+	if env.Code != "deploy_keys_unsupported_for_adopted" {
+		t.Fatalf("adopted code=%q", env.Code)
+	}
+	env = h.AssertStatus(http.MethodPost, "/v1/deployments/dk-ha-1111/deploy_keys",
+		owner.AccessToken, map[string]any{"name": "ci"}, http.StatusConflict)
+	if env.Code != "deploy_keys_unsupported_for_ha" {
+		t.Fatalf("ha code=%q", env.Code)
 	}
 }
 
