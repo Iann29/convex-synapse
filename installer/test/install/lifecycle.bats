@@ -1457,3 +1457,104 @@ EOF
     assert_success
     refute_output --partial "Custom domains"
 }
+
+@test "upgrade: stamps SYNAPSE_VERSION BEFORE invoking compose build" {
+    # Regression for v1.4.0 → v1.4.1: the stamp used to land *after* the
+    # build, so the synapse Go binary baked in the OLD VERSION via
+    # ldflags, BuildKit cache hit on unchanged Go source, image SHA
+    # didn't move, and compose left the API container running the
+    # previous binary. Dashboard upgraded fine because its source did
+    # change. This test pins the new ordering — when compose is
+    # invoked, .env's SYNAPSE_VERSION must already match the target.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.4.0
+SYNAPSE_PORT=8080
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    # Mock docker so when compose is invoked, it captures the .env's
+    # SYNAPSE_VERSION value at that moment to a side-effect file. The
+    # ENV_FILE path is exported into the mock's environment so it can
+    # read it without guessing.
+    cat >"$SYN_MOCK_BIN/docker" <<EOF2
+#!/usr/bin/env bash
+if [[ " \$* " == *" compose "* && " \$* " == *" up "* ]]; then
+    grep -E "^SYNAPSE_VERSION=" "$ENV_FILE" >"$BATS_TEST_TMPDIR/observed-version-at-build" 2>/dev/null || true
+fi
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.4.1
+    assert_success
+    [ -f "$BATS_TEST_TMPDIR/observed-version-at-build" ]
+    run cat "$BATS_TEST_TMPDIR/observed-version-at-build"
+    assert_output "SYNAPSE_VERSION=1.4.1"
+}
+
+@test "upgrade: rolls back the version stamp when build fails" {
+    # If the build fails we re-tag the previous images via _rollback;
+    # the version stamp must follow so .env doesn't claim the new
+    # version while the running binary is the old one.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.4.0
+SYNAPSE_PORT=8080
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    # Docker mock that fails on `compose ... up` so lifecycle hits the
+    # build-failure rollback branch.
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+if [[ " $* " == *" compose "* && " $* " == *" up "* ]]; then
+    exit 1
+fi
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.4.1
+    [ "$status" -eq 2 ]
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "1.4.0"
+}

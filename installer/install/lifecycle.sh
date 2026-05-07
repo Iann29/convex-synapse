@@ -317,34 +317,18 @@ lifecycle::_upgrade_inner() {
     "$docker_cmd" pull "$backend_image" >/dev/null 2>&1 || true
     "$docker_cmd" pull "$dashboard_image" >/dev/null 2>&1 || true
 
-    # --- 8. compose up -d --build ----------------------------------
-    local profile_args=()
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            profile_args+=("$line")
-        fi
-    done < <(lifecycle::detect_profiles "$env_file")
-
-    if ! compose::up "$install_dir" "${profile_args[@]}" --build; then
-        ui::fail "docker compose up --build failed"
-        lifecycle::log "$log_file" "upgrade failed: build"
-        lifecycle::_rollback "$install_dir" "$snap_file" "$log_file"
-        return 2
-    fi
-
-    # --- 9. wait for /health ---------------------------------------
-    local synapse_port
-    synapse_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
-    synapse_port="${synapse_port:-8080}"
-    local health_url="http://localhost:$synapse_port/health"
-    if ! compose::wait_healthy "$health_url" "$LIFECYCLE_HEALTH_TIMEOUT"; then
-        ui::fail "Synapse didn't become healthy in ${LIFECYCLE_HEALTH_TIMEOUT}s after upgrade"
-        lifecycle::log "$log_file" "upgrade failed: health"
-        lifecycle::_rollback "$install_dir" "$snap_file" "$log_file"
-        return 2
-    fi
-
-    # --- 11. stamp new version ------------------------------------
+    # --- 8. stamp new version BEFORE build ------------------------
+    # The synapse Go binary bakes its version in via build-arg + ldflags
+    # (-X main.Version=$VERSION). docker-compose.yml sources the build
+    # arg from $SYNAPSE_VERSION in .env. If we stamp the new version
+    # *after* the build (the v1.1–v1.4 ordering), the build runs with
+    # the OLD value, BuildKit cache hits on the unchanged Go source +
+    # unchanged VERSION arg, the image SHA stays the same, and compose
+    # decides not to recreate the synapse-api container — leaving the
+    # API running yesterday's binary while the dashboard (whose source
+    # *did* change) gets correctly upgraded. v1.4.0 → v1.4.1 hit
+    # exactly this trap on synapse-vps. So: stamp first, build second.
+    #
     # `set_env_var` force-overwrites; `ensure_env_var` would no-op
     # because SYNAPSE_VERSION already has a value (it's the WHOLE
     # POINT of the stamp).
@@ -363,7 +347,41 @@ lifecycle::_upgrade_inner() {
         new_stamp="$stamp_target"
     fi
     new_stamp="${new_stamp//\//-}"
+    local old_version_stamp
+    old_version_stamp="$(secrets::env_get "$env_file" SYNAPSE_VERSION)"
     secrets::set_env_var "$env_file" SYNAPSE_VERSION "$new_stamp"
+
+    # --- 9. compose up -d --build ----------------------------------
+    local profile_args=()
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            profile_args+=("$line")
+        fi
+    done < <(lifecycle::detect_profiles "$env_file")
+
+    if ! compose::up "$install_dir" "${profile_args[@]}" --build; then
+        ui::fail "docker compose up --build failed"
+        # Restore the version stamp so .env doesn't lie about the
+        # running binary. _rollback re-tags the previous images;
+        # combined with the stamp restore, the install reverts cleanly.
+        secrets::set_env_var "$env_file" SYNAPSE_VERSION "$old_version_stamp"
+        lifecycle::log "$log_file" "upgrade failed: build (stamp reverted to ${old_version_stamp:-unknown})"
+        lifecycle::_rollback "$install_dir" "$snap_file" "$log_file"
+        return 2
+    fi
+
+    # --- 10. wait for /health --------------------------------------
+    local synapse_port
+    synapse_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
+    synapse_port="${synapse_port:-8080}"
+    local health_url="http://localhost:$synapse_port/health"
+    if ! compose::wait_healthy "$health_url" "$LIFECYCLE_HEALTH_TIMEOUT"; then
+        ui::fail "Synapse didn't become healthy in ${LIFECYCLE_HEALTH_TIMEOUT}s after upgrade"
+        secrets::set_env_var "$env_file" SYNAPSE_VERSION "$old_version_stamp"
+        lifecycle::log "$log_file" "upgrade failed: health (stamp reverted to ${old_version_stamp:-unknown})"
+        lifecycle::_rollback "$install_dir" "$snap_file" "$log_file"
+        return 2
+    fi
 
     ui::success "Upgrade complete: ${current:-unknown} → $new_stamp"
     lifecycle::log "$log_file" "upgrade success: ${current:-unknown} → $new_stamp"
