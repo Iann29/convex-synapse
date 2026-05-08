@@ -49,6 +49,23 @@ EnvironmentFile=-/opt/synapse/.env
 # disk always has a real absolute path; the placeholder only lives in the
 # repo source.
 Environment=SYNAPSE_INSTALL_DIR={{INSTALL_DIR}}
+# BIND_ADDR=0.0.0.0 (not 127.0.0.1) is REQUIRED for the synapse-api
+# container to reach the daemon. Inside the container,
+# `host.docker.internal` resolves to the host's docker-bridge IP
+# (typically 172.17.0.1), NOT to loopback. A daemon bound to 127.0.0.1
+# rejects bridge-IP connections, so /v1/admin/version_check + the
+# upgrade button silently 502 from the dashboard.
+#
+# Security model:
+#   1. Bearer token gate (every endpoint requires Authorization: Bearer
+#      <SYNAPSE_UPDATER_TOKEN>). The token lives in /opt/synapse/.env
+#      (0600, root-only) and is generated once at install time.
+#   2. Operator firewall: port 8089 MUST be closed to the public
+#      internet at the cloud-provider security-group level OR via
+#      iptables/ufw. The token is defense-in-depth, not the only line.
+#      Hetzner / DigitalOcean / AWS default firewalls already do this;
+#      bare-metal installs without ufw need explicit `ufw deny 8089`.
+Environment=SYNAPSE_UPDATER_BIND=0.0.0.0
 
 [Install]
 WantedBy=multi-user.target

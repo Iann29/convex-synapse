@@ -1558,3 +1558,150 @@ EOF2
     run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
     assert_output "1.4.0"
 }
+
+# ====================================================================
+# v1.5.1 daemon-protocol migration regressions
+# ====================================================================
+#
+# Real-VPS smoke caught a v1.5.0 → v1.5.1 upgrade-path bug: existing
+# .env files predate the SYNAPSE_UPDATER_* keys, but lifecycle::upgrade
+# went straight to phase_install_updater without calling
+# secrets::ensure_env. Result: empty token in compose substitution,
+# daemon refuses to start, every "Check for updates" 401's.
+#
+# These tests pin the new ordering — ensure_env is invoked BEFORE
+# phase_install_updater, so the daemon and synapse-api both get a
+# populated bearer token + URL on every upgrade.
+
+@test "upgrade: ensures SYNAPSE_UPDATER_* keys in .env (v1.5.0 → v1.5.1 migration)" {
+    : >"$COMPOSE_FILE"
+    # v1.5.0-shaped .env: SYNAPSE_VERSION + ports + a JWT, but NONE of
+    # the SYNAPSE_UPDATER_* keys (the smoke that caught this bug had
+    # this exact shape).
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.0
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=existing-jwt-must-be-preserved
+POSTGRES_PASSWORD=existing-pg-must-be-preserved
+EOF2
+    # Deterministic openssl stub so secrets::ensure_env's generators
+    # produce predictable values inside ensure_env. The lifecycle's
+    # other openssl invocations are unrelated.
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF2'
+#!/usr/bin/env bash
+case "$1 $2 $3" in
+    "rand -hex 64") echo "stub-jwt-not-used-existing-already-set" ;;
+    "rand -hex 32") echo "stub-updater-token-32hex" ;;
+    "rand -hex 16") echo "stub-pg-not-used-existing-already-set" ;;
+    *)              echo "UNEXPECTED $*" ;;
+esac
+EOF2
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    SECRETS_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.5.1
+    assert_success
+
+    # All three SYNAPSE_UPDATER_* keys MUST now be present.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_TOKEN
+    [ -n "$output" ]
+    assert_output "stub-updater-token-32hex"
+
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_PORT
+    assert_output "8089"
+
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://host.docker.internal:8089"
+
+    # Pre-existing secrets MUST be preserved across the upgrade. If a
+    # regression rotates JWT or PG, every running session loses its
+    # credential — the bug we're guarding against.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
+    assert_output "existing-jwt-must-be-preserved"
+    run secrets::env_get "$ENV_FILE" POSTGRES_PASSWORD
+    assert_output "existing-pg-must-be-preserved"
+}
+
+@test "upgrade: re-running on a v1.5.1+ install preserves SYNAPSE_UPDATER_TOKEN (no rotation)" {
+    # Belt-and-suspenders for the idempotency contract: an operator
+    # re-running --upgrade against an already-upgraded install must
+    # NOT rotate the bearer token. Every running synapse-api would
+    # lose its credential mid-flight.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.1
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep-jwt
+POSTGRES_PASSWORD=keep-pg
+SYNAPSE_UPDATER_TOKEN=keep-token-do-not-rotate
+SYNAPSE_UPDATER_PORT=8089
+SYNAPSE_UPDATER_URL=http://host.docker.internal:8089
+EOF2
+    cat >"$SYN_MOCK_BIN/openssl" <<'EOF2'
+#!/usr/bin/env bash
+echo "should-never-be-used"
+EOF2
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    SECRETS_OPENSSL="$SYN_MOCK_BIN/openssl" \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.5.2 --force
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_TOKEN
+    assert_output "keep-token-do-not-rotate"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_PORT
+    assert_output "8089"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://host.docker.internal:8089"
+}

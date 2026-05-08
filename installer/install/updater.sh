@@ -86,13 +86,30 @@ phase_install_updater() {
     port="${port:-8089}"
     token="$(secrets::env_get "$INSTALL_DIR/.env" SYNAPSE_UPDATER_TOKEN)"
     local tries=10
+    local probed=0
     while (( tries-- > 0 )); do
         if curl -sSf -H "Authorization: Bearer ${token}" \
             "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
             ui::success "Self-update daemon is up (http://127.0.0.1:${port})"
-            return 0
+            probed=1
+            break
         fi
         sleep 0.3
     done
+
+    # v1.5.1: legacy unix socket from v1.4.x / v1.5.0 daemons. Best-
+    # effort cleanup so `ls /run/synapse/` doesn't show a stale socket
+    # pointing nowhere after the TCP daemon takes over. Failure is
+    # fine — the directory may not exist on a fresh install, the
+    # socket may already be gone from a previous upgrade, or the
+    # rmdir may fail because something else dropped a sibling file
+    # (like the lock file the v1.5.0 socket variant used). Never
+    # blocks the upgrade.
+    rm -f /run/synapse/updater.sock 2>/dev/null || true
+    rmdir /run/synapse 2>/dev/null || true
+
+    if (( probed )); then
+        return 0
+    fi
     ui::warn "Self-update daemon installed but health probe failed — check 'systemctl status synapse-updater'"
 }
