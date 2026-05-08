@@ -229,7 +229,22 @@ mock_default_externals() {
     run grep -F "ExecStart=/usr/local/bin/synapse-updater" \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
-    run grep -F "RuntimeDirectory=synapse" \
+    # v1.5.1+: bearer token + TCP localhost. EnvironmentFile pulls
+    # SYNAPSE_UPDATER_TOKEN out of /opt/synapse/.env (mode 0600) so the
+    # secret never lives inline in the 0644 systemd unit. The leading `-`
+    # makes the file optional so first-boot lifecycle stays graceful.
+    run grep -F "EnvironmentFile=-/opt/synapse/.env" \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
+}
+
+# Regression on v1.5.1 protocol switch: the old unix-socket lines must
+# stay gone. If anyone reintroduces them this test fires immediately.
+@test "synapse-updater.service: does not reintroduce the unix-socket lines" {
+    run grep -F "RuntimeDirectory=synapse" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_failure
+    run grep -F "SYNAPSE_UPDATER_SOCKET" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_failure
 }
