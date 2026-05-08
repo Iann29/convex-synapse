@@ -222,11 +222,12 @@ func run() error {
 			BackendS3SecretKey:  cfg.BackendS3SecretKey,
 			BackendBucketPrefix: cfg.BackendS3BucketPrefix,
 		},
-		Crypto:        secretBox,
-		UpdaterSocket: cfg.UpdaterSocket,
-		GitHubRepo:    cfg.GitHubRepo,
-		PublicIP:      cfg.PublicIP,
-		DomainCache:   proxyResolver,
+		Crypto:       secretBox,
+		UpdaterURL:   cfg.UpdaterURL,
+		UpdaterToken: cfg.UpdaterToken,
+		GitHubRepo:   cfg.GitHubRepo,
+		PublicIP:     cfg.PublicIP,
+		DomainCache:  proxyResolver,
 		// DNS-provider credentials reuse the same SecretBox as the HA
 		// deployment_storage flow — both encrypt operator-supplied
 		// secrets-at-rest. nil when SYNAPSE_STORAGE_KEY is unset, in

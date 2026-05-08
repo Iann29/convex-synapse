@@ -7,10 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -31,11 +28,19 @@ type AdminHandler struct {
 	DB      *pgxpool.Pool
 	Version string
 
-	// UpdaterSocket is the unix socket path the synapse-updater systemd
-	// daemon listens on. The synapse-api container bind-mounts /run/synapse
-	// from the host so this path resolves identically inside and outside.
-	// Empty (or unreachable) → upgrade endpoints return 503.
-	UpdaterSocket string
+	// UpdaterURL is the HTTP origin of the synapse-updater daemon. v1.5.1
+	// migrated the daemon from a unix socket to a localhost-bound TCP
+	// listener (see release notes); the api container reaches it via
+	// host.docker.internal so the daemon survives the rebuild it
+	// triggers without a bind-mounted socket. Empty → upgrade endpoints
+	// return 503.
+	UpdaterURL string
+
+	// UpdaterToken is the bearer secret expected by the daemon on every
+	// request. Generated once at install time, persisted in the
+	// daemon's env-file + the api's compose env. Empty alongside a
+	// non-empty UpdaterURL → 503 token_missing.
+	UpdaterToken string
 
 	// GitHubRepo is the repo owner/name pair (e.g. "Iann29/convex-synapse")
 	// queried by /version_check. Pinned per-build so a forked deployment
@@ -290,14 +295,9 @@ type upgradeResp struct {
 }
 
 func (h *AdminHandler) upgrade(w http.ResponseWriter, r *http.Request) {
-	if h.UpdaterSocket == "" {
-		writeError(w, http.StatusServiceUnavailable, "updater_unavailable",
-			"Self-update daemon is not configured on this host. Run setup.sh --upgrade via SSH.")
-		return
-	}
-	if _, err := os.Stat(h.UpdaterSocket); err != nil {
+	if err := h.updaterReachable(r.Context()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "updater_unreachable",
-			"Self-update daemon socket missing — daemon installed but not running, or this host doesn't have systemd. Run setup.sh --upgrade via SSH.")
+			"Self-update daemon unreachable: "+err.Error())
 		return
 	}
 
@@ -383,17 +383,10 @@ func updaterErrorMessage(code string) string {
 // upgradeStatus is a read-through to the updater's /status. We don't cache
 // — operators expect log-tail freshness when watching an upgrade run.
 func (h *AdminHandler) upgradeStatus(w http.ResponseWriter, r *http.Request) {
-	if h.UpdaterSocket == "" {
+	if err := h.updaterReachable(r.Context()); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"state": "unavailable",
-			"error": "updater_not_configured",
-		})
-		return
-	}
-	if _, err := os.Stat(h.UpdaterSocket); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"state": "unavailable",
-			"error": "updater_unreachable",
+			"error": err.Error(),
 		})
 		return
 	}
@@ -410,37 +403,28 @@ func (h *AdminHandler) upgradeStatus(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
-// callUpdater talks to the local unix socket. The HTTP client uses a
-// custom Transport that always dials the socket regardless of host.
+// callUpdater talks to the synapse-updater daemon over plain HTTP using
+// the v1.5.1+ TCP+bearer protocol. UpdaterURL is the daemon's origin
+// (e.g. http://host.docker.internal:9876); UpdaterToken is the shared
+// secret the daemon checks against the Authorization: Bearer header.
 func (h *AdminHandler) callUpdater(ctx context.Context, method, path string, body []byte) (int, []byte, error) {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			d := net.Dialer{}
-			return d.DialContext(ctx, "unix", h.UpdaterSocket)
-		},
-	}
-	client := &http.Client{Transport: transport, Timeout: updaterTimeout}
-
-	// The host segment is irrelevant — DialContext rewrites every call to
-	// the unix socket. We use "synapse-updater" so logs/traces show
-	// something legible.
-	u := &url.URL{Scheme: "http", Host: "synapse-updater", Path: path}
-
+	client := &http.Client{Timeout: updaterTimeout}
+	u := strings.TrimRight(h.UpdaterURL, "/") + path
 	var reader io.Reader
 	if len(body) > 0 {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), reader)
+	req, err := http.NewRequestWithContext(ctx, method, u, reader)
 	if err != nil {
 		return 0, nil, err
 	}
 	if reader != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-
+	req.Header.Set("Authorization", "Bearer "+h.UpdaterToken)
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, fmt.Errorf("updater unreachable at %s: %w", h.UpdaterURL, err)
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
@@ -448,4 +432,28 @@ func (h *AdminHandler) callUpdater(ctx context.Context, method, path string, bod
 		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, payload, nil
+}
+
+// updaterReachable probes /healthz with a short timeout, returning a
+// clear error when the daemon is unconfigured (no URL), missing a
+// token, or simply not listening. Used by every mutating updater
+// endpoint as a pre-flight so callers see 503 instead of an opaque
+// 502/timeout.
+func (h *AdminHandler) updaterReachable(ctx context.Context) error {
+	if h.UpdaterURL == "" {
+		return errors.New("not_configured")
+	}
+	if h.UpdaterToken == "" {
+		return errors.New("token_missing")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	status, _, err := h.callUpdater(cctx, http.MethodGet, "/healthz", nil)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("healthz returned %d", status)
+	}
+	return nil
 }

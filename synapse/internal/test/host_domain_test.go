@@ -113,11 +113,11 @@ func TestHostDomain_Get_FallbackURLsWhenPublicIP(t *testing.T) {
 }
 
 func TestHostDomain_Post_EmptyBody_400(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should never be hit on a malformed body")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/host_domain",
@@ -128,11 +128,11 @@ func TestHostDomain_Post_EmptyBody_400(t *testing.T) {
 }
 
 func TestHostDomain_Post_BothDomainAndPlainHttp_400(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should never be hit on contradictory flags")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/host_domain",
@@ -145,11 +145,11 @@ func TestHostDomain_Post_BothDomainAndPlainHttp_400(t *testing.T) {
 }
 
 func TestHostDomain_Post_InvalidDomain_400(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should never be hit on a malformed domain")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/host_domain",
@@ -162,11 +162,11 @@ func TestHostDomain_Post_InvalidDomain_400(t *testing.T) {
 }
 
 func TestHostDomain_Post_InvalidAcmeEmail_400(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should never be hit on a malformed email")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/host_domain",
@@ -184,7 +184,7 @@ func TestHostDomain_Post_InvalidAcmeEmail_400(t *testing.T) {
 func TestHostDomain_Post_ValidDomain_NoPublicIP_202(t *testing.T) {
 	var hits int64
 	var seenBody []byte
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&hits, 1)
 		if r.Method != http.MethodPost || r.URL.Path != "/reconfigure_host_domain" {
 			http.Error(w, "wrong route", http.StatusNotFound)
@@ -196,7 +196,7 @@ func TestHostDomain_Post_ValidDomain_NoPublicIP_202(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"started":true,"jobId":"placeholder"}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	var got hostDomainPostResp
@@ -269,13 +269,14 @@ func TestHostDomain_Post_ValidDomain_NoPublicIP_202(t *testing.T) {
 }
 
 func TestHostDomain_Post_DNSPreflight_Mismatch_400(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should never be hit when DNS preflight fails")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	h := SetupWithOpts(t, SetupOpts{
-		UpdaterSocket: sock,
-		PublicIP:      "203.0.113.10",
+		UpdaterURL:   url,
+		UpdaterToken: tok,
+		PublicIP:     "203.0.113.10",
 		HostDomainResolver: stubResolverFunc(func(host string) ([]string, error) {
 			return []string{"198.51.100.99"}, nil
 		}),
@@ -306,13 +307,14 @@ func TestHostDomain_Post_DNSPreflight_Mismatch_400(t *testing.T) {
 }
 
 func TestHostDomain_Post_DNSPreflight_Match_202(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"started":true}`))
 	})
 	h := SetupWithOpts(t, SetupOpts{
-		UpdaterSocket: sock,
-		PublicIP:      "203.0.113.10",
+		UpdaterURL:   url,
+		UpdaterToken: tok,
+		PublicIP:     "203.0.113.10",
 		HostDomainResolver: stubResolverFunc(func(host string) ([]string, error) {
 			return []string{"203.0.113.10"}, nil
 		}),
@@ -330,11 +332,11 @@ func TestHostDomain_Post_DNSPreflight_Match_202(t *testing.T) {
 }
 
 func TestHostDomain_Status_ExistingJob(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"started":true}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	// Seed a row and pretend the daemon advanced it to running.
@@ -389,11 +391,11 @@ func TestHostDomain_Status_InvalidUUID_404(t *testing.T) {
 }
 
 func TestHostDomain_Post_NotAdmin_403(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("daemon should NEVER be hit when caller is not admin")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	_ = makeAdminUser(t, h)
 	stranger := makeNonAdminUser(t, h)
 
@@ -424,12 +426,12 @@ func TestHostDomain_Post_NoUpdater_503(t *testing.T) {
 }
 
 func TestHostDomain_Post_DaemonReturns409_PassThrough(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"error":"reconfigure_in_progress"}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/host_domain",

@@ -3,11 +3,8 @@ package synapsetest
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 )
@@ -55,24 +52,34 @@ func stubGitHub(t *testing.T, tag string, fail bool) (*httptest.Server, *int64) 
 	return srv, &hits
 }
 
-// stubUpdater spins up a unix-socket HTTP server pretending to be the
-// synapse-updater daemon. fn lets each test inject the response shape
-// it cares about. Returns the socket path.
-func stubUpdater(t *testing.T, fn http.HandlerFunc) string {
+// stubUpdater spins up an httptest.Server pretending to be the
+// synapse-updater daemon (v1.5.1+ TCP+bearer protocol). It generates
+// a random bearer token, asserts every incoming request carries it,
+// and answers the /healthz pre-flight that AdminHandler.updaterReachable
+// performs before the real call. fn handles the route the test cares
+// about. Returns (url, token) the test passes through SetupOpts.
+func stubUpdater(t *testing.T, fn http.HandlerFunc) (string, string) {
 	t.Helper()
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "updater.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen unix: %v", err)
-	}
-	srv := &http.Server{Handler: fn}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() {
-		_ = srv.Close()
-		_ = os.Remove(sock)
+	token := "test-token-" + randHex(8)
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		// Every test exercises updaterReachable() first; hard-code a
+		// 200 OK on /healthz so individual tests don't need to remember
+		// it. Anything else routes to fn.
+		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		fn(w, r)
 	})
-	return sock
+	srv := httptest.NewServer(wrapped)
+	t.Cleanup(srv.Close)
+	return srv.URL, token
 }
 
 // makeAdminUser returns the first registered user. Registration promotes that
@@ -219,7 +226,7 @@ func TestAdmin_VersionCheck_Anonymous_401(t *testing.T) {
 
 func TestAdmin_Upgrade_NoUpdater_503(t *testing.T) {
 	h := SetupWithOpts(t, SetupOpts{
-		// UpdaterSocket left empty — the "this host has no daemon" path.
+		// UpdaterURL left empty — the "this host has no daemon" path.
 	})
 	owner := makeAdminUser(t, h)
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
@@ -231,7 +238,7 @@ func TestAdmin_Upgrade_NoUpdater_503(t *testing.T) {
 
 func TestAdmin_Upgrade_ForwardsToUpdater(t *testing.T) {
 	var seenBody []byte
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/upgrade" {
 			http.Error(w, "wrong route", http.StatusNotFound)
 			return
@@ -243,7 +250,7 @@ func TestAdmin_Upgrade_ForwardsToUpdater(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"started":true,"ref":"v1.2.0"}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	var got struct {
@@ -262,11 +269,11 @@ func TestAdmin_Upgrade_ForwardsToUpdater(t *testing.T) {
 }
 
 func TestAdmin_Upgrade_AuditLogEntry(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"started":true,"ref":"latest"}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
@@ -286,12 +293,12 @@ func TestAdmin_Upgrade_AuditLogEntry(t *testing.T) {
 }
 
 func TestAdmin_Upgrade_PassesThroughUpdater409(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"error":"upgrade_in_progress"}`))
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	env := h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
@@ -302,11 +309,11 @@ func TestAdmin_Upgrade_PassesThroughUpdater409(t *testing.T) {
 }
 
 func TestAdmin_Upgrade_NotAdmin_403(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("updater should NEVER be hit when caller is not an admin")
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	_ = makeAdminUser(t, h)
 	stranger := makeNonAdminUser(t, h)
 	h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
@@ -314,7 +321,7 @@ func TestAdmin_Upgrade_NotAdmin_403(t *testing.T) {
 }
 
 func TestAdmin_UpgradeStatus_PassesThrough(t *testing.T) {
-	sock := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
+	url, tok := stubUpdater(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/status" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -323,7 +330,7 @@ func TestAdmin_UpgradeStatus_PassesThrough(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	})
-	h := SetupWithOpts(t, SetupOpts{UpdaterSocket: sock})
+	h := SetupWithOpts(t, SetupOpts{UpdaterURL: url, UpdaterToken: tok})
 	owner := makeAdminUser(t, h)
 
 	var got struct {
@@ -354,6 +361,103 @@ func TestAdmin_UpgradeStatus_NoUpdater_Unavailable(t *testing.T) {
 	if got.State != "unavailable" {
 		t.Errorf("expected state=unavailable, got %q (full: %+v)", got.State, got)
 	}
+}
+
+// ---------- TCP+bearer migration (v1.5.1+) ----------
+//
+// The three tests below exercise the failure modes that only matter in
+// the daemon-protocol world: missing token, wrong token, and a daemon
+// that's "configured but unreachable" (closed port). The healthy path
+// stays covered by TestAdmin_Upgrade_ForwardsToUpdater above.
+
+// TestAdmin_Upgrade_TokenMissing covers the half-configured case: the
+// operator filled in SYNAPSE_UPDATER_URL but forgot
+// SYNAPSE_UPDATER_TOKEN. updaterReachable rejects locally with 503
+// before it even attempts to dial the daemon — the stub's mux MUST
+// never be invoked.
+func TestAdmin_Upgrade_TokenMissing(t *testing.T) {
+	url, _ := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("daemon must NOT be hit when no token is configured")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		UpdaterURL: url, // token deliberately empty
+	})
+	owner := makeAdminUser(t, h)
+	env := h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
+		owner.AccessToken, map[string]any{}, http.StatusServiceUnavailable)
+	if env.Code != "updater_unreachable" {
+		t.Errorf("code: got %q want updater_unreachable", env.Code)
+	}
+	if env.Message == "" || !contains(env.Message, "token_missing") {
+		t.Errorf("message should mention token_missing: %q", env.Message)
+	}
+}
+
+// TestAdmin_Upgrade_WrongToken covers the "operator rotated the
+// daemon's token but didn't restart synapse-api" case. The daemon
+// returns 401; the api propagates that status to the dashboard
+// (instead of disguising it as a 502/503) so the banner can prompt for
+// reconfiguration.
+func TestAdmin_Upgrade_WrongToken(t *testing.T) {
+	url, _ := stubUpdater(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Anything that reaches `fn` with the wrong token should never
+		// arrive — the stubUpdater wrapper short-circuits on bearer
+		// mismatch. This handler just guards the assertion.
+		t.Errorf("fn invoked with wrong-token request — wrapper should have short-circuited")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		UpdaterURL:   url,
+		UpdaterToken: "wrong-token-on-purpose",
+	})
+	owner := makeAdminUser(t, h)
+	// updaterReachable's /healthz probe is the first thing the handler
+	// runs; the daemon answers 401 → updaterReachable surfaces "healthz
+	// returned 401" and the handler maps that to 503. (The dashboard
+	// renders "Self-update daemon unreachable: healthz returned 401".)
+	env := h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
+		owner.AccessToken, map[string]any{}, http.StatusServiceUnavailable)
+	if env.Code != "updater_unreachable" {
+		t.Errorf("code: got %q want updater_unreachable", env.Code)
+	}
+	if !contains(env.Message, "401") {
+		t.Errorf("message should surface the 401 from the daemon: %q", env.Message)
+	}
+}
+
+// TestAdmin_Upgrade_DaemonNetworkFailure points the api at a closed
+// port (well-known bottom-of-the-range) so the dial errors immediately.
+// The handler should answer 503 with a body referencing the URL, so
+// the operator can copy-paste it into a debugging session.
+func TestAdmin_Upgrade_DaemonNetworkFailure(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		UpdaterURL:   "http://127.0.0.1:1", // port 1 (tcpmux) — never listens in tests
+		UpdaterToken: "any-token-the-daemon-isnt-listening",
+	})
+	owner := makeAdminUser(t, h)
+	env := h.AssertStatus(http.MethodPost, "/v1/admin/upgrade",
+		owner.AccessToken, map[string]any{}, http.StatusServiceUnavailable)
+	if env.Code != "updater_unreachable" {
+		t.Errorf("code: got %q want updater_unreachable", env.Code)
+	}
+	if !contains(env.Message, "updater unreachable at") {
+		t.Errorf("message should include the dial-error wrapper text: %q", env.Message)
+	}
+}
+
+// contains is a tiny strings.Contains alias kept private to admin_test
+// so the new tests can stay self-contained without growing imports.
+func contains(haystack, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // (Compilation only: ensures fmt is used somewhere if I refactor — skips
