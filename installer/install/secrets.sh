@@ -211,6 +211,26 @@ secrets::ensure_env() {
     if [[ -z "$utok" ]]; then
         secrets::ensure_env_var "$file" SYNAPSE_UPDATER_TOKEN "$(secrets::gen_updater_token)"
     fi
+    # SYNAPSE_UPDATER_PORT + SYNAPSE_UPDATER_URL also need to be in
+    # .env for upgrade-path migrations from v1.5.0 (which had only the
+    # token) and any other state where the template rendered before
+    # these keys existed. Without them, docker-compose's
+    # `${SYNAPSE_UPDATER_URL:-}` substitution leaves synapse-api with
+    # an empty target URL and every "Check for updates" call fails
+    # silently. ensure_env_var no-ops when the key is already set, so
+    # operators who exported a custom port/url upstream are preserved.
+    local uport
+    uport="$(secrets::env_get "$file" SYNAPSE_UPDATER_PORT)"
+    if [[ -z "$uport" ]]; then
+        secrets::ensure_env_var "$file" SYNAPSE_UPDATER_PORT "${SYNAPSE_UPDATER_PORT:-8089}"
+        uport="${SYNAPSE_UPDATER_PORT:-8089}"
+    fi
+    local uurl
+    uurl="$(secrets::env_get "$file" SYNAPSE_UPDATER_URL)"
+    if [[ -z "$uurl" ]]; then
+        secrets::ensure_env_var "$file" SYNAPSE_UPDATER_URL \
+            "${SYNAPSE_UPDATER_URL:-http://host.docker.internal:${uport}}"
+    fi
     if (( ha )); then
         local sk
         sk="$(secrets::env_get "$file" SYNAPSE_STORAGE_KEY)"

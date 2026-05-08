@@ -365,3 +365,83 @@ EOF
     run grep -c '^SYNAPSE_UPDATER_TOKEN=' "$ENV_FILE"
     assert_output "1"
 }
+
+# ---- ensure_env: SYNAPSE_UPDATER_PORT + SYNAPSE_UPDATER_URL --------
+#
+# Migration regression: v1.5.0 installs ensured only the TOKEN; the
+# upgrade-path smoke on synapse-vps caught that .env was missing the
+# PORT and URL keys, so docker-compose's `${SYNAPSE_UPDATER_URL:-}`
+# substitution shipped synapse-api with an empty target URL.
+# secrets::ensure_env now ensures all three; these tests guard the
+# regression.
+
+@test "ensure_env: generates SYNAPSE_UPDATER_PORT default 8089 when missing" {
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_PORT
+    assert_output "8089"
+}
+
+@test "ensure_env: generates SYNAPSE_UPDATER_URL default host.docker.internal when missing" {
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://host.docker.internal:8089"
+}
+
+@test "ensure_env: existing SYNAPSE_UPDATER_PORT preserved across re-run" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_UPDATER_PORT=9090
+EOF
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_PORT
+    assert_output "9090"
+}
+
+@test "ensure_env: existing SYNAPSE_UPDATER_URL preserved across re-run" {
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_UPDATER_URL=http://operator-set.example:1234
+EOF
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://operator-set.example:1234"
+}
+
+@test "ensure_env: SYNAPSE_UPDATER_PORT/URL re-run is idempotent (no duplicates)" {
+    secrets::ensure_env "$ENV_FILE"
+    secrets::ensure_env "$ENV_FILE"
+    secrets::ensure_env "$ENV_FILE"
+    run grep -c '^SYNAPSE_UPDATER_PORT=' "$ENV_FILE"
+    assert_output "1"
+    run grep -c '^SYNAPSE_UPDATER_URL=' "$ENV_FILE"
+    assert_output "1"
+}
+
+@test "ensure_env: SYNAPSE_UPDATER_URL uses the existing PORT (not the default) when PORT was pre-set" {
+    # If an operator pre-set the port to 9999 BEFORE running ensure_env
+    # for the first time, the URL should embed 9999 — not the 8089
+    # default. Guards against a copy-paste regression where someone
+    # hardcodes the URL string and breaks operator-overridden ports.
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_UPDATER_PORT=9999
+EOF
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://host.docker.internal:9999"
+}
+
+@test "ensure_env: v1.5.0 → v1.5.1 migration (token present, port+url missing)" {
+    # Real-VPS smoke scenario: a v1.5.0 install had only the TOKEN line
+    # because that's all v1.5.0's ensure_env wrote. Upgrading to v1.5.1
+    # must add PORT and URL without rotating the token.
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_VERSION=1.5.0
+SYNAPSE_PORT=8080
+SYNAPSE_UPDATER_TOKEN=preserve-me-across-upgrade
+EOF
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_TOKEN
+    assert_output "preserve-me-across-upgrade"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_PORT
+    assert_output "8089"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
+    assert_output "http://host.docker.internal:8089"
+}

@@ -265,8 +265,17 @@ EOF
     # about the daemon-protocol migration (PR 1 + PR 2 + PR 3).
     run grep -F -- "--unix-socket" "$INSTALLER_DIR/install/updater.sh"
     assert_failure
-    run grep -F "/run/synapse/updater.sock" "$INSTALLER_DIR/install/updater.sh"
-    assert_failure
+    # /run/synapse/updater.sock IS referenced now — but only by the
+    # v1.5.1 cleanup `rm -f` line that wipes the legacy socket from
+    # pre-existing v1.5.0 installs. The TCP daemon never reads from
+    # or writes to it. Catch a true regression by asserting the file
+    # still has no curl/connect/socket-path that would imply the
+    # daemon uses it for IPC.
+    if grep -F "/run/synapse/updater.sock" "$INSTALLER_DIR/install/updater.sh" \
+            | grep -vE 'rm -f|rmdir' >&2; then
+        echo "found a non-cleanup reference to the legacy socket — IPC regression?" >&2
+        return 1
+    fi
 }
 
 # ---- daemon syntax (no separate phase needed) ----------------------
@@ -309,4 +318,69 @@ EOF
     run grep -E '^EnvironmentFile=' \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
+}
+
+# v1.5.1 daemon-protocol bind-interface regression: real-VPS smoke
+# proved that 127.0.0.1 isn't reachable from inside synapse-api.
+# `host.docker.internal` resolves to the docker-bridge IP (typically
+# 172.17.0.1 on Linux), which a 127.0.0.1-bound daemon refuses. The
+# fix is to bind 0.0.0.0 — security relies on the bearer token + the
+# operator's firewall, not on the bind interface.
+@test "synapse-updater.service: binds 0.0.0.0 (not 127.0.0.1) so containers can reach via host.docker.internal" {
+    run grep -E '^Environment=SYNAPSE_UPDATER_BIND=0\.0\.0\.0' \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_success
+}
+
+@test "synapse-updater.service: explicitly does NOT bind 127.0.0.1" {
+    # Belt-and-suspenders: if anyone ever sets SYNAPSE_UPDATER_BIND=127.0.0.1
+    # in the unit, we want the test to fail loudly. The Python daemon's
+    # 127.0.0.1 default is fine for ad-hoc testing on a developer
+    # workstation; production via the systemd unit MUST be 0.0.0.0.
+    run grep -E '^Environment=SYNAPSE_UPDATER_BIND=127\.0\.0\.1' \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_failure
+}
+
+# v1.5.1 legacy-socket cleanup: pre-existing v1.5.0 installs left a
+# stale unix socket at /run/synapse/updater.sock. The new TCP daemon
+# doesn't use it, so we wipe it after the health probe succeeds.
+@test "phase_install_updater: source updater.sh wipes legacy /run/synapse/updater.sock after TCP probe" {
+    # Asserting the source contains the cleanup commands. Running
+    # phase_install_updater under bats can't actually exercise the
+    # /run/synapse/ paths (the install/systemctl mocks don't make a
+    # real daemon listen and most CI runners can't write to /run),
+    # but the `rm -f /run/synapse/updater.sock` line MUST live in the
+    # phase or the cleanup won't happen on a real upgrade.
+    run grep -F "/run/synapse/updater.sock" "$INSTALLER_DIR/install/updater.sh"
+    assert_success
+    run grep -F "rm -f /run/synapse/updater.sock" "$INSTALLER_DIR/install/updater.sh"
+    assert_success
+    run grep -F "rmdir /run/synapse" "$INSTALLER_DIR/install/updater.sh"
+    assert_success
+}
+
+@test "phase_install_updater: legacy-socket cleanup is best-effort (never blocks upgrade)" {
+    # The cleanup sits AFTER the health-probe loop and uses bare
+    # `|| true` so a missing /run/synapse directory (fresh install)
+    # or a permission error doesn't fail the phase. Read the source
+    # to confirm the cleanup line is followed by `|| true`.
+    run grep -E "rm -f /run/synapse/updater\.sock.*\|\| true" \
+        "$INSTALLER_DIR/install/updater.sh"
+    assert_success
+    run grep -E "rmdir /run/synapse.*\|\| true" \
+        "$INSTALLER_DIR/install/updater.sh"
+    assert_success
+}
+
+@test "phase_install_updater: still succeeds end-to-end (cleanup doesn't break the happy path)" {
+    # Functional regression: the v1.5.1 cleanup sits inside the phase.
+    # If the rm/rmdir commands ever start aborting on `set -e`-enabled
+    # callers, this catches it. We don't try to make /run/synapse exist
+    # — bats CI containers can't write there — but we DO assert the
+    # phase still returns 0 with a healthy mock daemon.
+    mock_default_externals
+    run phase_install_updater
+    assert_success
+    assert_output --partial "Self-update daemon is up"
 }

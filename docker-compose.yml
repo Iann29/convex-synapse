@@ -99,10 +99,13 @@ services:
       SYNAPSE_ASTER_POSTGRES_URL: ${SYNAPSE_ASTER_POSTGRES_URL:-}
       SYNAPSE_ASTER_DB_SCHEMA: ${SYNAPSE_ASTER_DB_SCHEMA:-public}
       SYNAPSE_ASTER_MODULES_DIR: ${SYNAPSE_ASTER_MODULES_DIR:-}
-      # Self-update daemon (v1.5.1+) — TCP localhost + bearer token.
+      # Self-update daemon (v1.5.1+) — TCP + bearer token.
       # The synapse-updater systemd unit on the host listens on
-      # 127.0.0.1:8089; this container reaches it via the
-      # host.docker.internal alias declared in extra_hosts below.
+      # 0.0.0.0:8089 (must accept the docker-bridge IP that
+      # host.docker.internal resolves to inside this container —
+      # 127.0.0.1-only would refuse the bridge connection). Operator
+      # firewall MUST keep 8089 closed to the public internet; the
+      # bearer token is defense-in-depth only.
       # Bearer token is rendered into .env by phase_secrets and stays
       # sticky across re-renders (rotating it would orphan every
       # already-running synapse-api). Default URL keeps local-dev

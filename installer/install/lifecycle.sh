@@ -292,6 +292,25 @@ lifecycle::_upgrade_inner() {
         $prefix cp -a "$tmp_clone/." "$install_dir/"
     fi
 
+    # --- 6.4. top up .env with new secrets keys --------------------
+    # v1.5.1 migration: existing installs upgrading from v1.5.0 (or
+    # earlier) have a .env that pre-dates the SYNAPSE_UPDATER_* keys.
+    # Without this top-up the daemon refuses to start (FATAL: empty
+    # SYNAPSE_UPDATER_TOKEN) and synapse-api gets an empty token via
+    # compose `${SYNAPSE_UPDATER_TOKEN:-}` substitution → 401 to the
+    # daemon. secrets::ensure_env is idempotent — re-runs preserve
+    # every existing value, so installs already on v1.5.1+ are no-op.
+    if declare -F secrets::ensure_env >/dev/null; then
+        local _ensure_env_args=()
+        local _ha_flag
+        _ha_flag="$(secrets::env_get "$env_file" SYNAPSE_HA_ENABLED)"
+        if [[ "$_ha_flag" == "true" ]]; then
+            _ensure_env_args+=(--ha)
+        fi
+        secrets::ensure_env "$env_file" "${_ensure_env_args[@]}" \
+            || ui::warn "could not ensure new secrets in .env"
+    fi
+
     # --- 6.5. refresh self-update daemon ---------------------------
     # The new tree on disk includes a possibly-newer synapse-updater
     # binary + systemd unit. We call phase_install_updater so the on-
