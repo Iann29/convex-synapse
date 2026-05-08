@@ -2,8 +2,8 @@
 # shellcheck shell=bash
 #
 # phase_install_updater — drops the synapse-updater daemon (Python 3
-# HTTP server over a unix socket) and its systemd unit on the host so
-# /v1/admin/upgrade in the dashboard can trigger setup.sh --upgrade.
+# HTTP server bound to TCP localhost) and its systemd unit on the host
+# so /v1/admin/upgrade in the dashboard can trigger setup.sh --upgrade.
 #
 # Lives outside docker compose because the daemon's job is to recreate
 # the compose stack — running it in compose would have it killing
@@ -76,12 +76,20 @@ phase_install_updater() {
         $prefix systemctl restart synapse-updater >/dev/null 2>&1 || true
     fi
 
-    # Health probe — give it a couple of seconds to bind the socket.
-    local socket=/run/synapse/updater.sock
+    # Health probe — give it a couple of seconds to bind the TCP listener.
+    # Daemon listens on 127.0.0.1:<port>; the bearer token lives in .env
+    # (rendered by phase_secrets, generated once at first install). We
+    # read both back from .env rather than the environment so a stale
+    # parent shell can't make us probe with the wrong creds.
+    local port token
+    port="$(secrets::env_get "$INSTALL_DIR/.env" SYNAPSE_UPDATER_PORT)"
+    port="${port:-8089}"
+    token="$(secrets::env_get "$INSTALL_DIR/.env" SYNAPSE_UPDATER_TOKEN)"
     local tries=10
     while (( tries-- > 0 )); do
-        if [[ -S "$socket" ]] && $prefix curl -sSf --unix-socket "$socket" http://x/healthz >/dev/null 2>&1; then
-            ui::success "Self-update daemon is up (unix:$socket)"
+        if curl -sSf -H "Authorization: Bearer ${token}" \
+            "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+            ui::success "Self-update daemon is up (http://127.0.0.1:${port})"
             return 0
         fi
         sleep 0.3

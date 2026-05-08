@@ -23,9 +23,10 @@
 
 # ---- pure generators ------------------------------------------------
 
-secrets::gen_jwt()         { "${SECRETS_OPENSSL:-openssl}" rand -hex 64; }
-secrets::gen_storage_key() { "${SECRETS_OPENSSL:-openssl}" rand -hex 32; }
-secrets::gen_db_password() { "${SECRETS_OPENSSL:-openssl}" rand -hex 16; }
+secrets::gen_jwt()           { "${SECRETS_OPENSSL:-openssl}" rand -hex 64; }
+secrets::gen_storage_key()   { "${SECRETS_OPENSSL:-openssl}" rand -hex 32; }
+secrets::gen_db_password()   { "${SECRETS_OPENSSL:-openssl}" rand -hex 16; }
+secrets::gen_updater_token() { "${SECRETS_OPENSSL:-openssl}" rand -hex 32; }
 
 # ---- atomic file write ---------------------------------------------
 
@@ -199,6 +200,16 @@ secrets::ensure_env() {
     pwd="$(secrets::env_get "$file" POSTGRES_PASSWORD)"
     if [[ -z "$pwd" ]]; then
         secrets::ensure_env_var "$file" POSTGRES_PASSWORD "$(secrets::gen_db_password)"
+    fi
+    # Self-update daemon bearer token (v1.5.1+). Same idempotency
+    # contract as JWT/POSTGRES_PASSWORD: generate once, preserve on
+    # every re-render. Rotating it would invalidate the credential
+    # baked into every running synapse-api container until the next
+    # `docker compose up -d`, so it stays sticky.
+    local utok
+    utok="$(secrets::env_get "$file" SYNAPSE_UPDATER_TOKEN)"
+    if [[ -z "$utok" ]]; then
+        secrets::ensure_env_var "$file" SYNAPSE_UPDATER_TOKEN "$(secrets::gen_updater_token)"
     fi
     if (( ha )); then
         local sk
