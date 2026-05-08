@@ -121,11 +121,13 @@ type SetupOpts struct {
 	// non-empty, deployment URLs get rewritten to
 	// "https://<name>.<BaseDomain>" — wins over PublicURL+ProxyEnabled.
 	BaseDomain string
-	// UpdaterSocket mirrors api.RouterDeps.UpdaterSocket — tests that
-	// exercise /v1/admin/upgrade either point this at a real-on-disk
-	// mock socket (see admin_test.go) or leave it empty to drive the
-	// "updater not configured" path.
-	UpdaterSocket string
+	// UpdaterURL + UpdaterToken mirror api.RouterDeps. Tests that
+	// exercise /v1/admin/upgrade point UpdaterURL at an
+	// httptest.Server (see admin_test.go::stubUpdater) and pass the
+	// matching token; leaving both empty drives the "updater not
+	// configured" path.
+	UpdaterURL   string
+	UpdaterToken string
 	// GitHubRepo + GitHubAPIBase let admin tests redirect the
 	// /version_check fetch at an httptest.Server that pretends to be
 	// GitHub. Production wiring leaves both empty (defaults apply).
@@ -256,7 +258,8 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		PublicURL:             opts.PublicURL,
 		ProxyEnabled:          opts.ProxyEnabled,
 		BaseDomain:            opts.BaseDomain,
-		UpdaterSocket:         opts.UpdaterSocket,
+		UpdaterURL:            opts.UpdaterURL,
+		UpdaterToken:          opts.UpdaterToken,
 		GitHubRepo:            opts.GitHubRepo,
 		GitHubAPIBase:         opts.GitHubAPIBase,
 		PublicIP:              opts.PublicIP,

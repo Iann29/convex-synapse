@@ -110,12 +110,15 @@ type Config struct {
 	BackendS3SecretKey    string
 	BackendS3BucketPrefix string
 
-	// Self-update daemon (v1.1.0+).
-	// UpdaterSocket: unix socket path the synapse-updater systemd
-	// daemon listens on. Default mounted at /run/synapse/updater.sock.
-	// Empty (or unreachable) → /v1/admin/upgrade returns 503 with a
-	// "run setup.sh --upgrade via SSH" hint.
-	UpdaterSocket string
+	// Self-update daemon (v1.1.0+; TCP+bearer migration in v1.5.1).
+	// UpdaterURL: HTTP origin (e.g. http://host.docker.internal:9876)
+	// the synapse-updater daemon listens on. Empty → /v1/admin/upgrade
+	// returns 503 with a "run setup.sh --upgrade via SSH" hint.
+	// UpdaterToken: shared bearer secret the daemon expects on every
+	// request (Authorization: Bearer <token>). Empty alongside a
+	// non-empty URL is treated as misconfigured (503 token_missing).
+	UpdaterURL   string
+	UpdaterToken string
 	// GitHubRepo points /v1/admin/version_check at the right release
 	// stream. Default Iann29/convex-synapse; overridable for forks.
 	GitHubRepo string
@@ -206,7 +209,8 @@ func Load() (*Config, error) {
 		BackendS3SecretKey:    os.Getenv("SYNAPSE_BACKEND_S3_SECRET_KEY"),
 		BackendS3BucketPrefix: getEnvDefault("SYNAPSE_BACKEND_S3_BUCKET_PREFIX", "convex"),
 
-		UpdaterSocket: getEnvDefault("SYNAPSE_UPDATER_SOCKET", "/run/synapse/updater.sock"),
+		UpdaterURL:    strings.TrimRight(os.Getenv("SYNAPSE_UPDATER_URL"), "/"),
+		UpdaterToken:  os.Getenv("SYNAPSE_UPDATER_TOKEN"),
 		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),
 		PublicIP:      strings.TrimSpace(os.Getenv("SYNAPSE_PUBLIC_IP")),
 		DashboardAddr: getEnvDefault("SYNAPSE_DASHBOARD_UPSTREAM", "synapse-convex-dashboard-proxy:80"),

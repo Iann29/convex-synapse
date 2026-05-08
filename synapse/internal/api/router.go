@@ -58,11 +58,17 @@ type RouterDeps struct {
 	// is unset.
 	Crypto SecretEncrypter
 
-	// UpdaterSocket is the unix socket path of the synapse-updater
-	// systemd daemon. Empty (or unreachable) → /v1/admin/upgrade
-	// degrades to "Run setup.sh --upgrade via SSH" via 503. Default
-	// in compose: /run/synapse/updater.sock (bind-mounted from host).
-	UpdaterSocket string
+	// UpdaterURL is the HTTP origin of the synapse-updater daemon
+	// (v1.5.1+ TCP+bearer migration; see installer/updater/README.md).
+	// Empty (or unreachable) → /v1/admin/upgrade degrades to
+	// "Run setup.sh --upgrade via SSH" via 503. Default in compose:
+	// http://host.docker.internal:9876.
+	UpdaterURL string
+
+	// UpdaterToken is the bearer secret shared with the daemon. Empty
+	// alongside a non-empty URL is treated as misconfigured (503
+	// token_missing).
+	UpdaterToken string
 
 	// GitHubRepo is "<owner>/<name>" used by /v1/admin/version_check.
 	// Default "Iann29/convex-synapse"; overridable so a hard fork can
@@ -253,7 +259,8 @@ func NewRouter(d RouterDeps) http.Handler {
 			adminH := &AdminHandler{
 				DB:                 d.DB,
 				Version:            d.Version,
-				UpdaterSocket:      d.UpdaterSocket,
+				UpdaterURL:         d.UpdaterURL,
+				UpdaterToken:       d.UpdaterToken,
 				GitHubRepo:         d.GitHubRepo,
 				GitHubAPIBase:      d.GitHubAPIBase,
 				PublicURL:          d.PublicURL,

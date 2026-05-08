@@ -20,8 +20,8 @@ import (
 )
 
 // hostDomainHandlers groups the /v1/admin/host_domain endpoints. They share
-// the AdminHandler's deps (DB, UpdaterSocket) plus the host-config snapshot
-// that GET surfaces and POST validates against. Mounted from
+// the AdminHandler's deps (DB, UpdaterURL/UpdaterToken) plus the host-config
+// snapshot that GET surfaces and POST validates against. Mounted from
 // AdminHandler.Routes().
 //
 // Why a separate file (not admin.go): host_domain has its own
@@ -225,14 +225,9 @@ type hostDomainPostResp struct {
 //     surface 502/503 to the caller.
 //  5. Audit + return 202 with the row id.
 func (h *AdminHandler) postHostDomain(w http.ResponseWriter, r *http.Request) {
-	if h.UpdaterSocket == "" {
-		writeError(w, http.StatusServiceUnavailable, "updater_unavailable",
-			"Self-update daemon is not configured on this host. Run setup.sh --reconfigure via SSH.")
-		return
-	}
-	if _, err := os.Stat(h.UpdaterSocket); err != nil {
+	if err := h.updaterReachable(r.Context()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "updater_unreachable",
-			"Self-update daemon socket missing — daemon installed but not running, or this host doesn't have systemd. Run setup.sh --reconfigure via SSH.")
+			"Self-update daemon unreachable: "+err.Error())
 		return
 	}
 
