@@ -28,13 +28,23 @@ setup() {
 
     # Source the bare phase + its UI/detect dependencies. Sourcing the
     # whole setup.sh would bring traps, lockfiles and ERR-handler state
-    # along, none of which the phase needs.
+    # along, none of which the phase needs. secrets.sh is needed for
+    # the env_get helper that the TCP probe uses to read .env.
     # shellcheck source=../../install/ui.sh
     source "$INSTALLER_DIR/install/ui.sh"
     # shellcheck source=../../lib/detect.sh
     source "$INSTALLER_DIR/lib/detect.sh"
+    # shellcheck source=../../install/secrets.sh
+    source "$INSTALLER_DIR/install/secrets.sh"
     # shellcheck source=../../install/updater.sh
     source "$INSTALLER_DIR/install/updater.sh"
+
+    # Most tests want a populated .env so the TCP probe can read the
+    # token / port back. Individual tests override or remove this file.
+    cat >"$FAKE_INSTALL/.env" <<'EOF'
+SYNAPSE_UPDATER_PORT=8089
+SYNAPSE_UPDATER_TOKEN=bats-fixture-bearer-token
+EOF
 
     INSTALL_DIR="$FAKE_INSTALL"
     INSTALLER_VERSION="9.9.9-bats"
@@ -215,6 +225,50 @@ mock_default_externals() {
     assert_success
 }
 
+# ---- TCP + bearer-token probe (v1.5.1+) ----------------------------
+
+@test "phase_install_updater: probes daemon via TCP localhost with bearer token" {
+    mock_default_externals
+    run phase_install_updater
+    assert_success
+
+    # The probe reads token + port from $INSTALL_DIR/.env (rendered
+    # by phase_secrets in the real install path; written by setup()
+    # in this test). Verify curl was driven with the right scheme,
+    # host, port, and Authorization header — all four together prove
+    # we're no longer talking unix socket.
+    [ -f "$SYN_MOCK_CALLS/curl" ]
+    run cat "$SYN_MOCK_CALLS/curl"
+    assert_output --partial "Authorization: Bearer bats-fixture-bearer-token"
+    assert_output --partial "http://127.0.0.1:8089/healthz"
+    refute_output --partial "--unix-socket"
+}
+
+@test "phase_install_updater: probe falls back to default port 8089 when .env lacks SYNAPSE_UPDATER_PORT" {
+    # Operator deleted the line, or an upgrade from a pre-v1.5.1
+    # install lands on a .env that never had the key. The probe must
+    # not panic — it falls back to the documented default.
+    cat >"$FAKE_INSTALL/.env" <<'EOF'
+SYNAPSE_UPDATER_TOKEN=token-only-no-port
+EOF
+    mock_default_externals
+    run phase_install_updater
+    assert_success
+    run cat "$SYN_MOCK_CALLS/curl"
+    assert_output --partial "http://127.0.0.1:8089/healthz"
+    assert_output --partial "Authorization: Bearer token-only-no-port"
+}
+
+@test "phase_install_updater: source updater.sh has no --unix-socket references" {
+    # Belt-and-suspenders. Anyone reintroducing the socket path would
+    # also need to fix this test, forcing a code-review conversation
+    # about the daemon-protocol migration (PR 1 + PR 2 + PR 3).
+    run grep -F -- "--unix-socket" "$INSTALLER_DIR/install/updater.sh"
+    assert_failure
+    run grep -F "/run/synapse/updater.sock" "$INSTALLER_DIR/install/updater.sh"
+    assert_failure
+}
+
 # ---- daemon syntax (no separate phase needed) ----------------------
 
 @test "synapse-updater: Python script is syntactically valid" {
@@ -247,4 +301,12 @@ mock_default_externals() {
     run grep -F "SYNAPSE_UPDATER_SOCKET" \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_failure
+}
+
+# PR 1 (daemon TCP) merged ahead of this PR's rebase, so EnvironmentFile=
+# is present in the unit file as a hard contract — no skip-guard.
+@test "synapse-updater.service: contains EnvironmentFile= for bearer token" {
+    run grep -E '^EnvironmentFile=' \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_success
 }

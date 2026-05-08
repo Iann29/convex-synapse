@@ -674,15 +674,25 @@ phase_secrets() {
         # not as empty placeholders. Two-line assign-then-export so
         # the generator's exit code isn't masked by `export` itself
         # always returning 0 (SC2155).
-        local jwt pg sk=""
+        local jwt pg sk="" utok
         jwt="$(secrets::gen_jwt)"
         pg="$(secrets::gen_db_password)"
+        utok="$(secrets::gen_updater_token)"
         export SYNAPSE_JWT_SECRET="$jwt"
         export POSTGRES_PASSWORD="$pg"
+        export SYNAPSE_UPDATER_TOKEN="$utok"
         if (( ENABLE_HA )); then
             sk="$(secrets::gen_storage_key)"
         fi
         export SYNAPSE_STORAGE_KEY="$sk"
+        # Self-update daemon (v1.5.1+) — TCP localhost + bearer token.
+        # synapse-api reaches the daemon via host.docker.internal:8089
+        # (extra_hosts in docker-compose.yml). The defaults below are
+        # the canonical wiring; operators who explicitly export a
+        # different SYNAPSE_UPDATER_PORT before calling setup.sh take
+        # precedence (the := preserves any pre-existing value).
+        export SYNAPSE_UPDATER_PORT="${SYNAPSE_UPDATER_PORT:-8089}"
+        export SYNAPSE_UPDATER_URL="${SYNAPSE_UPDATER_URL:-http://host.docker.internal:${SYNAPSE_UPDATER_PORT}}"
         secrets::render_env_tmpl "$INSTALLER_TEMPLATES/env.tmpl" "$env_file"
         $prefix chmod 0600 "$env_file"
         ui::success ".env rendered (${#SYNAPSE_JWT_SECRET}-byte JWT secret, ${#POSTGRES_PASSWORD}-byte PG password)"

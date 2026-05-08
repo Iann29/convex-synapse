@@ -20,6 +20,10 @@ setup() {
     # Fixed-output openssl stub for deterministic generators.
     cat >"$SYN_MOCK_BIN/openssl" <<'EOF'
 #!/usr/bin/env bash
+# Fixture stub: SECRETS_OPENSSL points at this. Both gen_storage_key
+# and gen_updater_token call `rand -hex 32` so they share a fixture
+# value — tests that need to distinguish the two assert on the
+# env-var key in the rendered file, not on the value.
 case "$1 $2" in
     "rand -hex")
         case "$3" in
@@ -54,6 +58,33 @@ EOF
     run secrets::gen_db_password
     assert_success
     assert_output --partial "PGPASS-fixture"
+}
+
+@test "gen_updater_token: returns the openssl stub output (32-byte hex)" {
+    # Shares the rand -hex 32 fixture with gen_storage_key — both are
+    # 32-byte tokens with no semantic difference at the openssl layer.
+    run secrets::gen_updater_token
+    assert_success
+    assert_output --partial "STORAGEKEY-fixture"
+}
+
+@test "gen_updater_token: invokes openssl with rand -hex 32" {
+    # Sanity check on the openssl invocation — the spec says 32 bytes
+    # (256 bits) of entropy, encoded as 64 hex chars. A typo to -hex 64
+    # would still produce a hex string; the only way to assert the
+    # right call is to check the argv recorded by the openssl mock.
+    cat >"$SYN_MOCK_BIN/openssl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >>"$SYN_MOCK_CALLS/openssl"
+echo "fixture-output"
+EOF
+    chmod +x "$SYN_MOCK_BIN/openssl"
+    run secrets::gen_updater_token
+    assert_success
+    run cat "$SYN_MOCK_CALLS/openssl"
+    assert_line "rand"
+    assert_line "-hex"
+    assert_line "32"
 }
 
 # ---- env_get --------------------------------------------------------
@@ -296,4 +327,41 @@ EOF
     # PG still gets generated
     run secrets::env_get "$ENV_FILE" POSTGRES_PASSWORD
     assert_output --partial "PGPASS-fixture"
+}
+
+# ---- ensure_env: SYNAPSE_UPDATER_TOKEN (v1.5.1+) -------------------
+
+@test "ensure_env: generates SYNAPSE_UPDATER_TOKEN when missing" {
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_TOKEN
+    # Stub returns the rand -hex 32 fixture; real installs get a
+    # 64-char hex string. Both code paths exercise the same call.
+    assert_output --partial "STORAGEKEY-fixture"
+}
+
+@test "ensure_env: existing SYNAPSE_UPDATER_TOKEN preserved across re-run" {
+    # Idempotency contract: the token rotates only via explicit
+    # operator action. A re-run of setup.sh on a working install
+    # must NOT change it — every running synapse-api would lose its
+    # credential mid-flight.
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_UPDATER_TOKEN=existing-updater-token-do-not-touch
+EOF
+    secrets::ensure_env "$ENV_FILE"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_TOKEN
+    assert_output "existing-updater-token-do-not-touch"
+    # JWT and PG still get generated (regression guard against
+    # accidentally short-circuiting the whole function).
+    run secrets::env_get "$ENV_FILE" SYNAPSE_JWT_SECRET
+    assert_output --partial "JWT-fixture"
+    run secrets::env_get "$ENV_FILE" POSTGRES_PASSWORD
+    assert_output --partial "PGPASS-fixture"
+}
+
+@test "ensure_env: SYNAPSE_UPDATER_TOKEN re-run is idempotent (no duplicates)" {
+    secrets::ensure_env "$ENV_FILE"
+    secrets::ensure_env "$ENV_FILE"
+    secrets::ensure_env "$ENV_FILE"
+    run grep -c '^SYNAPSE_UPDATER_TOKEN=' "$ENV_FILE"
+    assert_output "1"
 }
