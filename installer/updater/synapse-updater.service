@@ -33,14 +33,15 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
 
-# RuntimeDirectory creates /run/synapse on each start (cleaned on stop).
-# The daemon binds its unix socket inside that path; the synapse-api
-# container bind-mounts the same path so it can talk to the socket
-# without any TCP exposure.
-RuntimeDirectory=synapse
-RuntimeDirectoryMode=0755
-
-Environment=SYNAPSE_UPDATER_SOCKET=/run/synapse/updater.sock
+# EnvironmentFile pulls SYNAPSE_UPDATER_TOKEN (and any other shared secrets)
+# from the operator's .env. Inline `Environment=` would publish the token in
+# a 0644 systemd unit file readable by every local user; .env is 0600 and
+# already the canonical home for this kind of credential. The leading `-`
+# means "tolerate missing file" so a fresh install where the unit lands
+# before .env exists fails fast at the Python layer (no token → daemon
+# refuses to start) instead of failing systemd-side with a confusing
+# "EnvironmentFile not found" error.
+EnvironmentFile=-/opt/synapse/.env
 # {{INSTALL_DIR}} is rendered by installer/install/updater.sh::phase_install_updater
 # from the operator's --install-dir flag (default /opt/synapse). Hard-coding
 # /opt/synapse here would break any custom install path because the daemon
