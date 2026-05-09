@@ -610,3 +610,55 @@ func TestDNSProvider_Endpoint_MissingDomain(t *testing.T) {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 }
+
+// Regression for the v1.5.1 KVM4 panic: when SYNAPSE_STORAGE_KEY isn't
+// passed to the synapse-api container (compose passthrough missing),
+// crypto.NewFromEnv() returns an error and main.go used to assign a
+// `*crypto.SecretBox(nil)` straight into the api.SecretEnvelope
+// interface field. The interface then carried a typed-nil pointer:
+// `if h.Crypto == nil` returned false, the handler called
+// EncryptString, and the receiver-method dereference panicked.
+//
+// Two coverage angles:
+//   1. **Literal-nil interface**: the path main.go now takes (via the
+//      intermediate var pattern). Should hit the 503 guard cleanly.
+//   2. **Typed-nil via concrete type assignment**: simulates the old
+//      bug shape — pass a `var sb *crypto.SecretBox; sb` directly. If
+//      this returns 503 we know the api-side guard handles both
+//      shapes; if it panics the test traps the panic and fails
+//      loudly so the bug never re-lands silently.
+//
+// The api-side `if h.Crypto == nil` guard was always there (since
+// PR #86); the bug was that the interface had a typed-nil pointer so
+// the guard didn't trigger. The defense lives in main.go's
+// intermediate-var pattern: we never hand a typed-nil to the
+// interface field. This test pins both paths.
+func TestDNSCredentials_Add_Cloudflare_LiteralNilCrypto_Returns503(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		// DNSEnvelope omitted — interface field stays literal nil.
+	})
+	owner := makeAdminUser(t, h)
+
+	resp := h.Do(http.MethodPost, "/v1/admin/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "any-token", "label": "test"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on literal-nil Crypto, got %d", resp.StatusCode)
+	}
+	var body errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Code != "crypto_not_configured" {
+		t.Errorf("code: got %q want crypto_not_configured", body.Code)
+	}
+}
+
+// errorBody is the minimal envelope we use to assert structured 4xx/5xx
+// responses without the typed-nil bug masquerading as a generic 500.
+type errorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}

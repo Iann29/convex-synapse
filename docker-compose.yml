@@ -113,6 +113,26 @@ services:
       # returns 503 on connection refused).
       SYNAPSE_UPDATER_URL: ${SYNAPSE_UPDATER_URL:-http://host.docker.internal:8089}
       SYNAPSE_UPDATER_TOKEN: ${SYNAPSE_UPDATER_TOKEN:-}
+      # Storage envelope key (v0.5+). Required for the HA flow (encrypts
+      # deployment_storage Postgres URL + S3 keys at rest) AND the v1.5+
+      # DNS credentials flow (encrypts Cloudflare API tokens). The
+      # installer generates SYNAPSE_STORAGE_KEY idempotently in .env;
+      # without this passthrough the container never sees it and Crypto
+      # initialisation silently degrades to nil. Field-discovered on a
+      # fresh KVM4 install where /v1/admin/dns_credentials/cloudflare
+      # panicked on EncryptString of a typed-nil interface.
+      SYNAPSE_STORAGE_KEY: ${SYNAPSE_STORAGE_KEY:-}
+      # HA mode envs (v0.5+). Same passthrough story — missing from the
+      # container env meant ha:true was effectively disabled even when
+      # SYNAPSE_HA_ENABLED=true was in .env. Defaults keep non-HA
+      # installs unaffected.
+      SYNAPSE_HA_ENABLED: ${SYNAPSE_HA_ENABLED:-false}
+      SYNAPSE_BACKEND_POSTGRES_URL: ${SYNAPSE_BACKEND_POSTGRES_URL:-}
+      SYNAPSE_BACKEND_S3_ENDPOINT: ${SYNAPSE_BACKEND_S3_ENDPOINT:-}
+      SYNAPSE_BACKEND_S3_REGION: ${SYNAPSE_BACKEND_S3_REGION:-}
+      SYNAPSE_BACKEND_S3_ACCESS_KEY: ${SYNAPSE_BACKEND_S3_ACCESS_KEY:-}
+      SYNAPSE_BACKEND_S3_SECRET_KEY: ${SYNAPSE_BACKEND_S3_SECRET_KEY:-}
+      SYNAPSE_BACKEND_S3_BUCKET_PREFIX: ${SYNAPSE_BACKEND_S3_BUCKET_PREFIX:-}
     volumes:
       # Synapse provisions sibling containers via the host docker daemon.
       # This mount is unavoidable for the v0 architecture; the alternative is

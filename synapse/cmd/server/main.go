@@ -173,18 +173,52 @@ func run() error {
 		logger.Warn("docker unavailable; provisioning endpoints will fail", "err", err)
 	}
 
-	// Storage-secrets crypto. Optional — only HA-enabled clusters need
-	// it. When unset the handler refuses ha:true with ha_misconfigured;
-	// non-HA flows are unaffected.
+	// Storage-secrets crypto. Used by:
+	//   - HA flow (encrypts deployment_storage Postgres URL + S3 keys)
+	//   - DNS credentials flow (encrypts Cloudflare API tokens)
+	// The installer generates SYNAPSE_STORAGE_KEY idempotently in .env
+	// since v0.5+, so a fresh install always has it. We try to load
+	// regardless of HA mode — non-HA installs need it for DNS
+	// auto-config (v1.5.0+). Missing key:
+	//   - HA enabled  → fatal (ha:true refused with ha_misconfigured anyway)
+	//   - HA disabled → log + continue with nil; the DNS credential
+	//     handler returns 503 crypto_not_configured on POST.
 	var secretBox *crypto.SecretBox
-	if cfg.HAEnabled {
-		secretBox, err = crypto.NewFromEnv()
-		if err != nil {
+	secretBox, err = crypto.NewFromEnv()
+	if err != nil {
+		if cfg.HAEnabled {
 			logger.Error("HA enabled but SYNAPSE_STORAGE_KEY is missing or malformed",
 				"err", err)
 			return err
 		}
+		logger.Info("SYNAPSE_STORAGE_KEY not set; encrypted-secret features disabled (HA, DNS credentials)",
+			"err", err)
+		secretBox = nil
+	} else if cfg.HAEnabled {
 		logger.Info("HA mode enabled; storage secrets envelope active")
+	} else {
+		logger.Info("Storage secrets envelope active (HA disabled, but DNS credentials available)")
+	}
+
+	// Typed-nil-interface defense. Assigning a *crypto.SecretBox(nil)
+	// directly to an api.SecretEnvelope / api.SecretEncrypter field
+	// produces a non-nil interface that wraps a typed-nil pointer:
+	// `iface == nil` returns false, but the first method call panics
+	// with `nil pointer dereference` inside SecretBox.Encrypt. Caught
+	// in production on a fresh KVM4 install where SYNAPSE_STORAGE_KEY
+	// hadn't been plumbed through to the container env. Materialise
+	// the interface fields via intermediate variables so they hold
+	// literal nil when secretBox is nil — the api-side `if h.Crypto
+	// == nil` guards then work as intended.
+	var (
+		dnsEnvelope       api.SecretEnvelope
+		deploymentsCrypto api.SecretEncrypter
+		workerCrypto      provisioner.SecretDecrypter
+	)
+	if secretBox != nil {
+		dnsEnvelope = secretBox
+		deploymentsCrypto = secretBox
+		workerCrypto = secretBox
 	}
 
 	// Proxy resolver — built up-front so the domains handler can
@@ -222,7 +256,7 @@ func run() error {
 			BackendS3SecretKey:  cfg.BackendS3SecretKey,
 			BackendBucketPrefix: cfg.BackendS3BucketPrefix,
 		},
-		Crypto:       secretBox,
+		Crypto:       deploymentsCrypto,
 		UpdaterURL:   cfg.UpdaterURL,
 		UpdaterToken: cfg.UpdaterToken,
 		GitHubRepo:   cfg.GitHubRepo,
@@ -230,10 +264,10 @@ func run() error {
 		DomainCache:  proxyResolver,
 		// DNS-provider credentials reuse the same SecretBox as the HA
 		// deployment_storage flow — both encrypt operator-supplied
-		// secrets-at-rest. nil when SYNAPSE_STORAGE_KEY is unset, in
-		// which case /v1/admin/dns_credentials/cloudflare returns
-		// 503 crypto_not_configured.
-		DNSEnvelope: secretBox,
+		// secrets-at-rest. Literal-nil interface when SYNAPSE_STORAGE_KEY
+		// is unset, in which case /v1/admin/dns_credentials/cloudflare
+		// returns 503 crypto_not_configured.
+		DNSEnvelope: dnsEnvelope,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the
@@ -259,7 +293,7 @@ func run() error {
 				PortRangeMax:          cfg.PortRangeMax,
 			},
 			Logger: logger,
-			Crypto: secretBox, // nil when HA is off — single-replica jobs don't read it
+			Crypto: workerCrypto, // literal-nil interface when HA is off — single-replica jobs don't read it
 		}
 		go pworker.Run(rootCtx)
 	}
