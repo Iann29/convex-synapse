@@ -45,6 +45,33 @@ compose::up() {
                 ;;
         esac
     done
+    # When the caller passes --build (every upgrade and every fresh
+    # install), also pass --force-recreate. compose's recreate decision
+    # uses the per-service config-hash label on the running container,
+    # NOT the image SHA. A fresh `docker build` that produces a new
+    # image SHA at the SAME tag (synapse:local / synapse-dashboard:local)
+    # leaves the config-hash unchanged → compose marks the container
+    # as up-to-date → operator keeps running yesterday's binary even
+    # though a brand-new image now exists. v1.5.1 → v1.5.3 hit exactly
+    # this trap on real VPS — the dashboard chip stayed yellow because
+    # the dashboard container was never recreated. --force-recreate
+    # bypasses the hash check and recreates every container in the
+    # project, guaranteeing the new image is what actually runs.
+    # Cost: ~5-15s per upgrade (postgres + caddy briefly cycle); the
+    # health-wait already absorbs that window. Belt: skip when --build
+    # is absent so `lifecycle::rollback_images` (which calls compose up
+    # without --build) keeps its non-disruptive semantics.
+    local has_build=0
+    local arg
+    for arg in "${up_args[@]}"; do
+        if [[ "$arg" == "--build" ]]; then
+            has_build=1
+            break
+        fi
+    done
+    if (( has_build )); then
+        up_args+=(--force-recreate)
+    fi
     local args=(compose -f "$dir/docker-compose.yml" "${profiles[@]}" up -d "${up_args[@]}")
     ui::spin "Bringing up the stack" "$cmd" "${args[@]}"
 }

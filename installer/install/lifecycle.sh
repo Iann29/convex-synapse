@@ -208,6 +208,40 @@ lifecycle::_upgrade_inner() {
     local log_file="$install_dir/upgrade.log"
     local snap_file="$install_dir/.upgrade-snapshot.tsv"
 
+    # --- Phase B fast-path (post-reexec, v1.5.4+) -------------------
+    # When phase A's rsync re-execs into the freshly-installed setup.sh,
+    # the new shell ends up here too. Skip every step phase A already
+    # owned (validate / resolve target / snapshot / clone / rsync) and
+    # jump straight into ensure_env / phase_install_updater / build /
+    # wait_healthy — under the NEW code that was just rsync'd. This
+    # solves the bootstrap problem: any fix shipped in phase B (notably
+    # compose::up's --force-recreate, secrets::ensure_env adopting new
+    # keys, phase_install_updater rendering new systemd unit fields)
+    # actually applies on the upgrade that delivers it, not the one
+    # AFTER. Sentinel + state envs handed off by the old shell.
+    if [[ -n "${SYNAPSE_UPGRADE_REEXEC:-}" ]]; then
+        local target current stamp_target is_branch=1
+        target="${SYNAPSE_UPGRADE_REEXEC_TARGET:-}"
+        current="${SYNAPSE_UPGRADE_REEXEC_CURRENT:-}"
+        snap_file="${SYNAPSE_UPGRADE_REEXEC_SNAP:-$snap_file}"
+        stamp_target="${target#v}"
+        if [[ "$target" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_branch=0
+        fi
+        # Clear sentinel before phase B runs so any nested upgrade
+        # (e.g. operator running setup.sh --upgrade from inside a
+        # broken phase B for recovery) doesn't accidentally short-
+        # circuit. Children of phase B that call setup.sh again get
+        # a clean slate.
+        unset SYNAPSE_UPGRADE_REEXEC SYNAPSE_UPGRADE_REEXEC_TARGET \
+              SYNAPSE_UPGRADE_REEXEC_CURRENT SYNAPSE_UPGRADE_REEXEC_SNAP
+        ui::info "Resuming upgrade phase B under setup.sh v${INSTALLER_VERSION:-?}"
+        lifecycle::log "$log_file" "phase B resume: target=$target installer=v${INSTALLER_VERSION:-?}"
+        lifecycle::_upgrade_phase_b "$install_dir" "$target" "$current" \
+            "$stamp_target" "$is_branch" "$snap_file" "$env_file" "$log_file"
+        return $?
+    fi
+
     # --- 1. validate -----------------------------------------------
     if [[ ! -f "$env_file" ]]; then
         ui::fail "no .env at $env_file — is this a Synapse install dir?"
@@ -291,6 +325,97 @@ lifecycle::_upgrade_inner() {
         ui::warn "rsync not found — falling back to cp -a (no exclusions)"
         $prefix cp -a "$tmp_clone/." "$install_dir/"
     fi
+
+    # --- 6.3. defensive chmod -------------------------------------
+    # rsync -a should preserve mode bits, but if the upstream tree ever
+    # lost the executable bit (umask edge cases on contributor systems,
+    # tarball-export of a release), the next upgrade's daemon
+    # `subprocess.Popen([setup.sh, ...])` would die with PermissionError
+    # → status `failed: spawn error` and operator stuck on SSH-only
+    # recovery. Cheap defense: re-set +x on every file the upgrade /
+    # daemon flow exec's. Best-effort; missing files are not fatal.
+    $prefix chmod +x "$install_dir/setup.sh" 2>/dev/null || true
+    if [[ -d "$install_dir/installer" ]]; then
+        $prefix find "$install_dir/installer" -type f -name '*.sh' \
+            -exec chmod +x {} + 2>/dev/null || true
+        $prefix chmod +x "$install_dir/installer/updater/synapse-updater" \
+            2>/dev/null || true
+    fi
+
+    # --- 6.5. re-exec into freshly-installed setup.sh (v1.5.4+) ----
+    # The bash functions in memory right now (compose::up,
+    # secrets::ensure_env, phase_install_updater, lifecycle::_rollback,
+    # ...) came from the OLD release that originally installed Synapse
+    # on this host. Any fix shipped in $target only lives on disk —
+    # in-memory we still have v(N)'s logic. Re-exec the just-rsynced
+    # setup.sh so every subsequent step runs under v($target)'s code.
+    # This is the same pattern setup::bootstrap uses for `curl | bash`.
+    #
+    # Sentinel env keeps us from looping. State envs (target / current /
+    # snap path) hand off everything phase B needs without re-hitting
+    # GitHub or re-deriving paths. The lock file FD is preserved across
+    # exec; daemon-spawned subprocesses keep the same PID so the
+    # daemon's proc.wait() never sees a discontinuity.
+    #
+    # SYNAPSE_UPGRADE_NO_REEXEC=1 is the test escape hatch (bats can't
+    # easily mock execve). On exec failure we fall through to in-memory
+    # phase B so a corrupted target tree doesn't leave the install
+    # half-upgraded.
+    if [[ -z "${SYNAPSE_UPGRADE_REEXEC:-}" ]] \
+            && [[ -z "${SYNAPSE_UPGRADE_NO_REEXEC:-}" ]] \
+            && [[ -x "$install_dir/setup.sh" ]]; then
+        # Clean up tmp_clone now — the new shell can't reach the
+        # outer wrapper's cleanup. Also clear tmp_clone_var so the
+        # OLD wrapper (if exec fails and we fall through, or if
+        # the new shell somehow returns here) doesn't double-rm.
+        if [[ -d "$tmp_clone" ]]; then
+            rm -rf "$tmp_clone"
+        fi
+        if [[ -n "$tmp_clone_var" ]]; then
+            # shellcheck disable=SC2086
+            printf -v "$tmp_clone_var" '%s' ""
+        fi
+
+        export SYNAPSE_UPGRADE_REEXEC=1
+        export SYNAPSE_UPGRADE_REEXEC_TARGET="$target"
+        export SYNAPSE_UPGRADE_REEXEC_CURRENT="${current:-}"
+        export SYNAPSE_UPGRADE_REEXEC_SNAP="$snap_file"
+
+        lifecycle::log "$log_file" "phase A complete; re-exec → $install_dir/setup.sh"
+        ui::info "Re-exec into freshly-installed setup.sh (so phase B runs under new code)"
+
+        local _exec_args=(--upgrade --non-interactive --install-dir="$install_dir")
+        if [[ -n "$ref" ]]; then _exec_args+=(--ref="$ref"); fi
+        if (( force )); then _exec_args+=(--force); fi
+
+        exec "$install_dir/setup.sh" "${_exec_args[@]}"
+        # exec replaces the process — only reachable on execve failure.
+        ui::warn "exec into $install_dir/setup.sh failed; falling through to in-memory phase B"
+        unset SYNAPSE_UPGRADE_REEXEC SYNAPSE_UPGRADE_REEXEC_TARGET \
+              SYNAPSE_UPGRADE_REEXEC_CURRENT SYNAPSE_UPGRADE_REEXEC_SNAP
+    fi
+
+    # Fallback: re-exec disabled (test) or impossible (corrupted setup.sh).
+    # Run phase B in-memory under the OLD code. This is the v1.5.3-and-
+    # earlier behavior — known-buggy but better than aborting.
+    lifecycle::_upgrade_phase_b "$install_dir" "$target" "${current:-}" \
+        "$stamp_target" "$is_branch" "$snap_file" "$env_file" "$log_file"
+    return $?
+}
+
+# lifecycle::_upgrade_phase_b <install_dir> <target> <current>
+#                             <stamp_target> <is_branch>
+#                             <snap_file> <env_file> <log_file>
+# Phase B of the upgrade: ensure_env / phase_install_updater /
+# pre-pull / version stamp / compose up --build / wait_healthy /
+# rollback-on-failure. Split out from _upgrade_inner so the
+# re-exec'd new shell can call it directly without re-running
+# phase A's clone+rsync. Returns 0 on success, 2 on failure (with
+# rollback already attempted).
+lifecycle::_upgrade_phase_b() {
+    local install_dir="$1" target="$2" current="$3"
+    local stamp_target="$4" is_branch="$5"
+    local snap_file="$6" env_file="$7" log_file="$8"
 
     # --- 6.4. top up .env with new secrets keys --------------------
     # v1.5.1 migration: existing installs upgrading from v1.5.0 (or

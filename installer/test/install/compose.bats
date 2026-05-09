@@ -62,6 +62,60 @@ EOF
     assert_output --partial "--profile ha"
 }
 
+# v1.5.4 regression: compose's recreate decision uses config-hash, not
+# image SHA. A fresh `--build` that produces a new image at the same
+# tag silently leaves the old container running. compose::up MUST pair
+# --build with --force-recreate so the recreate is unconditional.
+@test "up --build: also passes --force-recreate" {
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" run compose::up "/opt/synapse" --build
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    assert_output --partial "--build"
+    assert_output --partial "--force-recreate"
+}
+
+# Symmetric guard: when --build is absent (the rollback path calls
+# `compose up -d` after re-tagging the previous images), --force-recreate
+# must also be absent — recreating containers in a rollback would defeat
+# the point of "non-disruptive image swap" semantics.
+@test "up without --build: does NOT add --force-recreate" {
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" run compose::up "/opt/synapse"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    refute_output --partial "--force-recreate"
+}
+
+# Mixed: --build with profiles still adds --force-recreate exactly once.
+@test "up --profile + --build: --force-recreate appears once" {
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$BATS_TEST_TMPDIR/docker.calls"
+exit 0
+EOF
+    chmod +x "$SYN_MOCK_BIN/docker"
+    COMPOSE_CMD="$SYN_MOCK_BIN/docker" run compose::up "." --profile caddy --build
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/docker.calls"
+    # Count --force-recreate occurrences in the captured invocation.
+    local count
+    count="$(grep -o -- '--force-recreate' "$BATS_TEST_TMPDIR/docker.calls" | wc -l)"
+    [[ "$count" -eq 1 ]] || { echo "expected exactly 1 --force-recreate, got $count"; return 1; }
+    assert_output --partial "--profile caddy"
+    assert_output --partial "--build"
+}
+
 @test "down: emits compose down without volumes by default" {
     cat >"$SYN_MOCK_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
