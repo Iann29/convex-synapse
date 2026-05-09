@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -141,6 +142,13 @@ type createCloudflareCredentialReq struct {
 }
 
 func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.Request) {
+	// Trace each entry so a fresh-install 500 in the field gives the
+	// operator a clear server-side breadcrumb to share without needing
+	// to attach a debugger.
+	slog.Default().Info("dns_credentials: createCloudflare entry",
+		"crypto_configured", h.Crypto != nil,
+		"factory_configured", h.CloudflareFactory != nil)
+
 	if h.Crypto == nil {
 		// Without a SecretBox we can't safely persist the token —
 		// plaintext-at-rest is not an acceptable fallback. Surface
