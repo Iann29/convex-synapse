@@ -24,6 +24,15 @@ ENV NEXT_PUBLIC_SYNAPSE_URL=$NEXT_PUBLIC_SYNAPSE_URL
 # Default targets a local-dev `docker run convex-dashboard` on 6791.
 ARG NEXT_PUBLIC_CONVEX_DASHBOARD_URL=http://localhost:6791
 ENV NEXT_PUBLIC_CONVEX_DASHBOARD_URL=$NEXT_PUBLIC_CONVEX_DASHBOARD_URL
+# Frontend version stamp — baked into the JS bundle at build time so
+# the running browser can prove which dashboard build it's serving.
+# Pairs with the Synapse Go binary's main.Version (returned by
+# /v1/install_status) so operators can spot a stale browser cache by
+# comparing front-vs-back strings on /me. Defaults to "dev" for local
+# dev; setup.sh passes the same SYNAPSE_VERSION stamp so front and
+# back always match in production.
+ARG NEXT_PUBLIC_DASHBOARD_VERSION=dev
+ENV NEXT_PUBLIC_DASHBOARD_VERSION=$NEXT_PUBLIC_DASHBOARD_VERSION
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

@@ -64,6 +64,20 @@ export function VersionStatusChip() {
 
   const updateAvailable = data.updateAvailable && !!data.latest;
 
+  // Frontend version is baked into the JS bundle at build time. When
+  // the operator just upgraded, the synapse-api container restarts with
+  // the new binary BUT the browser tab may still be running JS from
+  // before the upgrade — same SW-less stale-bundle pattern the /me
+  // AboutSection surfaces. Comparing the two here lets us flip the
+  // chip into a yellow "stale browser" state regardless of whether
+  // a release is available.
+  const frontendVersion =
+    process.env.NEXT_PUBLIC_DASHBOARD_VERSION ?? "dev";
+  const stale =
+    !updateAvailable &&
+    frontendVersion !== "dev" &&
+    frontendVersion !== data.current;
+
   const onCheckNow = async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -90,11 +104,15 @@ export function VersionStatusChip() {
           "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors",
           updateAvailable
             ? "bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+            : stale
+            ? "bg-yellow-500/15 text-yellow-200 hover:bg-yellow-500/25"
             : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200",
         )}
         title={
           updateAvailable
             ? `v${data.latest} available — click for details`
+            : stale
+            ? `Frontend out of sync (front=v${frontendVersion}, back=v${data.current}) — Ctrl+Shift+R to reload`
             : "Up to date — click for cache status"
         }
       >
@@ -102,13 +120,22 @@ export function VersionStatusChip() {
           aria-hidden
           className={clsx(
             "h-1.5 w-1.5 rounded-full",
-            updateAvailable ? "bg-amber-400" : "bg-emerald-500/70",
+            updateAvailable
+              ? "bg-amber-400"
+              : stale
+              ? "bg-yellow-400"
+              : "bg-emerald-500/70",
           )}
         />
         <span className="font-mono">v{data.current}</span>
         {updateAvailable && (
           <span className="text-amber-300/80">
             → v{data.latest}
+          </span>
+        )}
+        {stale && (
+          <span className="text-yellow-300/80" aria-label="frontend out of sync">
+            ⚠
           </span>
         )}
       </button>
@@ -127,9 +154,30 @@ export function VersionStatusChip() {
 
           <div className="space-y-2.5 px-3 py-3 text-xs">
             <div className="flex items-center justify-between">
-              <span className="text-neutral-500">Current</span>
+              <span className="text-neutral-500">Backend</span>
               <code className="font-mono text-neutral-100">v{data.current}</code>
             </div>
+
+            <div className="flex items-center justify-between">
+              <span className="text-neutral-500">Frontend</span>
+              <code
+                className={clsx(
+                  "font-mono",
+                  stale ? "text-yellow-200" : "text-neutral-100",
+                )}
+              >
+                v{frontendVersion}
+              </code>
+            </div>
+
+            {stale && (
+              <p className="rounded border border-yellow-500/30 bg-yellow-500/10 px-2 py-1.5 text-[11px] text-yellow-100">
+                Browser cache is from <code>v{frontendVersion}</code> but the
+                backend is on <code>v{data.current}</code>. Hard-refresh the
+                page (<kbd>Ctrl+Shift+R</kbd> / <kbd>Cmd+Shift+R</kbd>) to load
+                the new build.
+              </p>
+            )}
 
             <div className="flex items-center justify-between">
               <span className="text-neutral-500">Latest</span>
