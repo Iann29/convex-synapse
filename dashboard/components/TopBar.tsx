@@ -7,6 +7,7 @@ import useSWR from "swr";
 import clsx from "clsx";
 import { Avatar } from "@/components/ui/avatar";
 import { SynapseLogo } from "@/components/ui/logo";
+import { VersionStatusChip } from "@/components/VersionStatusChip";
 import { api, type Team } from "@/lib/api";
 import { clearAuth, getCurrentUser, type User } from "@/lib/auth";
 
@@ -94,6 +95,11 @@ export function TopBar() {
               Admin
             </Link>
           )}
+          {/* Version + GitHub-cache countdown. Hides itself for non
+              instance-admin users (the version_check endpoint 403s).
+              Always-visible for admins so the cache TTL is never a
+              mystery — kills the "did my upgrade publish?" anxiety. */}
+          {user && <VersionStatusChip />}
           <a
             href="https://github.com/get-convex/convex-backend"
             target="_blank"
