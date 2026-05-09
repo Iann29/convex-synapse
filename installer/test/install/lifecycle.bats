@@ -1705,3 +1705,205 @@ EOF2
     run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
     assert_output "http://host.docker.internal:8089"
 }
+
+# ====================================================================
+# v1.5.4 re-exec bootstrap fix
+# ====================================================================
+#
+# After phase A's rsync replaces $install_dir's source tree with the
+# target version, the running bash still has phase B's functions from
+# the OLD release in memory. Without a re-exec, every fix shipped in
+# the new release's lifecycle/compose/secrets/updater code only kicks
+# in on the SECOND upgrade. v1.5.4 splits _upgrade_inner: phase A
+# runs in OLD code, then exec's $install_dir/setup.sh so phase B runs
+# under NEW code. SYNAPSE_UPGRADE_REEXEC=1 + state envs hand off the
+# resolved target / current / snapshot paths.
+#
+# These tests pin the contract:
+#   1. With SYNAPSE_UPGRADE_NO_REEXEC=1 set, the re-exec is bypassed
+#      (the test escape hatch — bats can't easily mock execve, so we
+#      need a way to exercise phase B in-process).
+#   2. With sentinel SYNAPSE_UPGRADE_REEXEC=1 already set on entry to
+#      _upgrade_inner, the function jumps straight to phase B (skips
+#      validate / clone / rsync). State envs supply target etc.
+#   3. Phase A doesn't try to exec when $install_dir/setup.sh isn't
+#      executable post-rsync (corrupted target tree edge case) —
+#      falls through to in-memory phase B with a warning.
+
+@test "upgrade: SYNAPSE_UPGRADE_NO_REEXEC bypasses the exec, phase B runs in-process" {
+    # Without this escape hatch every existing lifecycle test would
+    # break because they don't lay down a real $install_dir/setup.sh.
+    # This test pins that the env var actually works.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.0
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    # Lay down a fake $install_dir/setup.sh so the re-exec guard's
+    # `[[ -x ... ]]` check WOULD pass — but NO_REEXEC overrides.
+    : >"$INSTALL_DIR/setup.sh"
+    chmod +x "$INSTALL_DIR/setup.sh"
+    SYNAPSE_UPGRADE_NO_REEXEC=1 \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.5.4
+    assert_success
+    # Stamp must have moved — proves phase B actually ran.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "1.5.4"
+}
+
+@test "upgrade: SYNAPSE_UPGRADE_REEXEC=1 fast-path skips phase A entirely" {
+    # Simulates the post-exec entry: sentinel + state envs are set
+    # by phase A in the OLD shell, exec'd into the NEW shell which
+    # lands here. Phase B should run; phase A's git clone / rsync
+    # MUST NOT — proven by mocking git to fail (we'd see the error
+    # if phase A ran).
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.3
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+echo "git MUST NOT run during phase B fast-path" >&2
+exit 99
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    # Pre-write a snapshot so phase B's rollback path has something to
+    # find if anything goes sideways.
+    : >"$INSTALL_DIR/.upgrade-snapshot.tsv"
+    SYNAPSE_UPGRADE_REEXEC=1 \
+        SYNAPSE_UPGRADE_REEXEC_TARGET="v1.5.4" \
+        SYNAPSE_UPGRADE_REEXEC_CURRENT="1.5.3" \
+        SYNAPSE_UPGRADE_REEXEC_SNAP="$INSTALL_DIR/.upgrade-snapshot.tsv" \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR"
+    assert_success
+    # If phase A had run, git would've fired and the upgrade would've
+    # exit 2 with "git clone failed". We're checking the OPPOSITE: the
+    # fast-path skipped clone entirely and phase B stamped the version.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "1.5.4"
+}
+
+@test "upgrade: re-exec falls through when \$install_dir/setup.sh isn't executable" {
+    # Belt-and-suspenders: if the rsync somehow lands a non-executable
+    # setup.sh (broken tarball, weird umask), the guard `[[ -x ... ]]`
+    # is false → re-exec is skipped → phase B runs in-memory under
+    # the OLD code. Better than aborting; the upgrade still completes
+    # (just without the bootstrap-fix benefit on this particular run).
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.3
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+# Lay down a NON-executable setup.sh in the cloned tmp so when rsync
+# copies it into $install_dir, the [[ -x ]] guard fails.
+echo '#!/bin/bash' >"$dest/setup.sh"
+chmod 0644 "$dest/setup.sh"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+    # NB: we DON'T set SYNAPSE_UPGRADE_NO_REEXEC — we want the re-exec
+    # branch to be evaluated. The chmod 0644 above + the defensive
+    # chmod +x in lifecycle.sh's phase A are racing — the defensive
+    # chmod runs in this very test (it's part of phase A). Override it
+    # by removing executable AFTER the chmod runs: easiest way is to
+    # mock `chmod` to no-op for this test. But that's brittle. Simpler:
+    # don't lay down a setup.sh at all — then `[[ -x ]]` fails because
+    # the file doesn't exist post-rsync (rsync mock above produced an
+    # empty dir but we're going to override with a separate mock that
+    # creates an empty tree).
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+# No setup.sh laid down → rsync produces empty $install_dir/setup.sh
+# (i.e. file doesn't exist) → guard fails → fall through.
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.5.4
+    assert_success
+    # Phase B still ran — version stamped.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "1.5.4"
+}

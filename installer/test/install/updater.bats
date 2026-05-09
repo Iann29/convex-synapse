@@ -144,6 +144,13 @@ mock_default_externals() {
         "$FAKE_INSTALL/installer/updater/synapse-updater.service" >"$rendered"
     run grep -F "Environment=SYNAPSE_INSTALL_DIR=$FAKE_INSTALL" "$rendered"
     assert_success
+    # v1.5.4: EnvironmentFile is also templated. Custom-dir installs
+    # used to break because EnvironmentFile=-/opt/synapse/.env was
+    # hard-coded — the daemon started without SYNAPSE_UPDATER_TOKEN
+    # and the dashboard's upgrade button silently 502'd. Pin both
+    # placeholders to the rendered absolute path.
+    run grep -F "EnvironmentFile=-$FAKE_INSTALL/.env" "$rendered"
+    assert_success
     run grep -F "{{INSTALL_DIR}}" "$rendered"
     assert_failure
     rm -f "$rendered"
@@ -157,6 +164,13 @@ mock_default_externals() {
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
     run grep -F "Environment=SYNAPSE_INSTALL_DIR=/opt/synapse" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_failure
+    # v1.5.4: same invariant for EnvironmentFile.
+    run grep -F "EnvironmentFile=-{{INSTALL_DIR}}/.env" \
+        "$REPO_ROOT/installer/updater/synapse-updater.service"
+    assert_success
+    run grep -F "EnvironmentFile=-/opt/synapse/.env" \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_failure
 }
@@ -293,10 +307,17 @@ EOF
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
     # v1.5.1+: bearer token + TCP localhost. EnvironmentFile pulls
-    # SYNAPSE_UPDATER_TOKEN out of /opt/synapse/.env (mode 0600) so the
-    # secret never lives inline in the 0644 systemd unit. The leading `-`
-    # makes the file optional so first-boot lifecycle stays graceful.
-    run grep -F "EnvironmentFile=-/opt/synapse/.env" \
+    # SYNAPSE_UPDATER_TOKEN out of <INSTALL_DIR>/.env (mode 0600) so
+    # the secret never lives inline in the 0644 systemd unit. The
+    # leading `-` makes the file optional so first-boot lifecycle stays
+    # graceful. v1.5.4: {{INSTALL_DIR}} replaced the v1.5.x hard-coded
+    # /opt/synapse path; phase_install_updater renders the placeholder
+    # from the operator's --install-dir flag at install time. Custom-dir
+    # installs (--install-dir=/opt/synapse-test, etc.) used to break
+    # with empty SYNAPSE_UPDATER_TOKEN because EnvironmentFile pointed
+    # at a non-existent /opt/synapse/.env even though .env actually
+    # lived under the custom path.
+    run grep -F "EnvironmentFile=-{{INSTALL_DIR}}/.env" \
         "$REPO_ROOT/installer/updater/synapse-updater.service"
     assert_success
 }

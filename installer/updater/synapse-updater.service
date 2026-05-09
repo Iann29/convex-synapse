@@ -41,13 +41,14 @@ SystemCallArchitectures=native
 # before .env exists fails fast at the Python layer (no token → daemon
 # refuses to start) instead of failing systemd-side with a confusing
 # "EnvironmentFile not found" error.
-EnvironmentFile=-/opt/synapse/.env
+#
 # {{INSTALL_DIR}} is rendered by installer/install/updater.sh::phase_install_updater
 # from the operator's --install-dir flag (default /opt/synapse). Hard-coding
-# /opt/synapse here would break any custom install path because the daemon
-# resolves setup.sh, .env, and VERSION relative to this value. The unit on
-# disk always has a real absolute path; the placeholder only lives in the
-# repo source.
+# /opt/synapse here (the v1.5.x bug) broke any custom install path: the
+# daemon ran without SYNAPSE_UPDATER_TOKEN and refused to start, and the
+# dashboard's upgrade button silently 502'd. Both EnvironmentFile and
+# SYNAPSE_INSTALL_DIR resolve from the same operator flag.
+EnvironmentFile=-{{INSTALL_DIR}}/.env
 Environment=SYNAPSE_INSTALL_DIR={{INSTALL_DIR}}
 # BIND_ADDR=0.0.0.0 (not 127.0.0.1) is REQUIRED for the synapse-api
 # container to reach the daemon. Inside the container,
