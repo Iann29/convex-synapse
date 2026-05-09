@@ -168,6 +168,10 @@ services:
         # convex-dashboard service below; setup.sh wires this to
         # http://<vps-ip>:6791 (or https://<domain>:6791 with TLS).
         NEXT_PUBLIC_CONVEX_DASHBOARD_URL: ${PUBLIC_CONVEX_DASHBOARD_URL:-http://localhost:6791}
+        # Same stamp the Go binary bakes via main.Version. Lets the
+        # browser prove which dashboard build it loaded — operator can
+        # check front vs back on /me to spot a stale browser cache.
+        NEXT_PUBLIC_DASHBOARD_VERSION: ${SYNAPSE_VERSION:-dev}
     image: synapse-dashboard:local
     container_name: synapse-dashboard
     restart: unless-stopped

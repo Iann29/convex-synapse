@@ -133,6 +133,13 @@ export type VersionCheck = {
   releaseNotes?: string;
   publishedAt?: string;
   fetchedAt?: string;
+  // RFC3339 timestamp; when this is in the future, /version_check is
+  // serving from the in-memory cache and will refetch from GitHub
+  // afterwards. The dashboard surfaces this as a "next check in MM:SS"
+  // countdown so anxious operators who just published a release know
+  // when the banner will see the new tag.
+  cacheExpiresAt?: string;
+  fromCache?: boolean;
   error?: string;
 };
 
@@ -1033,6 +1040,16 @@ export const api = {
   admin: {
     versionCheck(): Promise<VersionCheck> {
       return request<VersionCheck>("/v1/admin/version_check");
+    },
+    // Force-bust the GitHub release cache. Synapse normally caches the
+    // /releases/latest fetch for 15 minutes (GitHub's unauthenticated
+    // limit is 60/hr); this endpoint clears the cache and re-fetches
+    // immediately. Backend rate-limits at 30s between busts to keep a
+    // misbehaving caller from blowing through the GitHub limit.
+    versionCheckRefresh(): Promise<VersionCheck> {
+      return request<VersionCheck>("/v1/admin/version_check/refresh", {
+        method: "POST",
+      });
     },
     upgrade(ref?: string): Promise<UpgradeResponse> {
       return request<UpgradeResponse>("/v1/admin/upgrade", {

@@ -94,6 +94,7 @@ func (h *AdminHandler) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(h.requireInstanceAdmin)
 	r.Get("/version_check", h.versionCheck)
+	r.Post("/version_check/refresh", h.versionCheckRefresh)
 	r.Post("/upgrade", h.upgrade)
 	r.Get("/upgrade/status", h.upgradeStatus)
 	// Host-domain reconfigure (v1.4+). GET surfaces the current
@@ -165,6 +166,17 @@ type versionCheckResp struct {
 	// field is empty and the caller should treat updateAvailable as
 	// "unknown".
 	FetchedAt string `json:"fetchedAt,omitempty"`
+	// CacheExpiresAt is when the next live GitHub fetch will happen.
+	// The dashboard uses this to render a "next check in MM:SS"
+	// countdown — operators who just published a release don't have to
+	// stare at a stale banner wondering if it'll ever update. When
+	// FromCache is true and CacheExpiresAt is in the past, the next
+	// /version_check call refetches; the dashboard can also call
+	// POST /v1/admin/version_check/refresh to force-bust the cache.
+	CacheExpiresAt string `json:"cacheExpiresAt,omitempty"`
+	// FromCache distinguishes "just fetched live" from "served from
+	// the in-memory cache". Useful for the dashboard's countdown UX.
+	FromCache bool `json:"fromCache"`
 	// Error holds a short reason when GitHub couldn't be reached. The
 	// dashboard renders the banner without the green "click to upgrade"
 	// affordance when this is set.
@@ -182,7 +194,7 @@ func (h *AdminHandler) versionCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	_ = fromCache // future: surface to a header for debugging
+	resp.FromCache = fromCache
 
 	if latest != nil {
 		resp.Latest = trimVersion(latest.TagName)
@@ -190,11 +202,39 @@ func (h *AdminHandler) versionCheck(w http.ResponseWriter, r *http.Request) {
 		resp.ReleaseNotes = latest.Body
 		resp.PublishedAt = latest.PublishedAt
 		resp.FetchedAt = fetchedAt.UTC().Format(time.RFC3339)
+		resp.CacheExpiresAt = fetchedAt.Add(versionCheckCacheTTL).UTC().Format(time.RFC3339)
 		// semver.Compare needs a leading "v"; trimVersion strips it.
 		// Re-add for the comparison.
 		resp.UpdateAvailable = semverNewer("v"+resp.Latest, "v"+resp.Current)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// versionCheckRefresh busts the in-memory cache and forces the next
+// /version_check call to hit GitHub directly. Instance-admin only.
+// Useful when an operator just tagged a release and doesn't want to
+// wait up to 15 minutes for the dashboard banner to flip — same UX
+// goal as the countdown timer in the dashboard.
+//
+// We rate-limit the bust to one per 30 seconds across all callers so
+// a script with a tight loop can't blow through GitHub's 60 req/hr
+// unauthenticated limit. The 30s floor is well above what an
+// operator-driven UI button would ever produce.
+func (h *AdminHandler) versionCheckRefresh(w http.ResponseWriter, r *http.Request) {
+	h.cacheMu.Lock()
+	// Don't allow more than one cache-bust per 30s. If the cache was
+	// just refreshed, return the existing payload as if /version_check
+	// were called.
+	if h.cachedLatest != nil && time.Since(h.cachedAt) < 30*time.Second {
+		h.cacheMu.Unlock()
+		h.versionCheck(w, r)
+		return
+	}
+	h.cachedLatest = nil
+	h.cachedAt = time.Time{}
+	h.cacheMu.Unlock()
+
+	h.versionCheck(w, r)
 }
 
 func (h *AdminHandler) fetchLatestRelease(ctx context.Context) (*latestRelease, time.Time, bool, error) {

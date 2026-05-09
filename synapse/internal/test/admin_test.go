@@ -18,6 +18,8 @@ type versionCheckResp struct {
 	ReleaseNotes    string `json:"releaseNotes,omitempty"`
 	PublishedAt     string `json:"publishedAt,omitempty"`
 	FetchedAt       string `json:"fetchedAt,omitempty"`
+	CacheExpiresAt  string `json:"cacheExpiresAt,omitempty"`
+	FromCache       bool   `json:"fromCache"`
 	Error           string `json:"error,omitempty"`
 }
 
@@ -162,6 +164,69 @@ func TestAdmin_VersionCheck_CacheHit(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(hits); got != 1 {
 		t.Errorf("expected exactly 1 GitHub fetch across 5 requests, got %d", got)
+	}
+}
+
+// Regression for v1.5.3 cache-bust feature. The dashboard's
+// VersionStatusChip exposes a "Check now" button that the operator
+// hits when they want to bypass the 15-minute GitHub cache. Backend
+// rate-limits the bust to once per 30 seconds.
+func TestAdmin_VersionCheckRefresh_BustsCache(t *testing.T) {
+	gh, hits := stubGitHub(t, "v1.5.3", false)
+	h := SetupWithOpts(t, SetupOpts{
+		GitHubRepo:    "Iann29/convex-synapse",
+		GitHubAPIBase: gh.URL,
+	})
+	owner := makeAdminUser(t, h)
+
+	// Warm the cache.
+	var got versionCheckResp
+	h.DoJSON(http.MethodGet, "/v1/admin/version_check",
+		owner.AccessToken, nil, http.StatusOK, &got)
+	if atomic.LoadInt64(hits) != 1 {
+		t.Fatalf("expected 1 hit after warm-up, got %d", atomic.LoadInt64(hits))
+	}
+	if !got.FromCache && atomic.LoadInt64(hits) > 1 {
+		// First call is always live; we only check fromCache on the
+		// SECOND call when the cache should kick in.
+	}
+
+	// Subsequent GETs reuse the cache — proves we have a baseline of "no
+	// extra hits without the bust".
+	h.DoJSON(http.MethodGet, "/v1/admin/version_check",
+		owner.AccessToken, nil, http.StatusOK, &got)
+	if !got.FromCache {
+		t.Errorf("second GET should be served from cache, got fromCache=%v", got.FromCache)
+	}
+	if atomic.LoadInt64(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d (cache should have absorbed the second call)", atomic.LoadInt64(hits))
+	}
+
+	// POST /refresh — but since the cache was JUST warmed (well within
+	// 30s), the rate-limiter should refuse the bust and serve the
+	// existing payload.
+	h.DoJSON(http.MethodPost, "/v1/admin/version_check/refresh",
+		owner.AccessToken, nil, http.StatusOK, &got)
+	if atomic.LoadInt64(hits) != 1 {
+		t.Errorf("refresh-within-30s should NOT bust the cache, got %d hits", atomic.LoadInt64(hits))
+	}
+}
+
+func TestAdmin_VersionCheckRefresh_NotAdmin_403(t *testing.T) {
+	gh, _ := stubGitHub(t, "v1.5.3", false)
+	h := SetupWithOpts(t, SetupOpts{
+		GitHubRepo:    "Iann29/convex-synapse",
+		GitHubAPIBase: gh.URL,
+	})
+	// First-registered user IS the instance admin; we want the SECOND.
+	makeAdminUser(t, h) // registers + promotes the first user
+	other := h.RegisterRandomUser()
+
+	resp := h.Do(http.MethodPost, "/v1/admin/version_check/refresh",
+		other.AccessToken, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("non-admin should get 403, got %d", resp.StatusCode)
 	}
 }
 

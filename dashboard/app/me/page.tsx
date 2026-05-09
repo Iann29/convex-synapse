@@ -63,8 +63,91 @@ export default function MePage() {
         </CardBody>
       </Card>
 
+      <AboutSection />
+
       {data && <DangerZone user={data} />}
     </div>
+  );
+}
+
+// AboutSection surfaces the running Synapse versions: backend (Go binary
+// at /v1/install_status) and frontend (NEXT_PUBLIC_DASHBOARD_VERSION
+// baked into the JS bundle at build time). Operators upgrading via the
+// dashboard banner sometimes end up with a stale browser cache where
+// the JS is one release behind the API; comparing the two strings
+// here is the fastest way to spot it. When they don't match, we surface
+// a yellow notice with the recovery hint (Ctrl+Shift+R).
+function AboutSection() {
+  const { data: install } = useSWR<{ version?: string; firstRun?: boolean }>(
+    "/v1/install_status",
+    async () => {
+      // Use raw fetch — install_status is anonymous, no Bearer needed.
+      const base =
+        process.env.NEXT_PUBLIC_SYNAPSE_URL || "http://localhost:8080";
+      const r = await fetch(`${base}/v1/install_status`, { cache: "no-store" });
+      return r.ok ? r.json() : {};
+    },
+    {
+      refreshInterval: 60_000,
+      revalidateOnFocus: false,
+    },
+  );
+
+  const backendVersion = install?.version ?? "—";
+  const frontendVersion =
+    process.env.NEXT_PUBLIC_DASHBOARD_VERSION ?? "dev";
+  const mismatch =
+    backendVersion !== "—" &&
+    frontendVersion !== "dev" &&
+    backendVersion !== frontendVersion;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>About this Synapse</CardTitle>
+        <CardDescription>
+          Versions of the components your browser is currently talking to.
+          A mismatch usually means a stale browser cache after an upgrade —
+          a hard refresh (Ctrl+Shift+R) usually fixes it.
+        </CardDescription>
+      </CardHeader>
+      <CardBody>
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 text-sm">
+          <dt className="text-neutral-500">Backend</dt>
+          <dd
+            className="font-mono text-neutral-100"
+            data-testid="me-backend-version"
+          >
+            v{backendVersion}
+          </dd>
+          <dt className="text-neutral-500">Frontend</dt>
+          <dd
+            className="font-mono text-neutral-100"
+            data-testid="me-frontend-version"
+          >
+            v{frontendVersion}
+          </dd>
+        </dl>
+        {mismatch && (
+          <div
+            className="mt-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"
+            data-testid="me-version-mismatch"
+          >
+            <span className="font-semibold">Frontend is out of sync.</span>{" "}
+            Backend is on <code>v{backendVersion}</code>, but the JS your
+            browser loaded is from <code>v{frontendVersion}</code>. Hit{" "}
+            <kbd className="rounded bg-neutral-800 px-1 py-0.5 font-mono text-[10px]">
+              Ctrl+Shift+R
+            </kbd>{" "}
+            (Linux/Win) or{" "}
+            <kbd className="rounded bg-neutral-800 px-1 py-0.5 font-mono text-[10px]">
+              Cmd+Shift+R
+            </kbd>{" "}
+            (macOS) to load the new build.
+          </div>
+        )}
+      </CardBody>
+    </Card>
   );
 }
 
