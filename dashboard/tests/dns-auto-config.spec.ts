@@ -57,6 +57,12 @@ async function seedSecondUser(
 
 // Mock GET /v1/admin/dns_credentials with the supplied list. POST /
 // DELETE fall through unless the caller mocks them too.
+//
+// Shape MUST match the Go listDNSCredentialsResp wrapper
+// (`{ credentials: [...] }`). The pre-v1.5.5 fixture returned the
+// raw array, which matched the equally-broken frontend type — both
+// agreed in CI but diverged from the real backend in prod. Operators
+// saw a blank panel after adding credentials. Don't go back.
 async function mockListCredentials(
   page: Page,
   rows: unknown[],
@@ -66,7 +72,7 @@ async function mockListCredentials(
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(rows),
+        body: JSON.stringify({ credentials: rows }),
       });
       return;
     }
@@ -90,7 +96,7 @@ async function mockAddCloudflare(
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(rows),
+        body: JSON.stringify({ credentials: rows }),
       });
       return;
     }

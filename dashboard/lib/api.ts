@@ -1086,8 +1086,19 @@ export const api = {
     // edit DNS by hand. Cloudflare is the only supported provider in
     // v1.4.x; the shape leaves room for route53 / google / etc.
     dnsCredentials: {
-      list(): Promise<DNSCredential[]> {
-        return request<DNSCredential[]>("/v1/admin/dns_credentials");
+      // Backend wraps the array in { credentials: [...] } (matches the
+      // listDNSCredentialsResp Go struct in dns_credentials.go). Pre-
+      // v1.5.5 the frontend asked for `DNSCredential[]` directly, so
+      // SWR ended up holding the wrapper object — `data.length` was
+      // undefined, neither the empty-state nor the list ever rendered,
+      // and operators saw a blank panel after adding credentials. The
+      // Playwright spec mocked `[]` directly, hiding the divergence
+      // until real-VPS exposed it. Unwrap explicitly.
+      async list(): Promise<DNSCredential[]> {
+        const resp = await request<{ credentials: DNSCredential[] }>(
+          "/v1/admin/dns_credentials",
+        );
+        return resp.credentials ?? [];
       },
       addCloudflare(token: string, label: string): Promise<DNSCredential> {
         return request<DNSCredential>("/v1/admin/dns_credentials/cloudflare", {
