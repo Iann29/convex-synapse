@@ -1837,6 +1837,86 @@ EOF2
     assert_output "1.5.4"
 }
 
+@test "upgrade phase B exports freshly-stamped SYNAPSE_VERSION before compose build" {
+    # Regression for v1.5.7. systemd starts the synapse-updater daemon
+    # with EnvironmentFile=$INSTALL_DIR/.env, snapshotting whatever
+    # SYNAPSE_VERSION was at boot time into the daemon's process env.
+    # The daemon spawns setup.sh with child_env=dict(os.environ), so
+    # this shell inherits the stale value. Compose's interpolation
+    # gives shell env priority over the project .env file — without
+    # the export, every dashboard-driven upgrade builds the synapse +
+    # dashboard images with the previous release's VERSION baked in,
+    # then --force-recreates containers from those wrong-stamp images.
+    # Operators see chip mismatch + GitHub-cache amber even after the
+    # upgrade reports "success". This test simulates the daemon's
+    # frozen env and asserts compose sees the FRESH value.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.5.5
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+
+    # docker mock that records the SHELL value of SYNAPSE_VERSION at
+    # the moment compose runs. If the export landed correctly this
+    # writes "1.5.6"; without the export it'd write "1.5.5" (the
+    # simulated daemon-frozen value).
+    cat >"$SYN_MOCK_BIN/docker" <<EOF2
+#!/usr/bin/env bash
+if [[ " \$* " == *" compose "* && " \$* " == *" up "* ]]; then
+    printf '%s\n' "\${SYNAPSE_VERSION:-<unset>}" >"$BATS_TEST_TMPDIR/compose-saw-version"
+fi
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+
+    # Simulate the daemon's frozen env. Without the v1.5.7 export, the
+    # mock above would record "1.5.5" because the export is the only
+    # thing that overrides this shell value before compose runs.
+    export SYNAPSE_VERSION=1.5.5
+
+    SYNAPSE_UPGRADE_NO_REEXEC=1 \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.5.6
+    assert_success
+
+    # .env got stamped to the new version (existing invariant).
+    run secrets::env_get "$ENV_FILE" SYNAPSE_VERSION
+    assert_output "1.5.6"
+
+    # The new invariant: docker compose's child env saw the NEW value,
+    # not the simulated daemon-frozen 1.5.5.
+    [ -f "$BATS_TEST_TMPDIR/compose-saw-version" ]
+    run cat "$BATS_TEST_TMPDIR/compose-saw-version"
+    assert_output "1.5.6"
+
+    # Cleanup so subsequent tests don't inherit the export.
+    unset SYNAPSE_VERSION
+}
+
 @test "upgrade: re-exec falls through when \$install_dir/setup.sh isn't executable" {
     # Belt-and-suspenders: if the rsync somehow lands a non-executable
     # setup.sh (broken tarball, weird umask), the guard `[[ -x ... ]]`
