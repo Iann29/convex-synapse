@@ -27,7 +27,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.5.8"
+readonly INSTALLER_VERSION="1.5.9"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"
@@ -681,10 +681,47 @@ phase_secrets() {
         export SYNAPSE_JWT_SECRET="$jwt"
         export POSTGRES_PASSWORD="$pg"
         export SYNAPSE_UPDATER_TOKEN="$utok"
+
+        # HA wiring (v1.5.9). Pre-1.5.9 the wizard's "y" answer flipped
+        # SYNAPSE_HA_ENABLED but never:
+        #   1. activated the `ha` compose profile (so backend-postgres
+        #      and minio never came up), and
+        #   2. populated SYNAPSE_BACKEND_* in .env (so synapse-api had
+        #      empty connection strings and the dashboard's create-
+        #      deployment dialog refused with "ha_misconfigured").
+        # Both bugs co-occurred: any operator who ticked HA in the
+        # wizard ended up with a useless half-configured install.
+        # Now: generate Postgres + S3 credentials, wire SYNAPSE_BACKEND_*
+        # to the bundled services on synapse-network. The `ha` profile
+        # comes up in phase_compose_up. Operators who want managed
+        # external Postgres + S3 can override these values in .env
+        # after install (the bundled services stay idle without the
+        # profile flag).
+        local ha_pg_pass="" ha_s3_key="" ha_s3_secret=""
         if (( ENABLE_HA )); then
             sk="$(secrets::gen_storage_key)"
+            ha_pg_pass="$(secrets::gen_db_password)"
+            ha_s3_key="$(secrets::gen_db_password)"
+            ha_s3_secret="$(secrets::gen_storage_key)"
+            export SYNAPSE_BACKEND_POSTGRES_URL="postgres://convex:${ha_pg_pass}@backend-postgres:5432/postgres?sslmode=disable"
+            export SYNAPSE_BACKEND_S3_ENDPOINT="http://minio:9000"
+            export SYNAPSE_BACKEND_S3_REGION="us-east-1"
+            export SYNAPSE_BACKEND_S3_ACCESS_KEY="$ha_s3_key"
+            export SYNAPSE_BACKEND_S3_SECRET_KEY="$ha_s3_secret"
+            export SYNAPSE_BACKEND_S3_BUCKET_PREFIX="convex"
+        else
+            export SYNAPSE_BACKEND_POSTGRES_URL=""
+            export SYNAPSE_BACKEND_S3_ENDPOINT=""
+            export SYNAPSE_BACKEND_S3_REGION="us-east-1"
+            export SYNAPSE_BACKEND_S3_ACCESS_KEY=""
+            export SYNAPSE_BACKEND_S3_SECRET_KEY=""
+            export SYNAPSE_BACKEND_S3_BUCKET_PREFIX="convex"
         fi
         export SYNAPSE_STORAGE_KEY="$sk"
+        export HA_PG_USER="convex"
+        export HA_PG_PASSWORD="$ha_pg_pass"
+        export HA_S3_KEY="$ha_s3_key"
+        export HA_S3_SECRET="$ha_s3_secret"
         # Self-update daemon (v1.5.1+) — TCP localhost + bearer token.
         # synapse-api reaches the daemon via host.docker.internal:8089
         # (extra_hosts in docker-compose.yml). The defaults below are
@@ -768,6 +805,14 @@ phase_compose_up() {
     local profile_args=()
     if (( ${CADDY_PROFILE_NEEDED:-0} )); then
         profile_args+=(--profile caddy)
+    fi
+    # v1.5.9 — when ENABLE_HA, bring up backend-postgres + minio so
+    # the SYNAPSE_BACKEND_* URLs that phase_secrets just stamped into
+    # .env actually point at running services. lifecycle::detect_profiles
+    # uses SYNAPSE_HA_ENABLED to add the same flag on upgrades, so
+    # subsequent docker compose up calls keep the profile active.
+    if (( ENABLE_HA )); then
+        profile_args+=(--profile ha)
     fi
     # We deliberately skip `compose::pull` and rely on `up -d --build`
     # instead. Reason: the `synapse` and `dashboard` services in our

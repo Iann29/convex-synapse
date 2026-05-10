@@ -237,5 +237,62 @@ secrets::ensure_env() {
         if [[ -z "$sk" ]]; then
             secrets::ensure_env_var "$file" SYNAPSE_STORAGE_KEY "$(secrets::gen_storage_key)"
         fi
+        # v1.5.9 backend credentials. Pre-1.5.9 ENABLE_HA installs
+        # only stamped SYNAPSE_HA_ENABLED + SYNAPSE_STORAGE_KEY but
+        # never the SYNAPSE_BACKEND_* URLs that synapse-api needs to
+        # talk to the bundled cluster-pg + minio. Top-up here so
+        # upgrades from broken HA installs heal automatically. We
+        # generate fresh credentials only when missing — operators
+        # who pre-set their own managed Postgres+S3 are preserved.
+        local ha_pg
+        ha_pg="$(secrets::env_get "$file" HA_PG_PASSWORD)"
+        if [[ -z "$ha_pg" ]]; then
+            ha_pg="$(secrets::gen_db_password)"
+            secrets::ensure_env_var "$file" HA_PG_USER "convex"
+            secrets::ensure_env_var "$file" HA_PG_PASSWORD "$ha_pg"
+        fi
+        local ha_s3_key
+        ha_s3_key="$(secrets::env_get "$file" HA_S3_KEY)"
+        if [[ -z "$ha_s3_key" ]]; then
+            ha_s3_key="$(secrets::gen_db_password)"
+            secrets::ensure_env_var "$file" HA_S3_KEY "$ha_s3_key"
+        fi
+        local ha_s3_secret
+        ha_s3_secret="$(secrets::env_get "$file" HA_S3_SECRET)"
+        if [[ -z "$ha_s3_secret" ]]; then
+            ha_s3_secret="$(secrets::gen_storage_key)"
+            secrets::ensure_env_var "$file" HA_S3_SECRET "$ha_s3_secret"
+        fi
+        local backend_pg
+        backend_pg="$(secrets::env_get "$file" SYNAPSE_BACKEND_POSTGRES_URL)"
+        if [[ -z "$backend_pg" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_POSTGRES_URL \
+                "postgres://convex:${ha_pg}@backend-postgres:5432/postgres?sslmode=disable"
+        fi
+        local backend_s3_ep
+        backend_s3_ep="$(secrets::env_get "$file" SYNAPSE_BACKEND_S3_ENDPOINT)"
+        if [[ -z "$backend_s3_ep" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_S3_ENDPOINT "http://minio:9000"
+        fi
+        local backend_s3_region
+        backend_s3_region="$(secrets::env_get "$file" SYNAPSE_BACKEND_S3_REGION)"
+        if [[ -z "$backend_s3_region" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_S3_REGION "us-east-1"
+        fi
+        local backend_s3_access
+        backend_s3_access="$(secrets::env_get "$file" SYNAPSE_BACKEND_S3_ACCESS_KEY)"
+        if [[ -z "$backend_s3_access" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_S3_ACCESS_KEY "$ha_s3_key"
+        fi
+        local backend_s3_secret
+        backend_s3_secret="$(secrets::env_get "$file" SYNAPSE_BACKEND_S3_SECRET_KEY)"
+        if [[ -z "$backend_s3_secret" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_S3_SECRET_KEY "$ha_s3_secret"
+        fi
+        local backend_s3_bucket
+        backend_s3_bucket="$(secrets::env_get "$file" SYNAPSE_BACKEND_S3_BUCKET_PREFIX)"
+        if [[ -z "$backend_s3_bucket" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_BACKEND_S3_BUCKET_PREFIX "convex"
+        fi
     fi
 }

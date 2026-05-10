@@ -445,3 +445,98 @@ EOF
     run secrets::env_get "$ENV_FILE" SYNAPSE_UPDATER_URL
     assert_output "http://host.docker.internal:8089"
 }
+
+# --- v1.5.9 HA backend wiring -------------------------------------------
+
+@test "ensure_env --ha: generates SYNAPSE_BACKEND_POSTGRES_URL pointing at backend-postgres" {
+    secrets::ensure_env "$ENV_FILE" --ha
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_POSTGRES_URL
+    [[ "$output" =~ ^postgres://convex:.+@backend-postgres:5432/postgres\?sslmode=disable$ ]] \
+        || { echo "got: $output"; return 1; }
+}
+
+@test "ensure_env --ha: generates SYNAPSE_BACKEND_S3_* pointing at minio service" {
+    secrets::ensure_env "$ENV_FILE" --ha
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_ENDPOINT
+    assert_output "http://minio:9000"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_REGION
+    assert_output "us-east-1"
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_BUCKET_PREFIX
+    assert_output "convex"
+
+    # Access key + secret are non-empty (random 16/32-byte hex).
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_ACCESS_KEY
+    [ -n "$output" ]
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_SECRET_KEY
+    [ -n "$output" ]
+}
+
+@test "ensure_env --ha: HA_PG_USER/PASSWORD seed the bundled cluster-pg" {
+    secrets::ensure_env "$ENV_FILE" --ha
+    run secrets::env_get "$ENV_FILE" HA_PG_USER
+    assert_output "convex"
+    run secrets::env_get "$ENV_FILE" HA_PG_PASSWORD
+    [ -n "$output" ]
+    # The HA_PG_PASSWORD value must equal the one embedded in
+    # SYNAPSE_BACKEND_POSTGRES_URL — synapse-api uses the URL, the
+    # bundled backend-postgres container uses HA_PG_PASSWORD via
+    # docker-compose.yml's POSTGRES_PASSWORD substitution. They MUST
+    # match or the connection from synapse-api gets auth-rejected.
+    local pwd_in_url
+    pwd_in_url="$(secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_POSTGRES_URL \
+        | sed -nE 's|^postgres://convex:([^@]+)@.*|\1|p')"
+    assert_equal "$output" "$pwd_in_url"
+}
+
+@test "ensure_env --ha: HA_S3_KEY equals SYNAPSE_BACKEND_S3_ACCESS_KEY (minio creds match)" {
+    secrets::ensure_env "$ENV_FILE" --ha
+    local key_a key_b
+    key_a="$(secrets::env_get "$ENV_FILE" HA_S3_KEY)"
+    key_b="$(secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_ACCESS_KEY)"
+    assert_equal "$key_a" "$key_b"
+}
+
+@test "ensure_env (no --ha): SYNAPSE_BACKEND_* are NOT generated" {
+    secrets::ensure_env "$ENV_FILE"
+    # The keys may or may not exist in the file (they don't, in fact —
+    # ensure_env without --ha skips them entirely). Confirm value is
+    # empty either way.
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_POSTGRES_URL
+    assert_output ""
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_S3_ENDPOINT
+    assert_output ""
+    run secrets::env_get "$ENV_FILE" HA_PG_PASSWORD
+    assert_output ""
+}
+
+@test "ensure_env --ha: pre-existing SYNAPSE_BACKEND_POSTGRES_URL preserved (operator BYO)" {
+    # Operator with managed Postgres pre-sets the URL before running
+    # setup. ensure_env must NOT clobber it with a generated value
+    # that points at the bundled cluster-pg.
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_BACKEND_POSTGRES_URL=postgres://prod_user:prod_pass@my-managed-pg.example.com:5432/convex?sslmode=require
+EOF2
+    secrets::ensure_env "$ENV_FILE" --ha
+    run secrets::env_get "$ENV_FILE" SYNAPSE_BACKEND_POSTGRES_URL
+    assert_output "postgres://prod_user:prod_pass@my-managed-pg.example.com:5432/convex?sslmode=require"
+}
+
+@test "ensure_env --ha: idempotent (re-run preserves credentials)" {
+    secrets::ensure_env "$ENV_FILE" --ha
+    local pg1 s3k1
+    pg1="$(secrets::env_get "$ENV_FILE" HA_PG_PASSWORD)"
+    s3k1="$(secrets::env_get "$ENV_FILE" HA_S3_KEY)"
+
+    secrets::ensure_env "$ENV_FILE" --ha
+    secrets::ensure_env "$ENV_FILE" --ha
+    run secrets::env_get "$ENV_FILE" HA_PG_PASSWORD
+    assert_output "$pg1"
+    run secrets::env_get "$ENV_FILE" HA_S3_KEY
+    assert_output "$s3k1"
+
+    # No duplicate lines either.
+    run grep -c '^HA_PG_PASSWORD=' "$ENV_FILE"
+    assert_output "1"
+    run grep -c '^SYNAPSE_BACKEND_POSTGRES_URL=' "$ENV_FILE"
+    assert_output "1"
+}
