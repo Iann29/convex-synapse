@@ -495,6 +495,37 @@ lifecycle::_upgrade_phase_b() {
     old_version_stamp="$(secrets::env_get "$env_file" SYNAPSE_VERSION)"
     secrets::set_env_var "$env_file" SYNAPSE_VERSION "$new_stamp"
 
+    # v1.5.7: export the freshly-stamped value into the shell env so
+    # `docker compose` interpolation picks it up. Critical for the
+    # dashboard-driven upgrade path:
+    #
+    #   - synapse-updater.service has `EnvironmentFile=$INSTALL_DIR/.env`,
+    #     so the systemd-launched daemon snapshots the OLD SYNAPSE_VERSION
+    #     into its own process env at start time.
+    #   - The daemon spawns setup.sh with `env=dict(os.environ)`, so this
+    #     shell inherits the stale SYNAPSE_VERSION.
+    #   - secrets::set_env_var only mutates the FILE; the shell env is
+    #     untouched.
+    #   - docker compose's interpolation gives shell-env precedence over
+    #     the project .env file. Without this export, the build args
+    #     (VERSION, NEXT_PUBLIC_DASHBOARD_VERSION = ${SYNAPSE_VERSION:-dev})
+    #     resolve to the old value, BuildKit's ARG cache key matches an
+    #     existing layer, and `--force-recreate` happily recreates the
+    #     container from an image whose main.Version is yesterday's
+    #     stamp. The dashboard chip then shows old/new mismatch even
+    #     though .env, the daemon log, and `compose config` (run from a
+    #     fresh shell) all claim everything is on the new version.
+    #
+    # Pre-v1.5.7 the bug was invisible from any single SSH probe because
+    # `compose config` from the operator's interactive shell sees the
+    # current .env and reports the new version, while the daemon-spawned
+    # `compose up --build` saw the snapshotted shell env. Operators
+    # ssh-ing in and running `setup.sh --upgrade` manually never hit it
+    # — only daemon-driven upgrades did.
+    #
+    # See: https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/
+    export SYNAPSE_VERSION="$new_stamp"
+
     # --- 9. compose up -d --build ----------------------------------
     local profile_args=()
     while IFS= read -r line; do
