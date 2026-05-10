@@ -17,8 +17,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
   api,
+  type DNSCredential,
   type HostDomainChangeInput,
   type HostDomainConfig,
+  type HostDomainDNSAutoResult,
   type HostDomainJobStatus,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -312,13 +314,44 @@ function ChangeForm({
   const [baseDomain, setBaseDomain] = useState(current.baseDomain ?? "");
   const [acmeEmail, setAcmeEmail] = useState(current.acmeEmail ?? "");
   const [plainConfirm, setPlainConfirm] = useState(false);
+  const [autoConfigureDns, setAutoConfigureDns] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+
+  // Pull DNS credentials so we can light up the auto-config checkbox
+  // when at least one Cloudflare credential is on file. Hidden when
+  // none — clicking a no-op checkbox would just confuse operators.
+  const { data: credentials } = useSWR<DNSCredential[]>(
+    "/v1/admin/dns_credentials",
+    () => api.admin.dnsCredentials.list(),
+    { revalidateOnFocus: false, shouldRetryOnError: false },
+  );
+  const matchingCredential = useMemo(() => {
+    if (!credentials || credentials.length === 0) return null;
+    if (!domain) return null;
+    const d = domain.trim().toLowerCase().replace(/\.$/, "");
+    if (!d) return null;
+    let best: { cred: DNSCredential; zone: string } | null = null;
+    for (const c of credentials) {
+      if (c.provider !== "cloudflare") continue;
+      for (const z of c.zones ?? []) {
+        const zn = (z.name ?? "").trim().toLowerCase().replace(/\.$/, "");
+        if (!zn) continue;
+        if (d === zn || d.endsWith("." + zn)) {
+          if (!best || zn.length > best.zone.length) {
+            best = { cred: c, zone: zn };
+          }
+        }
+      }
+    }
+    return best;
+  }, [credentials, domain]);
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [applyOpen, setApplyOpen] = useState(false);
   const [applyJob, setApplyJob] = useState<{
     jobId: string;
     targetUrl: string;
+    dnsAuto?: HostDomainDNSAutoResult;
   } | null>(null);
 
   // The "would-be" URL after applying. Used in the confirm modal so the
@@ -382,6 +415,9 @@ function ChangeForm({
       out.baseDomain = baseDomain.trim().toLowerCase();
     }
     if (acmeEmail.trim()) out.acmeEmail = acmeEmail.trim();
+    if (autoConfigureDns && matchingCredential) {
+      out.autoConfigureDns = true;
+    }
     return out;
   };
 
@@ -389,7 +425,7 @@ function ChangeForm({
     const payload = buildPayload();
     try {
       const r = await api.admin.hostDomain.change(payload);
-      setApplyJob({ jobId: r.jobId, targetUrl });
+      setApplyJob({ jobId: r.jobId, targetUrl, dnsAuto: r.dnsAuto });
       setConfirmOpen(false);
       setApplyOpen(true);
     } catch (err) {
@@ -480,6 +516,36 @@ function ChangeForm({
                 <strong>before</strong> applying. The change will fail if
                 DNS isn&rsquo;t pointing yet.
               </p>
+
+              {matchingCredential && (
+                <label
+                  className="flex cursor-pointer items-start gap-3 rounded-md border border-emerald-900/60 bg-emerald-900/15 px-3 py-2.5 text-[11px] text-emerald-100"
+                  data-testid="host-domain-auto-dns-row"
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoConfigureDns}
+                    onChange={(e) => setAutoConfigureDns(e.target.checked)}
+                    className="mt-0.5"
+                    data-testid="host-domain-auto-dns-checkbox"
+                  />
+                  <span className="space-y-0.5">
+                    <span className="block font-medium text-emerald-100">
+                      Auto-configure DNS via Cloudflare credential “
+                      {matchingCredential.cred.label}”
+                    </span>
+                    <span className="block text-emerald-200/80">
+                      Synapse will upsert{" "}
+                      <code className="font-mono">A {domain || "<domain>"}</code>{" "}
+                      → this host&rsquo;s IP in zone{" "}
+                      <code className="font-mono">
+                        {matchingCredential.zone}
+                      </code>{" "}
+                      before applying. Skip this if you manage DNS by hand.
+                    </span>
+                  </span>
+                </label>
+              )}
             </div>
           )}
 
@@ -603,6 +669,7 @@ function ChangeForm({
           }}
           jobId={applyJob.jobId}
           targetUrl={applyJob.targetUrl}
+          dnsAuto={applyJob.dnsAuto}
         />
       )}
     </Card>
@@ -775,11 +842,13 @@ function ApplyDialog({
   onClose,
   jobId,
   targetUrl,
+  dnsAuto,
 }: {
   open: boolean;
   onClose: () => void;
   jobId: string;
   targetUrl: string;
+  dnsAuto?: HostDomainDNSAutoResult;
 }) {
   const [status, setStatus] = useState<HostDomainJobStatus | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -933,6 +1002,30 @@ function ApplyDialog({
             {targetUrl}
           </code>
         </div>
+
+        {dnsAuto?.attempted && dnsAuto.success && (
+          <p
+            className="rounded border border-emerald-900/60 bg-emerald-900/20 px-3 py-2 text-[11px] text-emerald-100"
+            data-testid="host-domain-dns-auto-success"
+          >
+            ✓ Created A record{" "}
+            <code className="font-mono">{dnsAuto.recordName}</code> →{" "}
+            <code className="font-mono">{dnsAuto.ip}</code>{" "}
+            in zone <code className="font-mono">{dnsAuto.zone}</code>{" "}
+            via Cloudflare
+            {dnsAuto.ipDetectedVia ? ` (${dnsAuto.ipDetectedVia})` : ""}.
+          </p>
+        )}
+        {dnsAuto?.attempted && !dnsAuto.success && (
+          <p
+            className="rounded border border-amber-900/60 bg-amber-950/40 px-3 py-2 text-[11px] text-amber-200"
+            data-testid="host-domain-dns-auto-failure"
+          >
+            <span className="font-semibold">Auto DNS skipped:</span>{" "}
+            {dnsAuto.reason ?? "unknown reason"}. Create the A record by
+            hand and re-apply if the reconfigure fails below.
+          </p>
+        )}
 
         {pollError && (
           <p className="rounded border border-amber-900/60 bg-amber-950/40 px-3 py-2 text-[11px] text-amber-200">

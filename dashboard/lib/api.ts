@@ -201,10 +201,30 @@ export type HostDomainJobStatus = {
 };
 
 // POST /v1/admin/host_domain. Returns the queued job id + a status URL
-// the dashboard polls to surface progress.
+// the dashboard polls to surface progress. v1.5.6 adds dnsAuto so the
+// dashboard can surface what (if anything) the backend did with a
+// stored Cloudflare credential before kicking off the reconfigure.
 export type HostDomainChangeResponse = {
   jobId: string;
   statusUrl: string;
+  dnsAuto?: HostDomainDNSAutoResult;
+};
+
+// HostDomainDNSAutoResult mirrors the Go dnsAutoResult struct. Surfaced
+// when the operator ticked "Auto-configure DNS" on the change form.
+// `attempted=true && success=true` → green confirmation rendered;
+// `attempted=true && success=false` → amber warning with `reason`;
+// undefined → checkbox wasn't ticked, render nothing.
+export type HostDomainDNSAutoResult = {
+  attempted: boolean;
+  success: boolean;
+  provider?: string;
+  credentialId?: string;
+  zone?: string;
+  recordName?: string;
+  ip?: string;
+  ipDetectedVia?: string;
+  reason?: string;
 };
 
 // Body shape for POST /v1/admin/host_domain. All fields optional — the
@@ -214,11 +234,17 @@ export type HostDomainChangeResponse = {
 //   { domain, baseDomain }                  → wildcard subdomains
 //   { acmeEmail }                           → bump the Let's Encrypt
 //                                             contact without re-issuing
+//   { domain, autoConfigureDns: true }      → upsert the A record via a
+//                                             stored Cloudflare credential
+//                                             before the reconfigure runs.
+//                                             Best-effort; falls through
+//                                             to manual DNS on failure.
 export type HostDomainChangeInput = {
   domain?: string;
   baseDomain?: string;
   plainHttp?: boolean;
   acmeEmail?: string;
+  autoConfigureDns?: boolean;
 };
 
 // Returned once at create time. `adminKey` is the freshly-minted value;
