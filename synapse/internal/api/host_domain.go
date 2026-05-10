@@ -182,6 +182,11 @@ type hostDomainPostReq struct {
 	BaseDomain *string `json:"baseDomain"`
 	PlainHTTP  bool    `json:"plainHttp"`
 	AcmeEmail  *string `json:"acmeEmail"`
+	// AutoConfigureDNS, when true, makes the handler attempt to upsert
+	// the matching A record via a stored Cloudflare credential BEFORE
+	// dispatching the daemon reconfigure. v1.5.6 — default off so
+	// operators with manually-managed DNS see no behaviour change.
+	AutoConfigureDNS bool `json:"autoConfigureDns"`
 }
 
 // trim returns the trimmed string pointed to, or "" if nil.
@@ -208,6 +213,12 @@ type hostDomainPostResp struct {
 	JobID     string `json:"jobId"`
 	StatusURL string `json:"statusUrl"`
 	State     string `json:"state"`
+	// DNSAuto carries the result of the optional pre-reconfigure
+	// Cloudflare A-record upsert. Nil when the operator didn't tick
+	// the checkbox; populated otherwise so the dashboard can render
+	// either a "✓ created A record" line or a warning explaining why
+	// DNS still needs manual attention.
+	DNSAuto *dnsAutoResult `json:"dnsAuto,omitempty"`
 }
 
 // postHostDomain validates a reconfigure request, persists a row in
@@ -281,17 +292,44 @@ func (h *AdminHandler) postHostDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// v1.5.6: optional auto-config of the A record via a stored
+	// Cloudflare credential BEFORE the DNS preflight runs. When the
+	// operator ticked "Auto-configure DNS" and a credential covering
+	// this domain exists, we upsert the A record so the preflight (and
+	// downstream Caddy ACME) can succeed on the first try. Best-effort
+	// per the operator-chosen warn-and-proceed semantic — failures land
+	// in dnsAuto.reason, not as a 4xx.
+	var dnsAuto *dnsAutoResult
+	if req.AutoConfigureDNS && domain != "" {
+		dnsAuto = h.attemptHostDomainDNSAuto(r.Context(), domain)
+	}
+
 	// DNS preflight — only meaningful when the operator has told us
 	// what their public IP is. Without PublicIP, we have no anchor to
 	// compare resolved A records against, so we skip and let the
 	// daemon's own DNS check (inside setup.sh --reconfigure) be the
 	// source of truth.
+	//
+	// When we just upserted the A record successfully, give DNS a few
+	// seconds to propagate before the preflight queries it — Cloudflare
+	// fans out within ~10s but recursive resolvers cache shorter than
+	// that. Skip the wait when auto-config didn't run or didn't succeed.
+	if dnsAuto != nil && dnsAuto.Success {
+		h.waitForARecord(r.Context(), domain, dnsAuto.IP)
+	}
 	if domain != "" && h.PublicIP != "" {
 		if got, ok := h.dnsLookupA(r.Context(), domain); !ok {
-			writeError(w, http.StatusBadRequest, "dns_preflight_failed",
-				fmt.Sprintf("domain does not resolve to the configured PublicIP: expected %s, got %s",
-					h.PublicIP, strings.Join(got, ", ")))
-			return
+			// Soft-fail when auto-config just ran successfully — the
+			// record was upserted seconds ago and may still be
+			// propagating to the resolver this api process uses. Let
+			// the daemon's reconfigure be the source of truth in that
+			// case; surfacing 4xx here would be a false negative.
+			if dnsAuto == nil || !dnsAuto.Success {
+				writeError(w, http.StatusBadRequest, "dns_preflight_failed",
+					fmt.Sprintf("domain does not resolve to the configured PublicIP: expected %s, got %s",
+						h.PublicIP, strings.Join(got, ", ")))
+				return
+			}
 		}
 	}
 
@@ -395,7 +433,39 @@ func (h *AdminHandler) postHostDomain(w http.ResponseWriter, r *http.Request) {
 		JobID:     jobID,
 		StatusURL: "/v1/admin/host_domain/status/" + jobID,
 		State:     "queued",
+		DNSAuto:   dnsAuto,
 	})
+}
+
+// waitForARecord polls the live DNS until `domain` resolves to the
+// host's public IP, up to 20s. Used after a successful Cloudflare
+// upsert so the downstream preflight (and Caddy's ACME issuance)
+// don't race the propagation. Returns immediately on first match;
+// returns silently on timeout — the caller's preflight will retry
+// shortly anyway and the daemon's reconfigure is the final source of
+// truth.
+//
+// `dnsLookupA` returns (nil, true) when the resolved set already
+// contains h.PublicIP (the contract is "matched against the
+// configured anchor"); we treat that as the success signal here.
+// When PublicIP is empty (no anchor) dnsLookupA returns (nil, true)
+// unconditionally — there's nothing to wait for, return immediately.
+func (h *AdminHandler) waitForARecord(ctx context.Context, domain, expectedIP string) {
+	if domain == "" || expectedIP == "" || h.PublicIP == "" {
+		return
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if _, ok := h.dnsLookupA(ctx, domain); ok {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // hostDomainErrorMessage humanises the codes the daemon emits.
