@@ -1903,14 +1903,42 @@ lifecycle::_reconfigure_inner() {
         "$docker_cmd" compose -f "$compose_file" rm -f caddy >/dev/null 2>&1 || true
     fi
 
-    # SYNAPSE_PUBLIC_URL flows into the synapse-api container env at
-    # start time; restart it (and the dashboard, which reads
-    # NEXT_PUBLIC_API_URL at build / runtime) so the new URL is the
-    # one the API surfaces in /cli_credentials and the dashboard JS
-    # uses for fetches. Best-effort — restarting a healthy stack
-    # that's already on the right env is harmless.
-    "$docker_cmd" compose -f "$compose_file" up -d --no-build synapse dashboard \
-        >/dev/null 2>&1 || true
+    # v1.5.8 — rebuild dashboard, restart synapse-api with the new env.
+    #
+    # synapse-api reads SYNAPSE_PUBLIC_URL from .env at container start
+    # (runtime), so a recreate is enough — the new URL flows into
+    # /cli_credentials and the proxy on next request.
+    #
+    # Dashboard is different: NEXT_PUBLIC_SYNAPSE_URL is BAKED into the
+    # JS bundle at Next.js build time. Without a rebuild, the running
+    # container keeps serving the bundle compiled against the OLD URL,
+    # the browser loads the new domain over HTTPS, and every JS fetch
+    # to the old http://<ip>:8080 base gets blocked by Mixed Content
+    # policy → the page renders but login fails with "Failed to fetch".
+    # Pre-v1.5.8 the reconfigure passed --no-build (deliberate, but
+    # wrong: the comment claimed dashboard read the URL "at build /
+    # runtime" — Next.js only inlines NEXT_PUBLIC_* at build time).
+    #
+    # Same daemon-stale-env trap as v1.5.7: synapse-updater.service
+    # snapshots .env into its process env at boot, dashboard-driven
+    # reconfigures inherit that frozen value, Compose interpolation
+    # gives shell env precedence over the project .env file. Without
+    # the explicit exports below, the rebuild would resolve
+    # NEXT_PUBLIC_SYNAPSE_URL/NEXT_PUBLIC_DASHBOARD_VERSION/etc from
+    # the daemon's pre-reconfigure shell env, baking yesterday's URL
+    # into today's image.
+    export PUBLIC_SYNAPSE_URL="$target_public_url"
+    export SYNAPSE_PUBLIC_URL="$target_public_url"
+
+    # compose::up adds --force-recreate when --build is passed (v1.5.4),
+    # so this single call rebuilds + recreates both services with the
+    # fresh URL baked in. Synapse builds are cache-friendly when its
+    # source hasn't changed, so the cost is mostly the dashboard rebuild
+    # (~30-60s on Hetzner CPX22). Best-effort; failures land in the log.
+    if ! compose::up "$install_dir" --build dashboard synapse \
+            >/dev/null 2>&1; then
+        ui::warn "compose up --build dashboard synapse returned non-zero — inspect with 'docker compose logs'"
+    fi
 
     # ---- 11. audit log + summary --------------------------------------
     {
