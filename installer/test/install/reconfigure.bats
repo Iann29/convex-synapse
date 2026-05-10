@@ -144,6 +144,66 @@ EOF
 
 # ---- happy paths ---------------------------------------------------
 
+# v1.5.8 regression. Reconfigure used to call compose with --no-build,
+# which left the dashboard container running JS compiled against the
+# OLD NEXT_PUBLIC_SYNAPSE_URL. Browser then loaded the new domain over
+# HTTPS and every JS fetch to the previous IP+port URL got blocked by
+# Mixed Content. Pin the new contract: reconfigure invokes compose
+# with --build --force-recreate for synapse + dashboard, AND the shell
+# env carries the fresh PUBLIC_SYNAPSE_URL so Compose's interpolation
+# bakes the right value into the rebuilt image.
+@test "reconfigure: rebuilds dashboard with fresh PUBLIC_SYNAPSE_URL exported" {
+    _install_fixture
+
+    # Override the docker mock to capture (a) every up command's argv,
+    # and (b) the SHELL value of PUBLIC_SYNAPSE_URL at the moment up
+    # runs. Both are needed: argv proves --build/--force-recreate
+    # landed; env capture proves the fresh URL is what compose's
+    # interpolation will see (i.e. defeats the daemon-stale-env trap).
+    cat >"$SYN_MOCK_BIN/docker" <<EOF2
+#!/usr/bin/env bash
+# Only capture the up call that names BOTH dashboard and synapse;
+# the upstream caddy bring-up is a separate compose call that
+# we don't care about for this regression.
+if [[ " \$* " == *" up "* && " \$* " == *" dashboard "* && " \$* " == *" synapse "* ]]; then
+  printf '%s\n' "\$*" >"$BATS_TEST_TMPDIR/docker.dashsyn.argv"
+  printf '%s\n' "\${PUBLIC_SYNAPSE_URL:-<unset>}" >"$BATS_TEST_TMPDIR/docker.dashsyn.env"
+fi
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+
+    # Simulate the daemon's frozen env from a pre-reconfigure snapshot.
+    # Without the v1.5.8 export, the dashboard would rebuild against
+    # this stale value.
+    export PUBLIC_SYNAPSE_URL="http://1.2.3.4:8080"
+    export SYNAPSE_PUBLIC_URL="http://1.2.3.4:8080"
+
+    run lifecycle::reconfigure "$INSTALL_DIR" --domain=foo.com
+    assert_success
+
+    # The synapse + dashboard up call MUST have --build (so dashboard
+    # is rebuilt with fresh build args) and --force-recreate (added by
+    # compose::up when --build is passed; verified directly in
+    # compose.bats).
+    [ -f "$BATS_TEST_TMPDIR/docker.dashsyn.argv" ]
+    run cat "$BATS_TEST_TMPDIR/docker.dashsyn.argv"
+    assert_output --partial "--build"
+    assert_output --partial "--force-recreate"
+    assert_output --partial "dashboard"
+    assert_output --partial "synapse"
+
+    # The env at the moment that specific compose ran must be the
+    # FRESH URL. Pre-v1.5.8 (no export) the mock would record the
+    # simulated daemon-frozen 1.2.3.4 value.
+    [ -f "$BATS_TEST_TMPDIR/docker.dashsyn.env" ]
+    run cat "$BATS_TEST_TMPDIR/docker.dashsyn.env"
+    assert_output "https://foo.com"
+
+    # Cleanup so subsequent tests aren't polluted by these exports.
+    unset PUBLIC_SYNAPSE_URL SYNAPSE_PUBLIC_URL
+}
+
 @test "reconfigure: --domain=foo.com updates SYNAPSE_DOMAIN + SYNAPSE_PUBLIC_URL" {
     _install_fixture
     run lifecycle::reconfigure "$INSTALL_DIR" --domain=foo.com
