@@ -78,6 +78,10 @@ test.afterEach(async () => {
 });
 
 test("provision a deployment via the dashboard", async ({ page }) => {
+  // The full Playwright suite may start this test while previous specs'
+  // provisioner workers are still waiting out backend health timeouts.
+  test.setTimeout(150_000);
+
   await setupProject(page);
 
   await page.getByRole("button", { name: /create deployment/i }).first().click();
@@ -91,7 +95,10 @@ test("provision a deployment via the dashboard", async ({ page }) => {
 
   await expect
     .poll(() => listSynapseContainerNames().length, {
-      timeout: 30_000,
+      // Full-suite runs can arrive behind in-flight provisioner jobs from
+      // specs that only need deployment metadata. Those workers clear after
+      // the backend health timeout, so this wait must exceed that 60s budget.
+      timeout: 90_000,
       intervals: [500, 1000, 2000],
     })
     .toBeGreaterThan(0);

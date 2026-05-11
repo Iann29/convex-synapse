@@ -95,6 +95,10 @@ test.afterEach(async () => {
 });
 
 test("provision three deployments, then delete them all", async ({ page }) => {
+  // Three real Convex containers plus any orphan cleanup from earlier specs can
+  // legitimately outlive Playwright's default 90s test budget.
+  test.setTimeout(240_000);
+
   await setupProject(page);
 
   // Sequence: dev, prod, dev. Each create call waits for the dialog to

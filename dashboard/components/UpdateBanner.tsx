@@ -92,6 +92,7 @@ export function UpdateBanner() {
         </div>
       </div>
       <UpgradeDialog
+        key={`${data.current}:${data.latest}`}
         open={open}
         onClose={() => setOpen(false)}
         check={data}
@@ -115,6 +116,9 @@ type DialogState =
   | "succeeded"
   | "failed";
 
+const upgradeInProgressKey = "synapse-upgrade-in-progress";
+const upgradeMarkerStaleAfterMs = 30 * 60 * 1000;
+
 function UpgradeDialog({
   open,
   onClose,
@@ -128,14 +132,71 @@ function UpgradeDialog({
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<UpgradeStatus | null>(null);
 
-  // Reset every time the modal reopens — operator may have already
-  // run an upgrade in this same browser session.
+  // The updater state is host-side and survives this React dialog. If the
+  // operator closes the overlay mid-upgrade, re-open directly into polling.
+  // A marker alone is not enough: stale browser state must not trap the modal
+  // in "upgrading" after the updater has gone idle.
   useEffect(() => {
-    if (open) {
-      setState("review");
-      setError(null);
-      setStatus(null);
-    }
+    if (!open) return;
+    let cancelled = false;
+
+    const resumeRunningUpgrade = async () => {
+      if (!hasUpgradeInProgressMarker()) {
+        setError(null);
+        setStatus(null);
+        setState("review");
+        return;
+      }
+
+      try {
+        const s = await api.admin.upgradeStatus();
+        if (cancelled) return;
+        setError(null);
+        setStatus(s);
+
+        if (s.state === "running") {
+          setState("polling");
+          return;
+        }
+        if (s.state === "success") {
+          clearUpgradeInProgressMarker();
+          setState("succeeded");
+          return;
+        }
+        if (s.state === "failed") {
+          clearUpgradeInProgressMarker();
+          setState("failed");
+          return;
+        }
+        if (isUpgradeInProgressMarkerStale()) {
+          clearUpgradeInProgressMarker();
+          setStatus(null);
+          setState("review");
+          return;
+        }
+
+        setState("polling");
+      } catch {
+        if (cancelled) return;
+        if (isUpgradeInProgressMarkerStale()) {
+          clearUpgradeInProgressMarker();
+          setError(null);
+          setStatus(null);
+          setState("review");
+          return;
+        }
+        // A connection drop is expected while synapse-api restarts mid-upgrade.
+        // Keep showing progress when a recent marker says the updater is active.
+        setError(null);
+        setStatus(null);
+        setState("polling");
+      }
+    };
+
+    void resumeRunningUpgrade();
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   // Poll /status while running. We poll aggressively (2.5s) — the
@@ -153,8 +214,17 @@ function UpgradeDialog({
         if (cancelled) return;
         consecutiveFailures = 0;
         setStatus(s);
-        if (s.state === "success") setState("succeeded");
-        else if (s.state === "failed") setState("failed");
+        if (s.state === "success") {
+          clearUpgradeInProgressMarker();
+          setState("succeeded");
+        } else if (s.state === "failed") {
+          clearUpgradeInProgressMarker();
+          setState("failed");
+        } else if (s.state === "idle" && isUpgradeInProgressMarkerStale()) {
+          clearUpgradeInProgressMarker();
+          setStatus(null);
+          setState("review");
+        }
       } catch {
         if (cancelled) return;
         consecutiveFailures++;
@@ -192,8 +262,10 @@ function UpgradeDialog({
     setState("starting");
     try {
       await api.admin.upgrade();
+      markUpgradeInProgress();
       setState("polling");
     } catch (err) {
+      clearUpgradeInProgressMarker();
       setError(
         err instanceof ApiError ? err.message : "Could not start the upgrade",
       );
@@ -405,4 +477,28 @@ function formatTime(iso?: string): string {
   } catch {
     return iso;
   }
+}
+
+function hasUpgradeInProgressMarker(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.sessionStorage.getItem(upgradeInProgressKey) !== null;
+}
+
+function markUpgradeInProgress() {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem(upgradeInProgressKey, String(Date.now()));
+}
+
+function clearUpgradeInProgressMarker() {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.removeItem(upgradeInProgressKey);
+}
+
+function isUpgradeInProgressMarkerStale(): boolean {
+  if (typeof window === "undefined") return false;
+  const value = window.sessionStorage.getItem(upgradeInProgressKey);
+  if (!value) return false;
+  const startedAt = Number(value);
+  if (!Number.isFinite(startedAt)) return true;
+  return Date.now() - startedAt > upgradeMarkerStaleAfterMs;
 }

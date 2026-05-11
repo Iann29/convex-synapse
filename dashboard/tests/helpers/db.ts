@@ -25,8 +25,11 @@ export async function truncateAll(): Promise<void> {
   const client = new Client({ connectionString: DB_URL });
   await client.connect();
   try {
+    // Do not RESTART IDENTITY here. The API process can still have
+    // provisioner goroutines finishing jobs from a previous test; reusing
+    // provisioning_jobs.id lets those stale goroutines mutate a new job row.
     await client.query(
-      `TRUNCATE ${TABLES.join(", ")} RESTART IDENTITY CASCADE`,
+      `TRUNCATE ${TABLES.join(", ")} CASCADE`,
     );
   } finally {
     await client.end();
