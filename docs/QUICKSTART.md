@@ -126,18 +126,30 @@ The Convex CLI's self-hosted mode looks for two env vars:
 set (and `CONVEX_DEPLOYMENT` is **not**), the CLI skips Big Brain and talks
 straight to the deployment.
 
-Synapse exposes the matching env-var pair on a single endpoint:
+The thin Synapse CLI wrapper in `cli/` automates that setup while still
+delegating all Convex work to the official `npx convex` package:
 
 ```bash
-# Grab + apply the credentials in one shot
-eval "$(curl -sf http://localhost:8080/v1/deployments/<NAME>/cli_credentials \
-        -H "Authorization: Bearer $A" \
-      | python3 -c 'import sys,json; print(json.load(sys.stdin)["exportSnippet"])')"
+# From the Synapse checkout, install the local wrapper binary once.
+cd cli && npm link
 
-# Push code, run a function, deploy — all against the Synapse container
+# In a Convex app directory, log in to Synapse and select a deployment.
+cd /path/to/my-test-app
+synapse login http://localhost:8080
+synapse select
+
+# Push code, run functions, deploy — all against the selected Synapse backend.
 npx convex dev --once
 npx convex deploy
 ```
+
+`synapse select` lists your teams, projects, and deployments via Synapse's
+existing `/v1` API, then writes `.env.local` with the two
+`CONVEX_SELF_HOSTED_*` values. If the file already has `CONVEX_DEPLOYMENT`,
+the wrapper comments it out so the official CLI doesn't enter the Cloud/Big
+Brain path by accident. You can also use `synapse convex dev` as a direct
+delegating shortcut; it runs `npx convex dev` with conflicting shell env vars
+removed.
 
 Full end-to-end:
 
@@ -151,11 +163,19 @@ NAME=$(curl -sf http://localhost:8080/v1/projects/$PID/deployment \
 mkdir my-test-app && cd my-test-app
 npx create-convex@latest .
 
-# 3. Pull credentials & run the CLI
-eval "$(curl -sf http://localhost:8080/v1/deployments/$NAME/cli_credentials \
+# 3. Let the wrapper write .env.local for the deployment you choose
+synapse login http://localhost:8080
+synapse select
+npx convex dev --once
+```
+
+Synapse still exposes the raw env-var pair on a single endpoint for scripts
+or CI flows that do not want the wrapper:
+
+```bash
+eval "$(curl -sf http://localhost:8080/v1/deployments/<NAME>/cli_credentials \
         -H "Authorization: Bearer $A" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin)["exportSnippet"])')"
-npx convex dev --once
 ```
 
 A `<CliCredentialsPanel>` React component

@@ -1,0 +1,17 @@
+{
+  "name": "synapse",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin CLI wrapper for using the official Convex CLI with Synapse-managed deployments.",
+  "bin": {
+    "synapse": "./bin/synapse.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
