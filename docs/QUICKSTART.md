@@ -107,15 +107,18 @@ curl -sf -X POST http://localhost:8080/v1/teams/my-team/create_project \
   -H "Authorization: Bearer $A" -H 'Content-Type: application/json' \
   -d '{"projectName":"My Project"}'
 
-# Provision a real Convex backend (returns once container is healthy)
+# Provision real Convex backends (dev + prod)
 PID=$(curl -sf http://localhost:8080/v1/teams/my-team/list_projects \
         -H "Authorization: Bearer $A" \
       | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
 curl -sf -X POST http://localhost:8080/v1/projects/$PID/create_deployment \
   -H "Authorization: Bearer $A" -H 'Content-Type: application/json' \
   -d '{"type":"dev","isDefault":true}'
+curl -sf -X POST http://localhost:8080/v1/projects/$PID/create_deployment \
+  -H "Authorization: Bearer $A" -H 'Content-Type: application/json' \
+  -d '{"type":"prod","isDefault":true}'
 
-# A new container appears
+# New containers appear
 docker ps --filter label=synapse.managed=true
 ```
 
@@ -133,40 +136,52 @@ delegating all Convex work to the official `npx convex` package:
 # From the Synapse checkout, install the local wrapper binary once.
 cd cli && npm link
 
-# In a Convex app directory, log in to Synapse and select a deployment.
+# In a Convex app directory, log in to Synapse and link the project.
 cd /path/to/my-test-app
 synapse login http://localhost:8080
 synapse select
 
-# Push code, run functions, deploy — all against the selected Synapse backend.
-npx convex dev --once
-npx convex deploy
+# Development goes to the saved dev deployment; deploy goes to prod.
+synapse convex dev --once
+synapse convex deploy
 ```
 
-`synapse select` lists your teams, projects, and deployments via Synapse's
-existing `/v1` API, then writes `.env.local` with the two
-`CONVEX_SELF_HOSTED_*` values. If the file already has `CONVEX_DEPLOYMENT`,
-the wrapper comments it out so the official CLI doesn't enter the Cloud/Big
-Brain path by accident. You can also use `synapse convex dev` as a direct
-delegating shortcut; it runs `npx convex dev` with conflicting shell env vars
-removed.
+`synapse select` lists your teams and projects via Synapse's existing `/v1`
+API, saves non-secret project metadata in `.synapse/project.json`, and writes
+`.env.local` with the dev deployment's `CONVEX_SELF_HOSTED_*` values as a
+convenience for direct `npx convex dev` use. If the file already has
+`CONVEX_DEPLOYMENT`, the wrapper comments it out so the official CLI doesn't
+enter the Cloud/Big Brain path by accident.
+
+`synapse convex ...` is the safer project-aware path. It fetches fresh
+credentials at runtime and injects them into the official Convex CLI process:
+
+- `synapse convex dev` uses the linked dev deployment.
+- `synapse convex deploy` uses the linked prod deployment.
+- `synapse convex --target dev deploy` overrides the automatic target.
+- Other Convex commands default to dev unless `--target prod` is passed.
+
+The npm package name `synapse` is already taken, so a registry-published
+version should use a package name such as `@iann29/synapse` while keeping the
+binary name as `synapse`. After installing it into an app, `npx synapse convex
+dev` still works because `npx` resolves local package bins first.
 
 Full end-to-end:
 
 ```bash
-# 1. (Already done above) Provision a deployment via Synapse
-NAME=$(curl -sf http://localhost:8080/v1/projects/$PID/deployment \
-        -H "Authorization: Bearer $A" \
-       | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+# 1. (Already done above) Provision dev and prod deployments via Synapse
 
 # 2. Bootstrap a sample app
 mkdir my-test-app && cd my-test-app
 npx create-convex@latest .
 
-# 3. Let the wrapper write .env.local for the deployment you choose
+# 3. Link the app and run against the dev deployment
 synapse login http://localhost:8080
 synapse select
-npx convex dev --once
+synapse convex dev --once
+
+# Production deploys use the linked prod deployment
+synapse convex deploy
 ```
 
 Synapse still exposes the raw env-var pair on a single endpoint for scripts
