@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
 import { CustomDomainsPanel } from "@/components/CustomDomainsPanel";
+import { ProjectDnsCredentialsPanel } from "@/components/ProjectDnsCredentialsPanel";
 import { DeployKeysPanel } from "@/components/DeployKeysPanel";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { ProjectMembersPanel } from "@/components/ProjectMembersPanel";
@@ -481,6 +482,13 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
 
       <hr className="border-neutral-900" />
       <EnvVarsPanel projectId={projectId} />
+
+      {/* Project-scoped DNS credentials (v1.6.4+). Cloudflare tokens
+          registered here live alongside the project — auto-configure
+          on custom domains picks these first before falling back to
+          instance-wide credentials in /admin. */}
+      <hr className="border-neutral-900" />
+      <ProjectDnsCredentialsPanel projectId={projectId} />
 
       {/* Project-level RBAC: per-project admin/member/viewer overrides on
           top of team_members. The panel auto-derives the caller's role

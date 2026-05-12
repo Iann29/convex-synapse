@@ -101,6 +101,13 @@ const (
 	ActionAddDNSCredential    = "dns_credential.added"
 	ActionRemoveDNSCredential = "dns_credential.removed"
 
+	// Project-scoped DNS-provider credentials (v1.6.4+, migration 000016).
+	// Distinct from the instance-wide actions above so a team's audit
+	// feed only carries credential events for that team's projects.
+	// Metadata.projectId is always set for these rows.
+	ActionAddProjectDNSCredential    = "project_dns_credential.added"
+	ActionRemoveProjectDNSCredential = "project_dns_credential.removed"
+
 	// Instance-level upgrade flow (v1.1.0+). Synapse-original — Cloud has
 	// no per-customer upgrade because Cloud is the platform.
 	ActionUpgradeStarted = "upgradeStarted"

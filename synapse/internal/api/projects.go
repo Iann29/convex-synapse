@@ -24,9 +24,10 @@ import (
 //     to keep the URL hierarchy intact
 //   - project-scoped (/v1/projects/{id}/...) lives here
 type ProjectsHandler struct {
-	DB          *pgxpool.Pool
-	Deployments *DeploymentsHandler
-	Tokens      *AccessTokensHandler
+	DB             *pgxpool.Pool
+	Deployments    *DeploymentsHandler
+	Tokens         *AccessTokensHandler
+	DNSCredentials *DNSCredentialsHandler
 }
 
 // canAdminProject is true for full administrators of a project.
@@ -95,6 +96,15 @@ func (h *ProjectsHandler) Routes() chi.Router {
 		r.Get("/access_tokens", h.listProjectAccessTokens)
 		r.Post("/app_access_tokens", h.createAppAccessToken)
 		r.Get("/app_access_tokens", h.listAppAccessTokens)
+		// Project-scoped DNS credentials (v1.6.4+). Mirror of
+		// /v1/admin/dns_credentials but gated to project admins so
+		// each project's keys live alongside the project. The
+		// auto-configure flow prefers project rows over instance-wide.
+		if h.DNSCredentials != nil {
+			r.Get("/dns_credentials", h.listProjectDNSCredentials)
+			r.Post("/dns_credentials/cloudflare", h.createProjectDNSCredential)
+			r.Delete("/dns_credentials/{id}", h.deleteProjectDNSCredential)
+		}
 		if h.Deployments != nil {
 			h.Deployments.MountProjectScopedRoutes(r)
 		}
@@ -1122,4 +1132,62 @@ func normaliseProjectRole(role string) (string, error) {
 	default:
 		return "", errors.New("role must be 'admin', 'member', or 'viewer'")
 	}
+}
+
+// ---------- v1/projects/{id}/dns_credentials (v1.6.4+) ----------
+//
+// Project-scoped variants of the /v1/admin/dns_credentials endpoints.
+// Gating differs:
+//   - GET /dns_credentials       → any project member (read-only list)
+//   - POST /dns_credentials/...  → project admin (canAdminProject)
+//   - DELETE /dns_credentials/.. → project admin (canAdminProject)
+//
+// Read access is broader than write so a project member running
+// `npx convex` can see whether DNS auto-configure is going to pick
+// up a credential without needing admin rights. The token value
+// never crosses the wire either way — only metadata.
+//
+// The heavy lifting (verify token, list zones, encrypt, insert) is
+// delegated to DNSCredentialsHandler.{ListForProject,
+// CreateCloudflareForProject, DeleteScoped} which carries the
+// scope through to the SQL so we can't accidentally leak between
+// projects via UUID-guessing.
+
+func (h *ProjectsHandler) listProjectDNSCredentials(w http.ResponseWriter, r *http.Request) {
+	p, _, _, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	h.DNSCredentials.ListForProject(w, r, p.ID)
+}
+
+func (h *ProjectsHandler) createProjectDNSCredential(w http.ResponseWriter, r *http.Request) {
+	p, _, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only project admins can add DNS credentials")
+		return
+	}
+	h.DNSCredentials.CreateCloudflareForProject(w, r, p.ID)
+}
+
+func (h *ProjectsHandler) deleteProjectDNSCredential(w http.ResponseWriter, r *http.Request) {
+	p, _, role, ok := h.loadProjectForRequest(w, r)
+	if !ok {
+		return
+	}
+	if !canAdminProject(role) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"Only project admins can remove DNS credentials")
+		return
+	}
+	// Pass the project ID through so DeleteScoped's WHERE clause
+	// matches only this project's rows — even if the caller passes
+	// a UUID belonging to another project (or the admin pool), the
+	// DELETE hits zero rows and we return 404.
+	pid := p.ID
+	h.DNSCredentials.DeleteScoped(w, r, &pid, audit.ActionRemoveProjectDNSCredential)
 }

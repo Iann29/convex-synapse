@@ -77,10 +77,22 @@ type listDNSCredentialsResp struct {
 	Credentials []models.DNSCredential `json:"credentials"`
 }
 
+// dnsCredentialSelectCols keeps the SELECT column list for
+// scanDNSCredentialRow in one place. project_id was added in
+// migration 000016; the column is NULL for instance-wide credentials
+// (the v1.5 default) and non-NULL for project-scoped rows added via
+// /v1/projects/{id}/dns_credentials.
+const dnsCredentialSelectCols = `id, provider, label, project_id, zones, created_by, created_at, last_used_at, last_error`
+
+// /v1/admin/dns_credentials returns only instance-wide credentials
+// (project_id IS NULL). Project-scoped rows are exposed via
+// /v1/projects/{id}/dns_credentials so each project admin sees only
+// their own keys.
 func (h *DNSCredentialsHandler) list(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.DB.Query(r.Context(), `
-		SELECT id, provider, label, zones, created_by, created_at, last_used_at, last_error
+		SELECT `+dnsCredentialSelectCols+`
 		FROM dns_credentials
+		WHERE project_id IS NULL
 		ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -106,19 +118,22 @@ func (h *DNSCredentialsHandler) list(w http.ResponseWriter, r *http.Request) {
 }
 
 // scanDNSCredentialRow centralises the row scan so the column list
-// stays in one place. zones is decoded from JSONB.
+// stays in one place. zones is decoded from JSONB; project_id is
+// nullable (NULL for instance-wide credentials).
 func scanDNSCredentialRow(row pgx.Row) (models.DNSCredential, error) {
 	var c models.DNSCredential
+	var projectID *string
 	var createdBy *string
 	var lastUsedAt *time.Time
 	var lastError *string
 	var zonesRaw []byte
 	if err := row.Scan(
-		&c.ID, &c.Provider, &c.Label, &zonesRaw,
+		&c.ID, &c.Provider, &c.Label, &projectID, &zonesRaw,
 		&createdBy, &c.CreatedAt, &lastUsedAt, &lastError,
 	); err != nil {
 		return models.DNSCredential{}, err
 	}
+	c.ProjectID = projectID
 	c.CreatedBy = createdBy
 	c.LastUsedAt = lastUsedAt
 	if lastError != nil {
@@ -141,13 +156,28 @@ type createCloudflareCredentialReq struct {
 	Label string `json:"label"`
 }
 
+// createCloudflare is the /v1/admin/dns_credentials/cloudflare path:
+// creates an instance-wide credential (project_id NULL). The mirror
+// path for project-scoped credentials lives on ProjectsHandler and
+// reuses createCloudflareScoped.
 func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.Request) {
+	h.createCloudflareScoped(w, r, nil, audit.ActionAddDNSCredential)
+}
+
+// createCloudflareScoped is the shared verify-token → list-zones →
+// encrypt → insert path used by both the instance-wide endpoint
+// (projectID = nil) and the per-project endpoint (projectID = the
+// project UUID). Audit action is overridable so the per-project
+// flow can emit a distinct ActionAddProjectDNSCredential row,
+// keeping the team audit feed honest about which scope changed.
+func (h *DNSCredentialsHandler) createCloudflareScoped(w http.ResponseWriter, r *http.Request, projectID *string, action string) {
 	// Trace each entry so a fresh-install 500 in the field gives the
 	// operator a clear server-side breadcrumb to share without needing
 	// to attach a debugger.
 	slog.Default().Info("dns_credentials: createCloudflare entry",
 		"crypto_configured", h.Crypto != nil,
-		"factory_configured", h.CloudflareFactory != nil)
+		"factory_configured", h.CloudflareFactory != nil,
+		"project_scoped", projectID != nil)
 
 	if h.Crypto == nil {
 		// Without a SecretBox we can't safely persist the token —
@@ -224,15 +254,18 @@ func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.
 		creator = uid
 	}
 
+	// projectID is *string; pgx converts a nil pointer to SQL NULL.
+	// Pass the pointer directly rather than dereferencing to preserve
+	// that distinction.
 	var (
 		id        string
 		createdAt time.Time
 	)
 	err = h.DB.QueryRow(r.Context(), `
-		INSERT INTO dns_credentials (provider, label, token_encrypted, zones, created_by)
-		VALUES ('cloudflare', $1, $2, $3, $4)
+		INSERT INTO dns_credentials (provider, label, project_id, token_encrypted, zones, created_by)
+		VALUES ('cloudflare', $1, $2, $3, $4, $5)
 		RETURNING id, created_at
-	`, label, encrypted, zonesJSON, creator).Scan(&id, &createdAt)
+	`, label, projectID, encrypted, zonesJSON, creator).Scan(&id, &createdAt)
 	if err != nil {
 		logErr("insert dns credential", err)
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -240,22 +273,27 @@ func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.
 		return
 	}
 
+	auditMeta := map[string]any{
+		"provider":  "cloudflare",
+		"label":     label,
+		"zoneCount": len(zones),
+	}
+	if projectID != nil {
+		auditMeta["projectId"] = *projectID
+	}
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
 		ActorID:    uid,
-		Action:     audit.ActionAddDNSCredential,
+		Action:     action,
 		TargetType: audit.TargetDNSCredential,
 		TargetID:   id,
-		Metadata: map[string]any{
-			"provider":  "cloudflare",
-			"label":     label,
-			"zoneCount": len(zones),
-		},
+		Metadata:   auditMeta,
 	})
 
 	out := models.DNSCredential{
 		ID:        id,
 		Provider:  "cloudflare",
 		Label:     label,
+		ProjectID: projectID,
 		Zones:     zones,
 		CreatedAt: createdAt,
 	}
@@ -265,7 +303,21 @@ func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusCreated, out)
 }
 
+// delete is the /v1/admin/dns_credentials/{id} path: removes an
+// instance-wide credential. Project-scoped credentials are deleted
+// via DeleteScoped called from ProjectsHandler so the route-level
+// project_id check happens there.
 func (h *DNSCredentialsHandler) delete(w http.ResponseWriter, r *http.Request) {
+	h.DeleteScoped(w, r, nil, audit.ActionRemoveDNSCredential)
+}
+
+// DeleteScoped runs the same in-use check + DELETE flow as `delete`
+// but optionally constrains the row's project_id. When projectID is
+// non-nil, the DELETE will only match rows owned by that project —
+// otherwise it'd be possible for a project admin to remove a
+// credential from another project (or instance-wide) by guessing
+// its UUID. When nil, only instance-wide rows match.
+func (h *DNSCredentialsHandler) DeleteScoped(w http.ResponseWriter, r *http.Request, projectID *string, action string) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing_id", "credential id is required")
@@ -293,15 +345,21 @@ func (h *DNSCredentialsHandler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Scope guard: the DELETE matches both id AND project_id, so a
+	// project admin can't reach into other projects (or the admin
+	// pool) by guessing UUIDs. NULL = "match only instance-wide rows"
+	// for the admin endpoint.
 	var (
 		provider string
 		label    string
 	)
-	err := h.DB.QueryRow(r.Context(), `
+	const sqlWithScope = `
 		DELETE FROM dns_credentials
 		WHERE id = $1
+		  AND project_id IS NOT DISTINCT FROM $2
 		RETURNING provider, label
-	`, id).Scan(&provider, &label)
+	`
+	err := h.DB.QueryRow(r.Context(), sqlWithScope, id, projectID).Scan(&provider, &label)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "credential_not_found",
@@ -315,16 +373,57 @@ func (h *DNSCredentialsHandler) delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uid, _ := auth.UserID(r.Context())
+	auditMeta := map[string]any{
+		"provider": provider,
+		"label":    label,
+	}
+	if projectID != nil {
+		auditMeta["projectId"] = *projectID
+	}
 	_ = audit.Record(r.Context(), h.DB, audit.Options{
 		ActorID:    uid,
-		Action:     audit.ActionRemoveDNSCredential,
+		Action:     action,
 		TargetType: audit.TargetDNSCredential,
 		TargetID:   id,
-		Metadata: map[string]any{
-			"provider": provider,
-			"label":    label,
-		},
+		Metadata:   auditMeta,
 	})
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListForProject is the project-scoped variant of list. Mounted on
+// ProjectsHandler under /v1/projects/{id}/dns_credentials.
+func (h *DNSCredentialsHandler) ListForProject(w http.ResponseWriter, r *http.Request, projectID string) {
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT `+dnsCredentialSelectCols+`
+		FROM dns_credentials
+		WHERE project_id = $1
+		ORDER BY created_at DESC
+	`, projectID)
+	if err != nil {
+		logErr("list project dns credentials", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to list DNS credentials")
+		return
+	}
+	defer rows.Close()
+
+	out := make([]models.DNSCredential, 0, 4)
+	for rows.Next() {
+		c, err := scanDNSCredentialRow(rows)
+		if err != nil {
+			logErr("scan project dns credential", err)
+			writeError(w, http.StatusInternalServerError, "internal",
+				"Failed to read DNS credentials")
+			return
+		}
+		out = append(out, c)
+	}
+	writeJSON(w, http.StatusOK, listDNSCredentialsResp{Credentials: out})
+}
+
+// CreateCloudflareForProject is the project-scoped variant of
+// createCloudflare. Mounted on ProjectsHandler.
+func (h *DNSCredentialsHandler) CreateCloudflareForProject(w http.ResponseWriter, r *http.Request, projectID string) {
+	h.createCloudflareScoped(w, r, &projectID, audit.ActionAddProjectDNSCredential)
 }

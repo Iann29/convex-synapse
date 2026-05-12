@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -389,7 +390,7 @@ func (h *DomainsHandler) createDomain(w http.ResponseWriter, r *http.Request) {
 	// path. Best-effort — silent skip on any precondition miss; the
 	// existing /domains/{id}/auto_configure endpoint stays the manual
 	// fallback for re-tries.
-	autoOutcome := h.tryAutoConfigureOnCreate(r.Context(), id, domainCanonical)
+	autoOutcome := h.tryAutoConfigureOnCreate(r.Context(), id, domainCanonical, d.ProjectID)
 	if autoOutcome != nil && autoOutcome.success {
 		// Re-read the row so the response carries the post-update
 		// auto_configured + dns_credential_id columns. Status went
@@ -461,12 +462,12 @@ type autoConfigureOnCreateOutcome struct {
 // retry path; tryAutoConfigureOnCreate exists only to remove the
 // "operator added a domain and now has to click another button" UX
 // papercut.
-func (h *DomainsHandler) tryAutoConfigureOnCreate(ctx context.Context, domainID, domainName string) *autoConfigureOnCreateOutcome {
+func (h *DomainsHandler) tryAutoConfigureOnCreate(ctx context.Context, domainID, domainName, projectID string) *autoConfigureOnCreateOutcome {
 	if h.Crypto == nil || h.PublicIP == "" {
 		return nil
 	}
 
-	cred, code, _, _ := h.resolveCredentialForDomain(ctx, "", domainName)
+	cred, code, _, _ := h.resolveCredentialForDomain(ctx, "", domainName, projectID)
 	if code != "" {
 		// 0 matches or 2+ matches — neither is a failure to surface
 		// inline; the operator can still do it manually.
@@ -824,7 +825,7 @@ func (h *DomainsHandler) autoConfigureDomain(w http.ResponseWriter, r *http.Requ
 	// Resolve the credential. With CredentialID set we look up that
 	// row directly; otherwise we ask the DB to find the unique
 	// credential whose zones cover this domain's apex.
-	cred, code, msg, status := h.resolveCredentialForDomain(r.Context(), req.CredentialID, domainName)
+	cred, code, msg, status := h.resolveCredentialForDomain(r.Context(), req.CredentialID, domainName, d.ProjectID)
 	if code != "" {
 		writeError(w, status, code, msg)
 		return
@@ -939,25 +940,43 @@ type dnsCredentialForAuto struct {
 }
 
 // resolveCredentialForDomain implements the credential-selection rules
-// described in the brief:
+// for the auto-configure flow. v1.6.4+ added project-scoped credentials,
+// which take precedence over instance-wide ones via a two-tier lookup:
 //
-//   - credential_id provided → fetch that row, error 404 if missing
-//   - credential_id empty + exactly one credential whose zone covers
-//     the domain → use it
-//   - credential_id empty + zero matches → 400 no_credential_for_zone
-//   - credential_id empty + 2+ matches → 400 credential_required
+//   - credential_id provided → fetch that row, but only if the row is
+//     visible to this project (its own row, or an instance-wide row).
+//     A row belonging to *another* project surfaces as 404 — UUIDs are
+//     unguessable but the check makes scope leaks impossible by
+//     construction.
+//   - credential_id empty → first try project-scoped rows; if any cover
+//     the zone, those are the candidate set. Only when zero project rows
+//     match do we fall back to instance-wide rows. Within whichever tier
+//     wins:
+//       0 matches  → 400 no_credential_for_zone
+//       1 match    → use it
+//       2+ matches → 400 credential_required (pass credentialId)
+//
+// projectID being "" means "no project context" (legacy path / instance
+// admin) and skips the project tier entirely.
 //
 // Returns either a populated dnsCredentialForAuto OR (code, msg, status)
-// for writeError. The dual-return shape mirrors validateDomain in the
-// same file.
-func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credentialID, domainName string) (dnsCredentialForAuto, string, string, int) {
+// for writeError.
+func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credentialID, domainName, projectID string) (dnsCredentialForAuto, string, string, int) {
 	if credentialID != "" {
+		// Scope guard: the row must belong to this project OR be
+		// instance-wide. The IS NOT DISTINCT FROM trick lets us pass
+		// "" for the legacy / admin path and still match NULL.
 		var c dnsCredentialForAuto
 		var zonesRaw []byte
+		var pid sql.NullString
+		if projectID != "" {
+			pid = sql.NullString{String: projectID, Valid: true}
+		}
 		err := h.DB.QueryRow(ctx, `
 			SELECT id, zones, token_encrypted FROM dns_credentials
 			WHERE id = $1
-		`, credentialID).Scan(&c.id, &zonesRaw, &c.tokenEncrypted)
+			  AND (project_id IS NULL OR project_id = $2)
+		`, credentialID, pid).Scan(&c.id, &zonesRaw, &c.tokenEncrypted)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return dnsCredentialForAuto{}, "credential_not_found",
@@ -973,13 +992,15 @@ func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credent
 		return c, "", "", 0
 	}
 
-	// Auto-pick: list all credentials, walk in-memory. The set is
-	// expected to be tiny (single-tenant operator is the target),
-	// so a SQL-level zone match isn't worth the JSONB query
-	// complexity.
+	// Auto-pick with two-tier hierarchy: project-scoped wins, fall
+	// through to instance-wide. We do one DB read returning both tiers
+	// + a flag, then split in-memory. Avoids the chatty "query
+	// project, count, maybe query global" round-trip pattern.
 	rows, err := h.DB.Query(ctx, `
-		SELECT id, zones, token_encrypted FROM dns_credentials
-	`)
+		SELECT id, zones, token_encrypted, (project_id IS NOT NULL) AS is_project_scoped
+		  FROM dns_credentials
+		 WHERE project_id IS NULL OR project_id = $1
+	`, sql.NullString{String: projectID, Valid: projectID != ""})
 	if err != nil {
 		logErr("list credentials for auto-pick", err)
 		return dnsCredentialForAuto{}, "internal",
@@ -987,11 +1008,12 @@ func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credent
 	}
 	defer rows.Close()
 
-	var matches []dnsCredentialForAuto
+	var projectMatches, globalMatches []dnsCredentialForAuto
 	for rows.Next() {
 		var c dnsCredentialForAuto
 		var zonesRaw []byte
-		if err := rows.Scan(&c.id, &zonesRaw, &c.tokenEncrypted); err != nil {
+		var isProjectScoped bool
+		if err := rows.Scan(&c.id, &zonesRaw, &c.tokenEncrypted, &isProjectScoped); err != nil {
 			logErr("scan credential", err)
 			return dnsCredentialForAuto{}, "internal",
 				"Failed to read DNS credentials", http.StatusInternalServerError
@@ -999,16 +1021,30 @@ func (h *DomainsHandler) resolveCredentialForDomain(ctx context.Context, credent
 		if len(zonesRaw) > 0 {
 			_ = json.Unmarshal(zonesRaw, &c.zones)
 		}
-		if _, _, ok := longestMatchingZone(domainName, c.zones); ok {
-			matches = append(matches, c)
+		if _, _, ok := longestMatchingZone(domainName, c.zones); !ok {
+			continue
+		}
+		if isProjectScoped {
+			projectMatches = append(projectMatches, c)
+		} else {
+			globalMatches = append(globalMatches, c)
 		}
 	}
-	switch len(matches) {
+
+	// Hierarchy: project tier wins if it has any matches. Only when
+	// the project tier is empty do we look at globals. This is the
+	// agency model — "credentials for client X live in client X's
+	// project" — without sacrificing the v1.5 single-cred install.
+	candidates := projectMatches
+	if len(candidates) == 0 {
+		candidates = globalMatches
+	}
+	switch len(candidates) {
 	case 0:
 		return dnsCredentialForAuto{}, "no_credential_for_zone",
 			"No saved DNS credential covers the apex of " + domainName, http.StatusBadRequest
 	case 1:
-		return matches[0], "", "", 0
+		return candidates[0], "", "", 0
 	default:
 		return dnsCredentialForAuto{}, "credential_required",
 			"Multiple DNS credentials cover this domain; pass credentialId to disambiguate",

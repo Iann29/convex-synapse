@@ -169,6 +169,7 @@ type dnsCredentialResp struct {
 	ID         string                  `json:"id"`
 	Provider   string                  `json:"provider"`
 	Label      string                  `json:"label"`
+	ProjectID  *string                 `json:"projectId,omitempty"`
 	Zones      []dnsCredentialZoneInfo `json:"zones"`
 	CreatedBy  *string                 `json:"createdBy,omitempty"`
 	CreatedAt  time.Time               `json:"createdAt"`

@@ -250,9 +250,14 @@ type DeploymentDomain struct {
 // LastUsedAt + LastError are populated by the auto-configure flow and
 // surface as "credential health" indicators in the panel.
 type DNSCredential struct {
-	ID         string     `json:"id"`
-	Provider   string     `json:"provider"`
-	Label      string     `json:"label"`
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Label    string `json:"label"`
+	// ProjectID is non-nil when the credential is scoped to a single
+	// project (v1.6.4+). Nil = instance-wide (managed under /v1/admin/
+	// dns_credentials). The lookup hierarchy is project-scoped first,
+	// then instance-wide as fallback, matched by zone coverage.
+	ProjectID  *string    `json:"projectId,omitempty"`
 	Zones      []ZoneInfo `json:"zones"`
 	CreatedBy  *string    `json:"createdBy,omitempty"`
 	CreatedAt  time.Time  `json:"createdAt"`
