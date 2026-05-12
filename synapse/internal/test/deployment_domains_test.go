@@ -3,6 +3,7 @@ package synapsetest
 import (
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,6 +27,14 @@ type domainResp struct {
 	CreatedAt                  time.Time  `json:"createdAt"`
 	UpdatedAt                  time.Time  `json:"updatedAt"`
 	DeploymentRestartTriggered bool       `json:"deploymentRestartTriggered,omitempty"`
+	// AutoDNS* fields are set only on POST /domains when the handler
+	// tried to mint the A record inline. Verify/list/delete responses
+	// leave them zero; DisallowUnknownFields would reject if missing.
+	AutoDNSAttempted    bool   `json:"autoDnsAttempted,omitempty"`
+	AutoDNSSuccess      bool   `json:"autoDnsSuccess,omitempty"`
+	AutoDNSReason       string `json:"autoDnsReason,omitempty"`
+	AutoDNSCredentialID string `json:"autoDnsCredentialId,omitempty"`
+	AutoDNSZone         string `json:"autoDnsZone,omitempty"`
 }
 
 type listDomainsResp struct {
@@ -348,5 +357,161 @@ func TestDomains_AuditEvents(t *testing.T) {
 	}
 	if removedCount != 1 {
 		t.Errorf("expected 1 domain.removed event, got %d", removedCount)
+	}
+}
+
+// ---------- Bug C: inline auto-DNS on createDomain ----------
+
+// Happy path: operator added a Cloudflare credential covering the
+// zone; POST /domains should mint the A record inline + flag the row
+// auto_configured. Removes the manual "click another button" UX
+// papercut.
+func TestDomain_Create_InlineAutoConfig_Success(t *testing.T) {
+	upsertHits := int64(0)
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "fechasul.com.br"}},
+		upsertHits:   &upsertHits,
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		PublicIP:          "203.0.113.10",
+	})
+	owner := makeAdminUser(t, h)
+
+	// Save the credential before adding the domain.
+	var cred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/admin/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "L"},
+		http.StatusCreated, &cred)
+
+	team := createTeam(t, h, owner.AccessToken, "DomCreateAuto Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "InlineCfg")
+	depName := "auto-create-" + randHex(3)
+	h.SeedDeployment(proj.ID, depName, "prod", "running", true, owner.ID, 3970, "")
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.fechasul.com.br", "role": "api"},
+		http.StatusCreated, &got)
+
+	if !got.AutoDNSAttempted {
+		t.Errorf("expected autoDnsAttempted=true (credential covers zone, Crypto + PublicIP set)")
+	}
+	if !got.AutoDNSSuccess {
+		t.Errorf("expected autoDnsSuccess=true, got reason=%q", got.AutoDNSReason)
+	}
+	if got.AutoDNSCredentialID != cred.ID {
+		t.Errorf("autoDnsCredentialId: got %q want %q", got.AutoDNSCredentialID, cred.ID)
+	}
+	if got.AutoDNSZone != "fechasul.com.br" {
+		t.Errorf("autoDnsZone: got %q want fechasul.com.br", got.AutoDNSZone)
+	}
+	if !got.AutoConfigured {
+		t.Errorf("expected row auto_configured=true after inline mint")
+	}
+	if got.DNSCredentialID == nil || *got.DNSCredentialID != cred.ID {
+		t.Errorf("expected dnsCredentialId persisted on row, got %v", got.DNSCredentialID)
+	}
+	// Status goes back to pending so the verifier loop picks it up
+	// once DNS propagates — same shape as the manual /auto_configure
+	// endpoint.
+	if got.Status != "pending" {
+		t.Errorf("status: got %q want pending (auto_configured rows reset to pending for verifier loop)", got.Status)
+	}
+	if atomic.LoadInt64(&upsertHits) != 1 {
+		t.Errorf("expected exactly 1 Cloudflare upsert, got %d", atomic.LoadInt64(&upsertHits))
+	}
+}
+
+// No credential covering the zone → silent skip. Row should land in
+// the "manual" path exactly like before (status=pending with the
+// publicIP-not-configured-style hint, AutoDNS* fields zero/omitted).
+func TestDomain_Create_InlineAutoConfig_NoCredentialMatch(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "different-zone.com"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		PublicIP:          "203.0.113.10",
+	})
+	owner := makeAdminUser(t, h)
+
+	// Credential is for different-zone.com; the domain we add is
+	// api.fechasul.com.br — no match.
+	var cred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/admin/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "L"},
+		http.StatusCreated, &cred)
+
+	team := createTeam(t, h, owner.AccessToken, "DomNoMatch Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "NoMatch")
+	depName := "auto-nomatch-" + randHex(3)
+	h.SeedDeployment(proj.ID, depName, "prod", "running", true, owner.ID, 3971, "")
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.fechasul.com.br", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.AutoDNSAttempted {
+		t.Errorf("expected silent skip (no credential covers zone), got attempted=true")
+	}
+	if got.AutoConfigured {
+		t.Errorf("expected auto_configured=false on no-match path")
+	}
+	if got.DNSCredentialID != nil {
+		t.Errorf("dnsCredentialId should be nil on no-match path, got %v", got.DNSCredentialID)
+	}
+}
+
+// PublicIP unset → silent skip. Without PublicIP we have nothing to
+// point the A record at, so the inline path can't run. Row stays in
+// the manual path with the publicIP-not-configured hint.
+func TestDomain_Create_InlineAutoConfig_NoPublicIP(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "fechasul.com.br"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		// PublicIP intentionally left unset.
+	})
+	owner := makeAdminUser(t, h)
+
+	var cred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/admin/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "L"},
+		http.StatusCreated, &cred)
+
+	team := createTeam(t, h, owner.AccessToken, "DomNoIP Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "NoIP")
+	depName := "auto-noip-" + randHex(3)
+	h.SeedDeployment(proj.ID, depName, "prod", "running", true, owner.ID, 3972, "")
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.fechasul.com.br", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.AutoDNSAttempted {
+		t.Errorf("expected silent skip (PublicIP unset), got attempted=true")
+	}
+	// And the existing pending-with-hint behaviour is preserved.
+	if got.Status != "pending" {
+		t.Errorf("status: got %q want pending", got.Status)
+	}
+	if !strings.Contains(got.LastDNSError, "SYNAPSE_PUBLIC_IP") {
+		t.Errorf("expected last_dns_error to mention SYNAPSE_PUBLIC_IP, got %q", got.LastDNSError)
 	}
 }

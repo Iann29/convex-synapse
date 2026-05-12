@@ -269,6 +269,170 @@ func TestDeployments_CLICredentialsBaseDomainURL(t *testing.T) {
 	}
 }
 
+// Custom api-role domain wins over every other URL form when active.
+// This is the operator-friendly path: they set api.<client>.com on the
+// deployment, pointed DNS, and Caddy issues TLS — the snippet should
+// hand `https://api.<client>.com` to the CLI, not host:port (which
+// requires the dynamic backend port to be open in the firewall) or the
+// random `<name>.<BaseDomain>` (which is ugly and nobody memorizes).
+func TestDeployments_CLICredentialsPrefersActiveAPIDomain(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		// Both PublicURL+HostPort and BaseDomain are set so we can prove
+		// the custom-domain branch wins over the others, not just over
+		// the empty case.
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+		BaseDomain:   "convex.example.com",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIDomain Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	depID := h.SeedDeployment(proj.ID, "cli-cat-7000", "prod", "running", true, owner.ID, 3310, "key-cd")
+
+	// Seed an active api-role domain row. Mimics what
+	// /v1/deployments/{name}/domains would create then verify.
+	insertDomain(t, h, depID, "api.example.com", "api", "active")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-cat-7000/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	wantURL := "https://api.example.com"
+	if got.ConvexURL != wantURL {
+		t.Errorf("convexUrl: got %q want %q (custom api domain must win over BaseDomain + PublicURL)",
+			got.ConvexURL, wantURL)
+	}
+	// Sanity: the URL must NOT carry the deployment name or a port —
+	// custom domain is the whole story.
+	if strings.Contains(got.ConvexURL, "cli-cat-7000") {
+		t.Errorf("custom-domain URL should not embed deployment name: %q", got.ConvexURL)
+	}
+	if strings.Contains(got.ConvexURL, ":3310") {
+		t.Errorf("custom-domain URL should not embed host port: %q", got.ConvexURL)
+	}
+}
+
+// Pending domain rows must NOT be used. Domains start in 'pending' until
+// DNS verification succeeds — using them prematurely would emit a URL
+// that doesn't resolve. Should fall through to the legacy decision.
+func TestDeployments_CLICredentialsIgnoresPendingDomain(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIPending Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	depID := h.SeedDeployment(proj.ID, "cli-owl-7100", "dev", "running", false, owner.ID, 3311, "key-pd")
+
+	insertDomain(t, h, depID, "api-pending.example.com", "api", "pending")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-owl-7100/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	// Pending row ignored → falls through to PublicURL+HostPort path.
+	wantURL := "http://synapse.example.com:3311"
+	if got.ConvexURL != wantURL {
+		t.Errorf("convexUrl: got %q want %q (pending domain must be ignored)", got.ConvexURL, wantURL)
+	}
+}
+
+// dashboard-role domains route to the Convex Dashboard container, NOT the
+// backend — using one as the CLI URL would point `npx convex` at a UI
+// that doesn't speak `/api/...`. Must fall through.
+func TestDeployments_CLICredentialsIgnoresDashboardRoleDomain(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "CLIDashRole Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	depID := h.SeedDeployment(proj.ID, "cli-bee-7200", "dev", "running", false, owner.ID, 3312, "key-dr")
+
+	insertDomain(t, h, depID, "dash.example.com", "dashboard", "active")
+
+	var got cliCredentialsResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/cli-bee-7200/cli_credentials",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	wantURL := "http://synapse.example.com:3312"
+	if got.ConvexURL != wantURL {
+		t.Errorf("convexUrl: got %q want %q (dashboard-role domain must be ignored)", got.ConvexURL, wantURL)
+	}
+}
+
+// /auth feeds the embedded Convex Dashboard via postMessage. The dashboard
+// upstream uses `new URL("/api/...", deploymentUrl)` — host-anchored, same
+// trap as the CLI. With ProxyEnabled on, the legacy publicDeploymentURL
+// would have emitted `<host>/d/<name>`, which silently drops the path
+// when the dashboard composes API URLs. /auth must return a root URL.
+func TestDeployments_AuthReturnsRootURLNotProxyPath(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "AuthRoot Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	h.SeedDeployment(proj.ID, "auth-fox-8000", "dev", "running", false, owner.ID, 3320, "key-auth-rt")
+
+	var got deploymentAuthResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/auth-fox-8000/auth",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	wantURL := "http://synapse.example.com:3320"
+	if got.DeploymentURL != wantURL {
+		t.Errorf("deploymentUrl: got %q want %q (must be root URL — no /d/ proxy form)",
+			got.DeploymentURL, wantURL)
+	}
+	if strings.Contains(got.DeploymentURL, "/d/") {
+		t.Errorf("/auth must not return /d/<name> proxy form (Convex Dashboard would 404 on /api/*): %q",
+			got.DeploymentURL)
+	}
+}
+
+// /auth must also honour active api-role custom domains (same precedence
+// as cli_credentials). This is the production case for the agency: each
+// deployment has api.<client>.com pointed at it, the embedded dashboard
+// should resolve through that domain.
+func TestDeployments_AuthPrefersActiveAPIDomain(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicURL:    "http://synapse.example.com:8080",
+		ProxyEnabled: true,
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "AuthDomain Co")
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "P")
+	depID := h.SeedDeployment(proj.ID, "auth-cat-8100", "prod", "running", true, owner.ID, 3321, "key-auth-cd")
+
+	insertDomain(t, h, depID, "api.client.com", "api", "active")
+
+	var got deploymentAuthResp
+	h.DoJSON(http.MethodGet, "/v1/deployments/auth-cat-8100/auth",
+		owner.AccessToken, nil, http.StatusOK, &got)
+
+	wantURL := "https://api.client.com"
+	if got.DeploymentURL != wantURL {
+		t.Errorf("deploymentUrl: got %q want %q", got.DeploymentURL, wantURL)
+	}
+}
+
+// insertDomain seeds a deployment_domains row directly via SQL so URL-
+// rewrite tests don't have to spin up the full /domains POST + DNS
+// verification flow (which depends on PublicIP being set, etc).
+func insertDomain(t *testing.T, h *Harness, deploymentID, domain, role, status string) {
+	t.Helper()
+	_, err := h.DB.Exec(h.rootCtx, `
+		INSERT INTO deployment_domains (deployment_id, domain, role, status)
+		VALUES ($1, $2, $3, $4)
+	`, deploymentID, domain, role, status)
+	if err != nil {
+		t.Fatalf("insert deployment_domain: %v", err)
+	}
+}
+
 func TestDeployments_CLICredentialsAnonymous401(t *testing.T) {
 	h := Setup(t)
 	owner := h.RegisterRandomUser()

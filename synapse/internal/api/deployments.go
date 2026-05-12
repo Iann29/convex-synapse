@@ -489,28 +489,32 @@ func (h *DeploymentsHandler) publicDeploymentURL(d *models.Deployment) string {
 // the CLI: it'd hit `<host>:8080/api/...` (which is the Synapse API,
 // returning 404) instead of the Convex backend container.
 //
-// To work around it, the CLI snippet bypasses the path proxy entirely
-// and points at the deployment's own host port, which is published on
-// 0.0.0.0:<HostPort> by the provisioner. The Convex backend serves
-// `/api/...` at root there, so `new URL("/api/x", baseUrl)` resolves
-// correctly.
-//
-// Decision matrix mirrors publicDeploymentURL but never falls through
-// to the path-proxy form:
+// Decision matrix (first match wins):
 //   - Adopted                    → d.DeploymentURL (operator-supplied)
+//   - active custom domain api   → "https://<custom_domain>" (preferred — no port,
+//                                  Caddy handles TLS, CLI-OK)
 //   - BaseDomain set             → "https://<name>.<BaseDomain>" (CLI-OK)
-//   - PublicURL set + HostPort>0 → "<PublicURL_host>:<HostPort>" (CLI-OK)
+//   - PublicURL set + HostPort>0 → "<PublicURL_host>:<HostPort>" (CLI-OK,
+//                                  needs the dynamic host port reachable
+//                                  from outside — Hetzner default-deny
+//                                  would block it)
 //   - everything else            → d.DeploymentURL fallback
 //
-// When BaseDomain is the active mode the host port doesn't even need
-// to be reachable from outside — Caddy is the only public endpoint.
-// When PublicURL+HostPort is the active mode the operator's firewall
-// MUST allow inbound on the dynamic host port (Hetzner default-deny
-// would block it). The dashboard surfaces the URL as-is so a failing
-// CLI is the only signal — there is no preflight here.
-func (h *DeploymentsHandler) cliDeploymentURL(d *models.Deployment) string {
+// The custom-domain branch matters most when the operator runs Synapse
+// behind Caddy with on-demand TLS: only :443 is open publicly, so the
+// host:port form would emit an unreachable URL. Custom domain bypasses
+// that entirely — the api.<client>.com form lands on Caddy on :443 and
+// gets routed to the deployment's backend container.
+//
+// On db lookup failure we log + fall back to the legacy decision tree.
+// Better to emit a possibly-wrong URL than 500 the request that asks
+// for credentials.
+func (h *DeploymentsHandler) cliDeploymentURL(ctx context.Context, d *models.Deployment) string {
 	if d.Adopted {
 		return d.DeploymentURL
+	}
+	if domain := h.lookupActiveAPIDomain(ctx, d.ID); domain != "" {
+		return "https://" + domain
 	}
 	if h.BaseDomain != "" {
 		return "https://" + d.Name + "." + h.BaseDomain
@@ -527,6 +531,38 @@ func (h *DeploymentsHandler) cliDeploymentURL(d *models.Deployment) string {
 		return d.DeploymentURL
 	}
 	return fmt.Sprintf("%s://%s:%d", u.Scheme, u.Hostname(), d.HostPort)
+}
+
+// lookupActiveAPIDomain returns the first active custom domain for this
+// deployment with role='api', or "" if none exists / lookup fails. The
+// UNIQUE(domain) constraint means at most one row matches, but we ORDER
+// BY created_at to make the choice deterministic if a future schema
+// change ever drops uniqueness.
+//
+// Returning "" on error instead of propagating keeps the caller's URL
+// helpers infallible — they can't 500 the operator's `synapse select`
+// just because the domains lookup hit a transient db blip.
+func (h *DeploymentsHandler) lookupActiveAPIDomain(ctx context.Context, deploymentID string) string {
+	if h.DB == nil || deploymentID == "" {
+		return ""
+	}
+	var domain string
+	err := h.DB.QueryRow(ctx, `
+		SELECT domain
+		  FROM deployment_domains
+		 WHERE deployment_id = $1
+		   AND role = $2
+		   AND status = $3
+		 ORDER BY created_at ASC
+		 LIMIT 1
+	`, deploymentID, models.DomainRoleAPI, models.DomainStatusActive).Scan(&domain)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			logErr("lookup active api domain", err)
+		}
+		return ""
+	}
+	return domain
 }
 
 // SecretEncrypter is the *crypto.SecretBox subset the handler needs.
@@ -1894,6 +1930,20 @@ type deploymentAuthResp struct {
 	DeploymentType string `json:"deploymentType"`
 }
 
+// deploymentAuth feeds the embedded Convex Dashboard (rendered at
+// /embed/<name>) with the credentials it asks for via postMessage.
+//
+// We deliberately return cliDeploymentURL here, NOT publicDeploymentURL.
+// The Convex Dashboard upstream image builds its API requests with
+// `new URL("/api/...", deploymentUrl)`, which is host-anchored — same
+// trap the CLI hits. If we emitted publicDeploymentURL in proxy mode it
+// would be `<host>/d/<name>`, the dashboard would resolve `/api/...`
+// against `<host>/api/...` (the Synapse API root, not the Convex
+// backend), and the iframe would render blank because every fetch 404s.
+//
+// Using cliDeploymentURL means the dashboard gets the same CLI-OK URL:
+// custom api domain if registered, BaseDomain wildcard if set, or
+// host:port — all of them serve `/api/...` at root.
 func (h *DeploymentsHandler) deploymentAuth(w http.ResponseWriter, r *http.Request) {
 	d, _, _, _, ok := h.loadDeploymentForRequest(w, r)
 	if !ok {
@@ -1901,7 +1951,7 @@ func (h *DeploymentsHandler) deploymentAuth(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, http.StatusOK, deploymentAuthResp{
 		DeploymentName: d.Name,
-		DeploymentURL:  h.publicDeploymentURL(d),
+		DeploymentURL:  h.cliDeploymentURL(r.Context(), d),
 		AdminKey:       d.AdminKey,
 		DeploymentType: d.DeploymentType,
 	})
@@ -1946,7 +1996,7 @@ func (h *DeploymentsHandler) deploymentCLICredentials(w http.ResponseWriter, r *
 	// CLI gets the root-URL form (no /d/<name> path proxy), since the
 	// Convex CLI's `new URL("/api/...", baseUrl)` host-anchors and
 	// would otherwise drop the path prefix.
-	cliURL := h.cliDeploymentURL(d)
+	cliURL := h.cliDeploymentURL(r.Context(), d)
 	exportSnippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
 		"export CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(d.AdminKey)
 	envSnippet := "CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
@@ -2144,7 +2194,7 @@ func (h *DeploymentsHandler) createDeployKey(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	cliURL := h.cliDeploymentURL(d)
+	cliURL := h.cliDeploymentURL(r.Context(), d)
 	envSnippet := "CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
 		"CONVEX_SELF_HOSTED_ADMIN_KEY=" + shellQuote(adminKey)
 	exportSnippet := "export CONVEX_SELF_HOSTED_URL=" + shellQuote(cliURL) + "\n" +
