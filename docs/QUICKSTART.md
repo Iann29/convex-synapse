@@ -130,7 +130,12 @@ set (and `CONVEX_DEPLOYMENT` is **not**), the CLI skips Big Brain and talks
 straight to the deployment.
 
 The thin Synapse CLI wrapper in `cli/` automates that setup while still
-delegating all Convex work to the official `npx convex` package:
+delegating all Convex work to the official `npx convex` package.
+
+The package name is scoped as `@iann29/synapse` because `synapse` is already
+taken on npm, but the installed binary is still named `synapse`.
+
+Local repo development:
 
 ```bash
 # From the Synapse checkout, install the local wrapper binary once.
@@ -140,10 +145,42 @@ cd cli && npm link
 cd /path/to/my-test-app
 synapse login http://localhost:8080
 synapse select
+```
+
+Or install the local checkout into one app without a global link:
+
+```bash
+cd /path/to/my-test-app
+npm install -D /path/to/convex-synapse/cli
+npx synapse login http://localhost:8080
+npx synapse select
+```
+
+Per-project install, once the package is published to npm:
+
+```bash
+cd /path/to/my-test-app
+npm install -D @iann29/synapse
+npx synapse login http://localhost:8080
+npx synapse select
+```
+
+Until the package is published to npm, install the release tarball directly:
+
+```bash
+cd /path/to/my-test-app
+npm install -D https://github.com/Iann29/convex-synapse/releases/download/v1.6.2/iann29-synapse-1.6.2.tgz
+npx synapse login http://localhost:8080
+npx synapse select
+```
+
+After `synapse select`:
+
+```bash
 
 # Development goes to the saved dev deployment; deploy goes to prod.
-synapse convex dev --once
-synapse convex deploy
+npx synapse convex dev --once
+npx synapse convex deploy
 ```
 
 `synapse select` lists your teams and projects via Synapse's existing `/v1`
@@ -161,10 +198,13 @@ credentials at runtime and injects them into the official Convex CLI process:
 - `synapse convex --target dev deploy` overrides the automatic target.
 - Other Convex commands default to dev unless `--target prod` is passed.
 
-The npm package name `synapse` is already taken, so a registry-published
-version should use a package name such as `@iann29/synapse` while keeping the
-binary name as `synapse`. After installing it into an app, `npx synapse convex
-dev` still works because `npx` resolves local package bins first.
+After installing the package into an app, `npx synapse convex dev` works
+because `npx` resolves local package bins first. For one-off use without
+installing the package into the app, use:
+
+```bash
+npm exec --package @iann29/synapse -- synapse convex dev
+```
 
 Full end-to-end:
 
@@ -175,13 +215,14 @@ Full end-to-end:
 mkdir my-test-app && cd my-test-app
 npx create-convex@latest .
 
-# 3. Link the app and run against the dev deployment
-synapse login http://localhost:8080
-synapse select
-synapse convex dev --once
+# 3. Install/link the wrapper, then run against the dev deployment
+npm install -D /path/to/convex-synapse/cli
+npx synapse login http://localhost:8080
+npx synapse select
+npx synapse convex dev --once
 
 # Production deploys use the linked prod deployment
-synapse convex deploy
+npx synapse convex deploy
 ```
 
 Synapse still exposes the raw env-var pair on a single endpoint for scripts

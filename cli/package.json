@@ -1,10 +1,34 @@
 {
   "name": "@iann29/synapse",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.6.2",
   "description": "Thin CLI wrapper for using the official Convex CLI with Synapse-managed deployments.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Iann29/convex-synapse.git",
+    "directory": "cli"
+  },
+  "bugs": {
+    "url": "https://github.com/Iann29/convex-synapse/issues"
+  },
+  "homepage": "https://github.com/Iann29/convex-synapse#readme",
+  "keywords": [
+    "convex",
+    "synapse",
+    "convex-synapse",
+    "self-hosted",
+    "cli"
+  ],
   "bin": {
     "synapse": "./bin/synapse.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "node --test"
