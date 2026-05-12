@@ -265,3 +265,83 @@ func TestHostDomain_Post_AutoConfigureDNS_OmittedFlag(t *testing.T) {
 			hits)
 	}
 }
+
+// TestHostDomain_DNSAuto_IgnoresProjectScopedCredentials confirms the
+// v1.6.5 P1 fix: the host-domain auto-DNS picker (instance scope) MUST
+// NOT pull a project-scoped credential, even when the project happens
+// to register one whose zones[] covers the operator's host domain.
+//
+// Without the fix this would silently use the tenant's Cloudflare
+// token to mint a host A record — a cross-scope token use. The fix
+// scopes the SELECT in findCloudflareCredentialForDomain to
+// `project_id IS NULL`. With ONLY a project credential present, the
+// auto-config response should report attempted=true, success=false,
+// reason="no stored Cloudflare credential covers <host>".
+func TestHostDomain_DNSAuto_IgnoresProjectScopedCredentials(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "example.com"}},
+	})
+	updater, tok := makeFakeUpdaterForReconfigure(t)
+
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		UpdaterURL:        updater.URL,
+		UpdaterToken:      tok,
+		PublicIP:          "203.0.113.10",
+		HostDomainResolver: stubResolverFunc(func(host string) ([]string, error) {
+			return []string{"203.0.113.10"}, nil
+		}),
+	})
+	owner := makeAdminUser(t, h)
+
+	// Seed a PROJECT credential whose zone covers the host domain.
+	// This is the cross-scope case the fix prevents: same operator,
+	// same Cloudflare account, but the credential lives under a
+	// project (e.g. an agency stored the host's zone in a client
+	// project's settings).
+	team := createTeam(t, h, owner.AccessToken, "HostScope Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "HostScopeProj")
+	var projCred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "project-cred"},
+		http.StatusCreated, &projCred)
+	if projCred.ProjectID == nil {
+		t.Fatalf("expected project-scoped credential")
+	}
+
+	// Now request host_domain with autoConfigureDns=true. The picker
+	// should walk the credentials filtered by project_id IS NULL,
+	// find none, and return success=false, reason mentioning "no
+	// stored Cloudflare credential".
+	body := map[string]any{
+		"domain":           "synapse.example.com",
+		"autoConfigureDns": true,
+	}
+	var got hostDomainPostRespForTest
+	h.DoJSON(http.MethodPost, "/v1/admin/host_domain",
+		owner.AccessToken, body, http.StatusAccepted, &got)
+
+	if got.DNSAuto == nil {
+		t.Fatalf("expected dnsAuto in response, got nil")
+	}
+	if !got.DNSAuto.Attempted {
+		t.Errorf("dnsAuto.attempted: got false want true")
+	}
+	if got.DNSAuto.Success {
+		t.Errorf("dnsAuto.success: got true (project credential leaked into host scope!)")
+	}
+	if got.DNSAuto.CredentialID != "" {
+		t.Errorf("dnsAuto.credentialId: got %q want empty (project cred must not be picked)",
+			got.DNSAuto.CredentialID)
+	}
+	// Reason should mention that no covering credential exists. We
+	// don't pin the exact string since the message lives in
+	// translateCloudflareError-adjacent code, but it should be
+	// non-empty and clearly indicate a missing credential.
+	if got.DNSAuto.Reason == "" {
+		t.Errorf("dnsAuto.reason: empty (operator can't tell why auto-config skipped)")
+	}
+}

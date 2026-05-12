@@ -446,32 +446,43 @@ type autoConfigureOnCreateOutcome struct {
 }
 
 // tryAutoConfigureOnCreate is the inline-best-effort auto-configure
-// invoked at the end of createDomain. Returns nil when we deliberately
-// skipped (preconditions missed); returns an outcome (success or
-// failure) when we actually called Cloudflare.
+// invoked at the end of createDomain. Returns nil when there is
+// genuinely nothing the operator could do without further setup
+// (no Crypto, no PublicIP, or no credential covers the zone — the
+// operator already knows their setup doesn't carry one). Returns
+// an outcome with attempted=true otherwise: success=true on a clean
+// Cloudflare upsert, or success=false + reason populated when we
+// HAD a credential candidate but couldn't pick one (ambiguity) or
+// the upsert failed.
 //
-// Skips that produce nil:
-//   - Crypto is nil (SYNAPSE_STORAGE_KEY not set on this Synapse host)
-//   - PublicIP is "" (no IP to point the A record at)
-//   - resolveCredentialForDomain returns code != "" (zero matches, or
-//     multiple matches — the operator must call /auto_configure with
-//     credentialId to disambiguate)
+// The "ambiguity" case — multiple project credentials cover the
+// same zone — was previously a silent skip, leaving the operator
+// guessing why auto-configure didn't fire on a freshly added domain.
+// v1.6.5 surfaces it inline so the dashboard can render "Multiple
+// credentials match — pick one via Auto-configure".
 //
-// On any of those we leave the row exactly as createDomain inserted
-// it. The /domains/{id}/auto_configure endpoint stays the manual
-// retry path; tryAutoConfigureOnCreate exists only to remove the
-// "operator added a domain and now has to click another button" UX
-// papercut.
+// Decrypt failures and Cloudflare API errors are also surfaced via
+// outcome.reason so the dashboard's POST /domains response carries
+// enough detail to show a clear next step.
 func (h *DomainsHandler) tryAutoConfigureOnCreate(ctx context.Context, domainID, domainName, projectID string) *autoConfigureOnCreateOutcome {
 	if h.Crypto == nil || h.PublicIP == "" {
 		return nil
 	}
 
-	cred, code, _, _ := h.resolveCredentialForDomain(ctx, "", domainName, projectID)
-	if code != "" {
-		// 0 matches or 2+ matches — neither is a failure to surface
-		// inline; the operator can still do it manually.
+	cred, code, msg, _ := h.resolveCredentialForDomain(ctx, "", domainName, projectID)
+	switch code {
+	case "":
+		// Happy path — fall through to the upsert.
+	case "no_credential_for_zone":
+		// Genuine "nothing to do" — operator never wired a credential
+		// for this zone. Silent skip preserves the v1.6.4 UX (the
+		// row's existing status='pending' + DNS hint is enough).
 		return nil
+	default:
+		// "credential_required" or any future ambiguity code: surface
+		// inline so the dashboard can show the operator they need to
+		// pick a specific credentialId via /auto_configure.
+		return &autoConfigureOnCreateOutcome{reason: msg}
 	}
 
 	zoneName, recordName, ok := longestMatchingZone(domainName, cred.zones)

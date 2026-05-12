@@ -115,12 +115,22 @@ func (h *AdminHandler) attemptHostDomainDNSAuto(ctx context.Context, domain stri
 }
 
 // findCloudflareCredentialForDomain returns (id, zoneName, encryptedToken)
-// for the credential whose stored zones[] best matches `domain`.
-// "Best match" = the longest zone name that the domain is equal to or
-// a subdomain of. So `synapsepanel.com` matches a credential listing
-// `synapsepanel.com`; `app.synapsepanel.com` would also match the same
-// credential. If two credentials both cover the domain, the more
-// specific zone wins.
+// for the INSTANCE-WIDE credential whose stored zones[] best matches
+// `domain`. "Best match" = the longest zone name that the domain is
+// equal to or a subdomain of. So `synapsepanel.com` matches a
+// credential listing `synapsepanel.com`; `app.synapsepanel.com`
+// would also match the same credential. If two credentials both
+// cover the domain, the more specific zone wins.
+//
+// Project-scoped credentials (v1.6.4+, project_id IS NOT NULL) are
+// deliberately excluded here: this function is the host-domain auto-
+// DNS picker (mounted under /v1/admin/host_domain), and host_domain
+// is an instance-level concern. If a project happens to register a
+// credential whose zone covers the operator's host domain, we must
+// NOT use that project's token to mint host DNS — that would be a
+// cross-scope token use. The per-project equivalent is
+// resolveCredentialForDomain in domains.go, which DOES walk project
+// rows for per-deployment custom domains.
 func (h *AdminHandler) findCloudflareCredentialForDomain(
 	ctx context.Context, domain string,
 ) (string, string, []byte, error) {
@@ -128,6 +138,7 @@ func (h *AdminHandler) findCloudflareCredentialForDomain(
 		SELECT id, zones, token_encrypted
 		  FROM dns_credentials
 		 WHERE provider = 'cloudflare'
+		   AND project_id IS NULL
 	`)
 	if err != nil {
 		return "", "", nil, err

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Project-scoped DNS credentials (v1.6.4+, migration 000016).
@@ -380,5 +381,181 @@ func TestProjectDNSCredentials_CascadeOnProjectDelete(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Errorf("expected ON DELETE CASCADE to remove project credential, %d row(s) remain", remaining)
+	}
+}
+
+// ---------- v1.6.5 follow-up coverage ----------
+
+// TestProjectDNSCredentials_AuditCarriesTeamID confirms the v1.6.5
+// fix: project_dns_credential.added and .removed events must stamp
+// team_id on the audit row so the team activity feed (which queries
+// WHERE team_id = $X) actually surfaces them. Pre-v1.6.5 these events
+// landed with team_id NULL and were invisible to the team feed.
+func TestProjectDNSCredentials_AuditCarriesTeamID(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "audit.com"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "AuditTeam Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "AuditProj")
+
+	// Add + remove a credential to trigger both audit actions.
+	var cred dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "audit-test"},
+		http.StatusCreated, &cred)
+	h.AssertStatus(http.MethodDelete,
+		"/v1/projects/"+proj.ID+"/dns_credentials/"+cred.ID,
+		owner.AccessToken, nil, http.StatusNoContent)
+
+	// Both events must show up in the TEAM feed. Poll briefly because
+	// audit writes happen after the response is written.
+	var got auditLogResp
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got = auditLogResp{}
+		h.DoJSON(http.MethodGet, "/v1/teams/"+team.Slug+"/audit_log",
+			owner.AccessToken, nil, http.StatusOK, &got)
+		seen := 0
+		for _, e := range got.Items {
+			if e.Action == "project_dns_credential.added" ||
+				e.Action == "project_dns_credential.removed" {
+				seen++
+			}
+		}
+		if seen >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	addSeen, removeSeen := false, false
+	for _, e := range got.Items {
+		switch e.Action {
+		case "project_dns_credential.added":
+			addSeen = true
+			if e.Metadata["projectId"] != proj.ID {
+				t.Errorf("add: metadata.projectId = %v, want %q", e.Metadata["projectId"], proj.ID)
+			}
+		case "project_dns_credential.removed":
+			removeSeen = true
+		}
+	}
+	if !addSeen {
+		t.Error("project_dns_credential.added missing from team audit feed (team_id not stamped?)")
+	}
+	if !removeSeen {
+		t.Error("project_dns_credential.removed missing from team audit feed (team_id not stamped?)")
+	}
+}
+
+// TestProjectDNSCredentials_InlineAutoConfig_SignalsAmbiguity covers
+// the v1.6.5 P2.2 fix: when a project has 2+ credentials covering the
+// same zone, POST /domains used to silently skip auto-config. Now it
+// surfaces autoDnsAttempted=true + autoDnsSuccess=false + reason
+// pointing the operator at /auto_configure with credentialId.
+func TestProjectDNSCredentials_InlineAutoConfig_SignalsAmbiguity(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "ambig.com"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		PublicIP:          "203.0.113.10",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "Ambig Co "+randHex(3))
+	proj := createProject(t, h, owner.AccessToken, team.Slug, "AmbigProj")
+
+	// Seed TWO project credentials covering the same zone.
+	for i := 0; i < 2; i++ {
+		var cred dnsCredentialResp
+		h.DoJSON(http.MethodPost, "/v1/projects/"+proj.ID+"/dns_credentials/cloudflare",
+			owner.AccessToken,
+			map[string]string{"token": "valid", "label": "ambig-" + randHex(2)},
+			http.StatusCreated, &cred)
+	}
+
+	depName := "ambig-cat-" + randHex(3)
+	h.SeedDeployment(proj.ID, depName, "prod", "running", true, owner.ID, 3990, "")
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.ambig.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if !got.AutoDNSAttempted {
+		t.Error("expected autoDnsAttempted=true (resolveCredentialForDomain returned a usable ambiguity signal)")
+	}
+	if got.AutoDNSSuccess {
+		t.Error("expected autoDnsSuccess=false on ambiguity")
+	}
+	if got.AutoDNSReason == "" {
+		t.Error("expected non-empty autoDnsReason explaining the ambiguity")
+	}
+	if got.AutoDNSCredentialID != "" {
+		t.Errorf("autoDnsCredentialId should be empty on ambiguity (none picked), got %q",
+			got.AutoDNSCredentialID)
+	}
+	if got.AutoConfigured {
+		t.Error("row's auto_configured should remain false on ambiguity")
+	}
+}
+
+// TestProjectDNSCredentials_AutoConfigure_CrossProjectCredentialIDBlocked
+// closes the test gap from the code review: passing another project's
+// credential UUID via /auto_configure?credentialId=... must 404, not
+// reach across project boundaries. The code already enforces this in
+// resolveCredentialForDomain with WHERE id = $1 AND (project_id IS NULL
+// OR project_id = $2); this test exercises the branch.
+func TestProjectDNSCredentials_AutoConfigure_CrossProjectCredentialIDBlocked(t *testing.T) {
+	stub := newCloudflareStub(t, &stubConfig{
+		verifyResult: true,
+		zones:        []stubZone{{ID: "zone-1", Name: "xleak.com"}},
+	})
+	h := SetupWithOpts(t, SetupOpts{
+		DNSEnvelope:       freshCryptoBox(t),
+		CloudflareFactory: cloudflareFactoryForStub(stub),
+		PublicIP:          "203.0.113.10",
+	})
+	owner := h.RegisterRandomUser()
+	team := createTeam(t, h, owner.AccessToken, "XLeak Co "+randHex(3))
+	projA := createProject(t, h, owner.AccessToken, team.Slug, "A-"+randHex(2))
+	projB := createProject(t, h, owner.AccessToken, team.Slug, "B-"+randHex(2))
+
+	// Project A holds the credential.
+	var credA dnsCredentialResp
+	h.DoJSON(http.MethodPost, "/v1/projects/"+projA.ID+"/dns_credentials/cloudflare",
+		owner.AccessToken,
+		map[string]string{"token": "valid", "label": "A-cred"},
+		http.StatusCreated, &credA)
+
+	// Project B has a deployment + a domain to auto_configure.
+	depName := "xleak-owl-" + randHex(3)
+	h.SeedDeployment(projB.ID, depName, "prod", "running", true, owner.ID, 3991, "")
+	var dom domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+depName+"/domains",
+		owner.AccessToken,
+		map[string]any{"domain": "api.xleak.com", "role": "api"},
+		http.StatusCreated, &dom)
+
+	// Try to auto_configure project B's domain with project A's
+	// credentialId. Must 404 — visibility is constrained to project B
+	// + instance-wide rows; A's credential is invisible.
+	env := h.AssertStatus(http.MethodPost,
+		"/v1/deployments/"+depName+"/domains/"+dom.ID+"/auto_configure",
+		owner.AccessToken,
+		map[string]string{"credentialId": credA.ID},
+		http.StatusNotFound)
+	if env.Code != "credential_not_found" {
+		t.Errorf("cross-project credentialId: got code %q want credential_not_found", env.Code)
 	}
 }
