@@ -202,8 +202,17 @@ func NewRouter(d RouterDeps) http.Handler {
 	// rewrite as /auth and /cli_credentials so dashboards and CLIs see
 	// public URLs instead of the loopback "http://127.0.0.1:<port>".
 	// Tokens enables scope-aware access-token CRUD under /access_tokens.
+	// dnsCredsH is shared between the instance-admin path (mounted
+	// under /v1/admin/dns_credentials below) and the per-project
+	// path (mounted on ProjectsHandler). Constructing it once keeps
+	// the CloudflareFactory test seam consistent across both surfaces.
+	dnsCredsH := &DNSCredentialsHandler{
+		DB:                d.DB,
+		Crypto:            d.DNSEnvelope,
+		CloudflareFactory: d.CloudflareFactory,
+	}
 	teamsH := &TeamsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
-	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH}
+	projectsH := &ProjectsHandler{DB: d.DB, Deployments: deploymentsH, Tokens: tokensH, DNSCredentials: dnsCredsH}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -269,13 +278,9 @@ func NewRouter(d RouterDeps) http.Handler {
 				HostDomainResolver: d.HostDomainResolver,
 			}
 			// DNS-provider credentials — mounted under /admin and
-			// gated by AdminHandler.requireInstanceAdmin. Wired here
-			// so all instance-admin surfaces stay consistent.
-			dnsCredsH := &DNSCredentialsHandler{
-				DB:                d.DB,
-				Crypto:            d.DNSEnvelope,
-				CloudflareFactory: d.CloudflareFactory,
-			}
+			// gated by AdminHandler.requireInstanceAdmin. Same
+			// handler instance is also mounted on ProjectsHandler
+			// for project-scoped credentials (v1.6.4+).
 			adminH.DNSCredentials = dnsCredsH
 			r.Mount("/admin", adminH.Routes())
 			// Personal access tokens — flat verb-suffixed endpoints under /v1.

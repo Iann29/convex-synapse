@@ -315,6 +315,9 @@ export type DNSCredential = {
   id: string;
   provider: "cloudflare";
   label: string;
+  // projectId set ⇒ scoped to a single project (v1.6.4+); unset ⇒
+  // instance-wide, managed under /v1/admin/dns_credentials.
+  projectId?: string;
   zones: { id: string; name: string }[];
   createdBy?: string;
   createdAt: string;
@@ -886,6 +889,35 @@ export const api = {
         `/v1/projects/${encodeURIComponent(id)}/update_default_environment_variables`,
         { method: "POST", body: { changes } }
       );
+    },
+    // Project-scoped DNS credentials (v1.6.4+). Mirror of
+    // api.admin.dnsCredentials but scoped to a single project — each
+    // client of the agency keeps its Cloudflare token alongside its
+    // project. Auto-configure flow picks the project's credentials
+    // first and falls back to instance-wide as a safety net.
+    dnsCredentials: {
+      async list(id: string): Promise<DNSCredential[]> {
+        const resp = await request<{ credentials: DNSCredential[] }>(
+          `/v1/projects/${encodeURIComponent(id)}/dns_credentials`,
+        );
+        return resp.credentials ?? [];
+      },
+      addCloudflare(
+        id: string,
+        token: string,
+        label: string,
+      ): Promise<DNSCredential> {
+        return request<DNSCredential>(
+          `/v1/projects/${encodeURIComponent(id)}/dns_credentials/cloudflare`,
+          { method: "POST", body: { token, label } },
+        );
+      },
+      delete(projectId: string, credentialId: string): Promise<void> {
+        return request<void>(
+          `/v1/projects/${encodeURIComponent(projectId)}/dns_credentials/${encodeURIComponent(credentialId)}`,
+          { method: "DELETE" },
+        );
+      },
     },
   },
 
