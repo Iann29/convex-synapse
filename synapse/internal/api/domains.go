@@ -192,6 +192,20 @@ func (h *DomainsHandler) verifyDomainDNS(ctx context.Context, domain, expectedIP
 type domainResponse struct {
 	models.DeploymentDomain
 	DeploymentRestartTriggered bool `json:"deploymentRestartTriggered,omitempty"`
+
+	// AutoDNS* fields are populated only on POST /domains when the
+	// handler tried to mint the A record inline via a stored DNS
+	// credential. Attempted=false (zero value) means we didn't try
+	// — preconditions missed (no Crypto, no PublicIP, no credential
+	// covers the zone). Attempted=true with Success=false carries a
+	// human-readable Reason; the operator can hit
+	// /domains/{id}/auto_configure to retry. Other endpoints (verify,
+	// delete) leave all of these zero so omitempty hides them.
+	AutoDNSAttempted    bool   `json:"autoDnsAttempted,omitempty"`
+	AutoDNSSuccess      bool   `json:"autoDnsSuccess,omitempty"`
+	AutoDNSReason       string `json:"autoDnsReason,omitempty"`
+	AutoDNSCredentialID string `json:"autoDnsCredentialId,omitempty"`
+	AutoDNSZone         string `json:"autoDnsZone,omitempty"`
 }
 
 // scanDomain is the row-shape for SELECTs on deployment_domains. Used
@@ -367,6 +381,25 @@ func (h *DomainsHandler) createDomain(w http.ResponseWriter, r *http.Request) {
 		h.Cache.InvalidateDomain(domainCanonical)
 	}
 
+	// v1.5+: when the row landed non-active AND we have everything we
+	// need to mint an A record on the operator's behalf (Crypto +
+	// PublicIP + a credential covering the zone), do it inline. This
+	// turns the ergonomically-broken "row sits at pending forever
+	// because operator forgot the manual A record" into the happy
+	// path. Best-effort — silent skip on any precondition miss; the
+	// existing /domains/{id}/auto_configure endpoint stays the manual
+	// fallback for re-tries.
+	autoOutcome := h.tryAutoConfigureOnCreate(r.Context(), id, domainCanonical)
+	if autoOutcome != nil && autoOutcome.success {
+		// Re-read the row so the response carries the post-update
+		// auto_configured + dns_credential_id columns. Status went
+		// back to 'pending' so the verifier loop picks up the freshly
+		// minted record once DNS propagates.
+		if reread, err := h.loadDomainByID(r.Context(), id); err == nil {
+			updated = reread
+		}
+	}
+
 	// Restart the deployment's container ONLY when the row landed
 	// 'active' — that's the only state where the proxy will route
 	// browser traffic at it, so a stale CORS_ALLOWED_ORIGINS becomes
@@ -378,10 +411,126 @@ func (h *DomainsHandler) createDomain(w http.ResponseWriter, r *http.Request) {
 			r.Context(), d.ID, d.Name, h.Logger)
 	}
 
-	writeJSON(w, http.StatusCreated, domainResponse{
+	resp := domainResponse{
 		DeploymentDomain:           updated,
 		DeploymentRestartTriggered: restartTriggered,
-	})
+	}
+	if autoOutcome != nil {
+		resp.AutoDNSAttempted = true
+		resp.AutoDNSSuccess = autoOutcome.success
+		resp.AutoDNSReason = autoOutcome.reason
+		resp.AutoDNSCredentialID = autoOutcome.credentialID
+		resp.AutoDNSZone = autoOutcome.zone
+	}
+
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// autoConfigureOnCreateOutcome is the inline-auto-configure trace
+// stamped onto the createDomain response. It exists so the dashboard
+// can render a green "✓ A record created via Cloudflare credential
+// 'Personal CF'" line on first-add success — no second round-trip
+// to /auto_configure needed.
+//
+// success=false with attempted=true means we tried but Cloudflare
+// rejected (token bad, network blip, etc); the row is still pending
+// + the operator can hit /auto_configure manually to retry. nil
+// outcome means we didn't try (preconditions missed: no Crypto, no
+// PublicIP, or no credential covers the zone).
+type autoConfigureOnCreateOutcome struct {
+	success      bool
+	credentialID string
+	zone         string
+	reason       string
+}
+
+// tryAutoConfigureOnCreate is the inline-best-effort auto-configure
+// invoked at the end of createDomain. Returns nil when we deliberately
+// skipped (preconditions missed); returns an outcome (success or
+// failure) when we actually called Cloudflare.
+//
+// Skips that produce nil:
+//   - Crypto is nil (SYNAPSE_STORAGE_KEY not set on this Synapse host)
+//   - PublicIP is "" (no IP to point the A record at)
+//   - resolveCredentialForDomain returns code != "" (zero matches, or
+//     multiple matches — the operator must call /auto_configure with
+//     credentialId to disambiguate)
+//
+// On any of those we leave the row exactly as createDomain inserted
+// it. The /domains/{id}/auto_configure endpoint stays the manual
+// retry path; tryAutoConfigureOnCreate exists only to remove the
+// "operator added a domain and now has to click another button" UX
+// papercut.
+func (h *DomainsHandler) tryAutoConfigureOnCreate(ctx context.Context, domainID, domainName string) *autoConfigureOnCreateOutcome {
+	if h.Crypto == nil || h.PublicIP == "" {
+		return nil
+	}
+
+	cred, code, _, _ := h.resolveCredentialForDomain(ctx, "", domainName)
+	if code != "" {
+		// 0 matches or 2+ matches — neither is a failure to surface
+		// inline; the operator can still do it manually.
+		return nil
+	}
+
+	zoneName, recordName, ok := longestMatchingZone(domainName, cred.zones)
+	if !ok {
+		return nil
+	}
+
+	out := &autoConfigureOnCreateOutcome{credentialID: cred.id, zone: zoneName}
+
+	plaintextToken, err := h.Crypto.DecryptString(cred.tokenEncrypted)
+	if err != nil {
+		// Decrypt failures mean SYNAPSE_STORAGE_KEY rotated or the
+		// row is corrupt. We surface this loudly because both call
+		// for operator action; the row stays pending so the manual
+		// retry path doesn't hide the problem.
+		out.reason = "could not decrypt the stored DNS credential token"
+		logErr("auto-configure on create: decrypt token", err)
+		return out
+	}
+
+	client := h.cloudflareClient(plaintextToken)
+	if err := client.UpsertARecord(ctx, zoneName, recordName, h.PublicIP); err != nil {
+		out.reason = "cloudflare upsert failed: " + err.Error()
+		h.recordCredentialError(ctx, cred.id, err.Error())
+		return out
+	}
+
+	// Mark auto_configured + reset to pending so the dns.Verifier
+	// picks the row up once DNS propagates. last_dns_error cleared
+	// because the previous synchronous preflight wrote a stale
+	// "lookup failed" before the record existed.
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE deployment_domains
+		   SET auto_configured = true,
+		       dns_credential_id = $2,
+		       status = 'pending',
+		       dns_verified_at = NULL,
+		       last_dns_error = NULL,
+		       updated_at = now()
+		 WHERE id = $1
+	`, domainID, cred.id); err != nil {
+		out.reason = "cloudflare ok but failed to persist auto_configured flag"
+		logErr("auto-configure on create: update row", err)
+		return out
+	}
+
+	out.success = true
+	return out
+}
+
+// loadDomainByID reads a single deployment_domains row. Used by
+// createDomain to refresh the row after a successful inline auto-
+// configure flipped auto_configured + dns_credential_id.
+func (h *DomainsHandler) loadDomainByID(ctx context.Context, id string) (models.DeploymentDomain, error) {
+	row := h.DB.QueryRow(ctx, `
+		SELECT `+domainSelectCols+`
+		  FROM deployment_domains
+		 WHERE id = $1
+	`, id)
+	return scanDomainRow(row)
 }
 
 // applyVerification updates the row's status + verifiedAt + lastErr
