@@ -1162,7 +1162,7 @@ func (h *ProjectsHandler) listProjectDNSCredentials(w http.ResponseWriter, r *ht
 }
 
 func (h *ProjectsHandler) createProjectDNSCredential(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -1171,11 +1171,14 @@ func (h *ProjectsHandler) createProjectDNSCredential(w http.ResponseWriter, r *h
 			"Only project admins can add DNS credentials")
 		return
 	}
-	h.DNSCredentials.CreateCloudflareForProject(w, r, p.ID)
+	// Pass the project's team through so the audit event lands with
+	// team_id set — the team activity feed filters WHERE team_id = $X
+	// and would silently drop the row otherwise.
+	h.DNSCredentials.CreateCloudflareForProject(w, r, p.ID, t.ID)
 }
 
 func (h *ProjectsHandler) deleteProjectDNSCredential(w http.ResponseWriter, r *http.Request) {
-	p, _, role, ok := h.loadProjectForRequest(w, r)
+	p, t, role, ok := h.loadProjectForRequest(w, r)
 	if !ok {
 		return
 	}
@@ -1187,7 +1190,13 @@ func (h *ProjectsHandler) deleteProjectDNSCredential(w http.ResponseWriter, r *h
 	// Pass the project ID through so DeleteScoped's WHERE clause
 	// matches only this project's rows — even if the caller passes
 	// a UUID belonging to another project (or the admin pool), the
-	// DELETE hits zero rows and we return 404.
+	// DELETE hits zero rows and we return 404. teamID makes the audit
+	// row visible to the team activity feed.
 	pid := p.ID
-	h.DNSCredentials.DeleteScoped(w, r, &pid, audit.ActionRemoveProjectDNSCredential)
+	tid := t.ID
+	h.DNSCredentials.DeleteScoped(w, r, dnsCredentialScope{
+		ProjectID: &pid,
+		TeamID:    &tid,
+		Action:    audit.ActionRemoveProjectDNSCredential,
+	})
 }

@@ -156,21 +156,39 @@ type createCloudflareCredentialReq struct {
 	Label string `json:"label"`
 }
 
+// dnsCredentialScope captures the scope + audit metadata a single
+// credential operation needs. Instance-wide ops pass the zero value
+// (all-nil + ActionAdd/RemoveDNSCredential); project-scoped ops fill
+// ProjectID + TeamID so the audit row carries proper provenance and
+// the team activity feed picks the event up via WHERE team_id = $X.
+//
+// Pre-v1.6.5 the helpers took ProjectID + Action as positional args
+// and never propagated TeamID — leaving project DNS credential events
+// invisible in the team audit feed. Surfaced by the v1.6.4 audit pass.
+type dnsCredentialScope struct {
+	ProjectID *string
+	TeamID    *string
+	Action    string
+}
+
 // createCloudflare is the /v1/admin/dns_credentials/cloudflare path:
 // creates an instance-wide credential (project_id NULL). The mirror
 // path for project-scoped credentials lives on ProjectsHandler and
 // reuses createCloudflareScoped.
 func (h *DNSCredentialsHandler) createCloudflare(w http.ResponseWriter, r *http.Request) {
-	h.createCloudflareScoped(w, r, nil, audit.ActionAddDNSCredential)
+	h.createCloudflareScoped(w, r, dnsCredentialScope{Action: audit.ActionAddDNSCredential})
 }
 
 // createCloudflareScoped is the shared verify-token → list-zones →
 // encrypt → insert path used by both the instance-wide endpoint
-// (projectID = nil) and the per-project endpoint (projectID = the
-// project UUID). Audit action is overridable so the per-project
-// flow can emit a distinct ActionAddProjectDNSCredential row,
-// keeping the team audit feed honest about which scope changed.
-func (h *DNSCredentialsHandler) createCloudflareScoped(w http.ResponseWriter, r *http.Request, projectID *string, action string) {
+// (scope.ProjectID = nil) and the per-project endpoint
+// (scope.ProjectID = the project UUID, scope.TeamID = the project's
+// team). Audit action is overridable so the per-project flow can
+// emit a distinct ActionAddProjectDNSCredential row, keeping the
+// team audit feed honest about which scope changed.
+func (h *DNSCredentialsHandler) createCloudflareScoped(w http.ResponseWriter, r *http.Request, scope dnsCredentialScope) {
+	projectID := scope.ProjectID
+	action := scope.Action
 	// Trace each entry so a fresh-install 500 in the field gives the
 	// operator a clear server-side breadcrumb to share without needing
 	// to attach a debugger.
@@ -281,13 +299,20 @@ func (h *DNSCredentialsHandler) createCloudflareScoped(w http.ResponseWriter, r 
 	if projectID != nil {
 		auditMeta["projectId"] = *projectID
 	}
-	_ = audit.Record(r.Context(), h.DB, audit.Options{
+	auditOpts := audit.Options{
 		ActorID:    uid,
 		Action:     action,
 		TargetType: audit.TargetDNSCredential,
 		TargetID:   id,
 		Metadata:   auditMeta,
-	})
+	}
+	// TeamID stamps the row so it surfaces in the team activity feed
+	// (which filters WHERE team_id = $X). Instance-wide credentials
+	// stay TeamID="" — they don't belong to any team.
+	if scope.TeamID != nil {
+		auditOpts.TeamID = *scope.TeamID
+	}
+	_ = audit.Record(r.Context(), h.DB, auditOpts)
 
 	out := models.DNSCredential{
 		ID:        id,
@@ -308,27 +333,63 @@ func (h *DNSCredentialsHandler) createCloudflareScoped(w http.ResponseWriter, r 
 // via DeleteScoped called from ProjectsHandler so the route-level
 // project_id check happens there.
 func (h *DNSCredentialsHandler) delete(w http.ResponseWriter, r *http.Request) {
-	h.DeleteScoped(w, r, nil, audit.ActionRemoveDNSCredential)
+	h.DeleteScoped(w, r, dnsCredentialScope{Action: audit.ActionRemoveDNSCredential})
 }
 
-// DeleteScoped runs the same in-use check + DELETE flow as `delete`
-// but optionally constrains the row's project_id. When projectID is
-// non-nil, the DELETE will only match rows owned by that project —
-// otherwise it'd be possible for a project admin to remove a
-// credential from another project (or instance-wide) by guessing
-// its UUID. When nil, only instance-wide rows match.
-func (h *DNSCredentialsHandler) DeleteScoped(w http.ResponseWriter, r *http.Request, projectID *string, action string) {
+// DeleteScoped runs the in-use check + DELETE flow with optional
+// scope constraint. When scope.ProjectID is non-nil the DELETE only
+// matches rows owned by that project — otherwise it'd be possible
+// for a project admin to remove a credential from another project
+// (or instance-wide) by guessing its UUID.
+//
+// Order of checks matters for honesty: pre-v1.6.5 the in-use check
+// (409) ran before the scope guard, so a project-A admin guessing a
+// project-B credential UUID could distinguish "exists and is in
+// use" (409) from "doesn't exist or isn't in use" (404). UUIDs are
+// unguessable in practice (low risk), but we run the scope-bounded
+// SELECT first now to remove the leak: the in-use 409 only fires
+// for rows the caller is actually allowed to see.
+func (h *DNSCredentialsHandler) DeleteScoped(w http.ResponseWriter, r *http.Request, scope dnsCredentialScope) {
+	projectID := scope.ProjectID
+	action := scope.Action
+
 	id := chi.URLParam(r, "id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing_id", "credential id is required")
 		return
 	}
 
+	// Scope-bounded existence check FIRST. If the row doesn't exist
+	// in this scope, return 404 immediately — without leaking via
+	// the 409 in-use check whether some other scope holds it. The
+	// IS NOT DISTINCT FROM trick lets nil project_id match SQL NULL.
+	var (
+		provider string
+		label    string
+	)
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT provider, label
+		  FROM dns_credentials
+		 WHERE id = $1
+		   AND project_id IS NOT DISTINCT FROM $2
+	`, id, projectID).Scan(&provider, &label)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "credential_not_found",
+				"DNS credential not found")
+			return
+		}
+		logErr("load credential for delete", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"Failed to load DNS credential")
+		return
+	}
+
 	// 409 if any deployment_domains row still references this
-	// credential. We check before the DELETE so the row sticks around
-	// for the operator to inspect — accidentally orphaning the column
-	// would be safe (ON DELETE SET NULL) but it'd silently break the
-	// "auto_configured" badge on every domain that used the token.
+	// credential. The row sticks around for the operator to inspect —
+	// accidentally orphaning the column would be safe (ON DELETE SET
+	// NULL) but it'd silently break the "auto_configured" badge on
+	// every domain that used the token.
 	var inUse bool
 	if err := h.DB.QueryRow(r.Context(), `
 		SELECT EXISTS (
@@ -345,27 +406,17 @@ func (h *DNSCredentialsHandler) DeleteScoped(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Scope guard: the DELETE matches both id AND project_id, so a
-	// project admin can't reach into other projects (or the admin
-	// pool) by guessing UUIDs. NULL = "match only instance-wide rows"
-	// for the admin endpoint.
-	var (
-		provider string
-		label    string
-	)
-	const sqlWithScope = `
+	// Now perform the actual DELETE. Scope is re-applied here as
+	// belt-and-suspenders: between the SELECT above and this DELETE
+	// the row could (in principle) be moved across scopes by another
+	// concurrent operation; the scope-guarded WHERE makes that race
+	// safe — worst case the DELETE no-ops with pgx.ErrNoRows and we
+	// surface 404, never delete the wrong row.
+	if _, err := h.DB.Exec(r.Context(), `
 		DELETE FROM dns_credentials
 		WHERE id = $1
 		  AND project_id IS NOT DISTINCT FROM $2
-		RETURNING provider, label
-	`
-	err := h.DB.QueryRow(r.Context(), sqlWithScope, id, projectID).Scan(&provider, &label)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "credential_not_found",
-				"DNS credential not found")
-			return
-		}
+	`, id, projectID); err != nil {
 		logErr("delete dns credential", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"Failed to delete DNS credential")
@@ -380,13 +431,17 @@ func (h *DNSCredentialsHandler) DeleteScoped(w http.ResponseWriter, r *http.Requ
 	if projectID != nil {
 		auditMeta["projectId"] = *projectID
 	}
-	_ = audit.Record(r.Context(), h.DB, audit.Options{
+	auditOpts := audit.Options{
 		ActorID:    uid,
 		Action:     action,
 		TargetType: audit.TargetDNSCredential,
 		TargetID:   id,
 		Metadata:   auditMeta,
-	})
+	}
+	if scope.TeamID != nil {
+		auditOpts.TeamID = *scope.TeamID
+	}
+	_ = audit.Record(r.Context(), h.DB, auditOpts)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -423,7 +478,13 @@ func (h *DNSCredentialsHandler) ListForProject(w http.ResponseWriter, r *http.Re
 }
 
 // CreateCloudflareForProject is the project-scoped variant of
-// createCloudflare. Mounted on ProjectsHandler.
-func (h *DNSCredentialsHandler) CreateCloudflareForProject(w http.ResponseWriter, r *http.Request, projectID string) {
-	h.createCloudflareScoped(w, r, &projectID, audit.ActionAddProjectDNSCredential)
+// createCloudflare. Mounted on ProjectsHandler. teamID is the
+// project's team — stamped on the audit row so the team activity
+// feed picks the event up via WHERE team_id = $X.
+func (h *DNSCredentialsHandler) CreateCloudflareForProject(w http.ResponseWriter, r *http.Request, projectID, teamID string) {
+	h.createCloudflareScoped(w, r, dnsCredentialScope{
+		ProjectID: &projectID,
+		TeamID:    &teamID,
+		Action:    audit.ActionAddProjectDNSCredential,
+	})
 }
