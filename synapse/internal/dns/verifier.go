@@ -59,7 +59,7 @@ type Verifier struct {
 	DB     *pgxpool.Pool
 	Logger *slog.Logger
 
-	// Resolver is overridable in tests. nil → net.DefaultResolver.
+	// Resolver is overridable in tests. nil → ExternalResolver.
 	Resolver Resolver
 
 	// ExpectedIP is the IPv4 the auto-configure flow points A records
@@ -131,11 +131,15 @@ func (v *Verifier) lookupTimeout() time.Duration {
 	return v.LookupTimeout
 }
 
+// resolver returns the configured Resolver, falling back to
+// ExternalResolver so production lookups dial 1.1.1.1 directly
+// instead of going through the container's possibly-broken
+// /etc/resolv.conf. See dns/resolver.go for the rationale.
 func (v *Verifier) resolver() Resolver {
 	if v.Resolver != nil {
 		return v.Resolver
 	}
-	return net.DefaultResolver
+	return ExternalResolver()
 }
 
 func (v *Verifier) now() time.Time {

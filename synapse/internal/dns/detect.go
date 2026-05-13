@@ -47,9 +47,11 @@ type resolver interface {
 	LookupNS(ctx context.Context, name string) ([]*net.NS, error)
 }
 
-// defaultResolver delegates to net.DefaultResolver. Production
-// callers leave Provider's resolver hook nil; tests inject a stub.
-var defaultResolver resolver = net.DefaultResolver
+// defaultResolver delegates to ExternalResolver so production NS
+// lookups dodge the OS resolver entirely. See ExternalResolver for
+// the rationale (broken distroless /etc/resolv.conf, host stub-
+// resolver caches, etc.). Tests inject a stub via the detect() seam.
+var defaultResolver resolver = ExternalResolver()
 
 // Provider returns the DNS-provider identifier (e.g. "cloudflare",
 // "route53", "unknown") for the given domain, plus the raw NS hosts

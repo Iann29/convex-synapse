@@ -130,6 +130,78 @@ lifecycle::log() {
     } >>"$log_file" 2>/dev/null || true
 }
 
+# ---- env-file -> shell-env propagation -----------------------------
+
+# lifecycle::source_env_file <env_file>
+#
+# Read every KEY=VALUE line out of <env_file> and `export` it into the
+# current shell's environment. Used by lifecycle::_upgrade_phase_b
+# right before `compose up --build` to eliminate a footgun specific
+# to the dashboard-driven upgrade path:
+#
+#   * The synapse-updater systemd unit sets EnvironmentFile=$INSTALL_DIR/.env,
+#     so the daemon's process env is a *snapshot* of .env at the
+#     daemon's start time.
+#   * The daemon forks setup.sh --upgrade via subprocess; setup.sh
+#     inherits the daemon's stale shell env.
+#   * docker compose interpolation gives the shell env precedence over
+#     the project --env-file. So if an operator hand-edited .env (or
+#     ran `setup.sh --reconfigure --domain=...`) AFTER the daemon
+#     started, the FILE has the new value but the SHELL has the old
+#     one — and the build picks up the old.
+#
+# Field-discovered on synapsepanel.com: post-reconfigure .env had
+# PUBLIC_SYNAPSE_URL=https://synapsepanel.com, but the daemon's
+# snapshot still carried http://72.60.3.159:8080 from the initial
+# IP-only install. Every daemon-driven upgrade rebuilt the dashboard
+# with NEXT_PUBLIC_SYNAPSE_URL=http://72.60.3.159:8080, producing
+# mixed-content errors against the HTTPS frontend.
+#
+# Safety:
+#
+#   * We do NOT `source` the file (which would execute any shell
+#     metacharacters in values — VAR=$(rm -rf /) would be fatal).
+#   * We delegate per-key reads to secrets::env_get so quote-stripping
+#     stays consistent with the rest of the installer.
+#   * Only well-formed KEY=VALUE lines are processed; malformed lines
+#     (key with whitespace, missing =, etc.) are silently skipped.
+#     The .env we render via env.tmpl + secrets::set_env_var is
+#     always well-formed, so the skip path only fires when an
+#     operator hand-corrupted .env — at which point the upgrade was
+#     going to break anyway.
+#   * Bash key syntax: `^[A-Za-z_][A-Za-z0-9_]*=` — POSIX shell var
+#     name. Anything else gets dropped. Prevents an arbitrary line
+#     like `KEY WITH SPACES=value` from synthesising a malformed
+#     `export` call.
+lifecycle::source_env_file() {
+    local file="$1"
+    [[ -r "$file" ]] || return 0
+    # Single pass: parse KEY=VALUE inline rather than calling
+    # secrets::env_get per key (which re-scans the whole file —
+    # quadratic on large .env and trips shellcheck SC2094 about
+    # nested-pipe reads). We mirror env_get's quote-stripping by hand
+    # so the contract stays consistent.
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Cheap skip for the common shape: blank lines + comments.
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        # Only accept POSIX-shell-name keys. Anything else (digits-
+        # first, whitespace in name, no `=`) is silently dropped to
+        # keep a hand-edited .env from synthesising a malformed
+        # export call.
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            # Strip surrounding "..." or '...' (operator-quoted
+            # values from doc copy-pastes). Matches env_get's
+            # behaviour.
+            val="${val#\"}"; val="${val%\"}"
+            val="${val#\'}"; val="${val%\'}"
+            export "$key=$val"
+        fi
+    done < "$file"
+}
+
 # ---- profile detection ---------------------------------------------
 
 # lifecycle::detect_profiles <env_file>
@@ -525,6 +597,25 @@ lifecycle::_upgrade_phase_b() {
     #
     # See: https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/
     export SYNAPSE_VERSION="$new_stamp"
+
+    # --- 8.5. propagate the FILE's view of every other var ---------
+    # Generalises the SYNAPSE_VERSION re-export trick above to every
+    # key in .env. Why we need this: the daemon's shell env is a
+    # snapshot of .env at daemon-start time. If the operator
+    # hand-edited .env (e.g. ran `--reconfigure --domain=...` from
+    # SSH) AFTER the daemon was last restarted, the FILE has the new
+    # value but the SHELL has the old one. Docker compose's
+    # interpolation gives shell env precedence, so the build picks up
+    # the stale value and bakes it into the image (NEXT_PUBLIC_* are
+    # build-time inlines for the dashboard — caught the hard way on
+    # synapsepanel.com where every daemon-driven upgrade rebuilt the
+    # dashboard with a stale http://<ip>:8080 instead of the
+    # post-reconfigure https://<domain>).
+    #
+    # source_env_file is safe by construction: no `source` / `eval`,
+    # only KEY=VALUE lines with POSIX-name keys get exported, values
+    # are unquoted by secrets::env_get. See its doc comment.
+    lifecycle::source_env_file "$env_file"
 
     # --- 9. compose up -d --build ----------------------------------
     local profile_args=()

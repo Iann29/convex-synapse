@@ -1,6 +1,8 @@
 package synapsetest
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -513,5 +515,214 @@ func TestDomain_Create_InlineAutoConfig_NoPublicIP(t *testing.T) {
 	}
 	if !strings.Contains(got.LastDNSError, "SYNAPSE_PUBLIC_IP") {
 		t.Errorf("expected last_dns_error to mention SYNAPSE_PUBLIC_IP, got %q", got.LastDNSError)
+	}
+}
+
+// stubLookupIPResolver lets the verifyDomainDNS tests drive the
+// resolver deterministically. Returning a non-nil err mimics
+// NXDOMAIN/SERVFAIL/timeout shapes; returning ips mimics the
+// "record exists but points elsewhere" path.
+type stubLookupIPResolver struct {
+	ips []net.IP
+	err error
+}
+
+func (s *stubLookupIPResolver) LookupIP(_ context.Context, _, _ string) ([]net.IP, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	// Defensive copy so a test that mutates the slice can't leak
+	// state into the next call.
+	out := make([]net.IP, len(s.ips))
+	copy(out, s.ips)
+	return out, nil
+}
+
+// TestDomains_Add_NXDOMAIN_Pending covers the v1.6.10 fix: when the
+// sync verify at create-time hits a "no such host" error, the row
+// must land at status='pending' (not 'failed') so the async verifier
+// can keep retrying through the propagation window. Pre-v1.6.10 the
+// sync path was symmetric with verifyDomainDNS's old return shape
+// and flipped to 'failed' on any lookup error, which painted a
+// permanent-looking red badge five seconds after the record was
+// minted but before Cloudflare propagated globally. The dashboard's
+// "Verify" button hit the same trap.
+func TestDomains_Add_NXDOMAIN_Pending(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP: "203.0.113.42",
+		DomainsResolver: &stubLookupIPResolver{
+			err: &net.DNSError{
+				Err:        "no such host",
+				Name:       "api.example.com",
+				IsNotFound: true,
+			},
+		},
+	})
+	f := newDomainsFixture(t, h, "dom-nxdomain", 3580)
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.Status != "pending" {
+		t.Errorf("status: got %q want pending (NXDOMAIN is transient — async verifier must keep retrying)", got.Status)
+	}
+	if !strings.Contains(got.LastDNSError, "still propagating") {
+		t.Errorf("expected last_dns_error to start with 'still propagating', got %q", got.LastDNSError)
+	}
+}
+
+// TestDomains_Add_LookupTimeout_Pending exercises the same pending-on-
+// lookup-error path with a different DNSError shape — IsTimeout=true.
+// Operators on slow networks or behind aggressive egress filtering
+// see this regularly during the propagation window; same treatment
+// as NXDOMAIN.
+func TestDomains_Add_LookupTimeout_Pending(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP: "203.0.113.42",
+		DomainsResolver: &stubLookupIPResolver{
+			err: &net.DNSError{
+				Err:       "i/o timeout",
+				Name:      "api.example.com",
+				IsTimeout: true,
+			},
+		},
+	})
+	f := newDomainsFixture(t, h, "dom-timeout", 3581)
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.Status != "pending" {
+		t.Errorf("status: got %q want pending (timeout is transient)", got.Status)
+	}
+}
+
+// TestDomains_Add_EmptyIPList_Pending: the resolver returned cleanly
+// but with zero A records. Same propagation-shape gap as NXDOMAIN —
+// we want pending, not failed.
+func TestDomains_Add_EmptyIPList_Pending(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP:        "203.0.113.42",
+		DomainsResolver: &stubLookupIPResolver{ips: nil},
+	})
+	f := newDomainsFixture(t, h, "dom-empty-ips", 3582)
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.Status != "pending" {
+		t.Errorf("status: got %q want pending (no A records yet)", got.Status)
+	}
+	if !strings.Contains(got.LastDNSError, "still propagating") {
+		t.Errorf("expected 'still propagating' hint, got %q", got.LastDNSError)
+	}
+}
+
+// TestDomains_Add_IPMismatch_StillFails: when the lookup actually
+// returns IPs but none match SYNAPSE_PUBLIC_IP, this is deterministic
+// (propagation completed, record is wrong). Status must stay 'failed'
+// because the operator needs to act — e.g. orange-cloud the record at
+// Cloudflare, point at the wrong server, etc. The async verifier
+// behaves the same way on this branch.
+func TestDomains_Add_IPMismatch_Failed(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP: "203.0.113.42",
+		DomainsResolver: &stubLookupIPResolver{
+			ips: []net.IP{net.ParseIP("172.67.131.206")},
+		},
+	})
+	f := newDomainsFixture(t, h, "dom-mismatch", 3583)
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.Status != "failed" {
+		t.Errorf("status: got %q want failed (IP mismatch is deterministic)", got.Status)
+	}
+	if !strings.Contains(got.LastDNSError, "expected 203.0.113.42") {
+		t.Errorf("expected mismatch hint to mention expected IP, got %q", got.LastDNSError)
+	}
+	if !strings.Contains(got.LastDNSError, "172.67.131.206") {
+		t.Errorf("expected mismatch hint to mention actual IP, got %q", got.LastDNSError)
+	}
+}
+
+// TestDomains_Add_Match_Active: the happy path. Resolver returns the
+// expected IP; row flips to active. Belt-and-suspenders test for the
+// branch the refactor preserved.
+func TestDomains_Add_Match_Active(t *testing.T) {
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP: "203.0.113.42",
+		DomainsResolver: &stubLookupIPResolver{
+			ips: []net.IP{net.ParseIP("203.0.113.42")},
+		},
+	})
+	f := newDomainsFixture(t, h, "dom-match", 3584)
+
+	var got domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &got)
+
+	if got.Status != "active" {
+		t.Errorf("status: got %q want active", got.Status)
+	}
+	if got.LastDNSError != "" {
+		t.Errorf("expected empty last_dns_error on active, got %q", got.LastDNSError)
+	}
+	if got.DNSVerifiedAt == nil {
+		t.Errorf("expected dnsVerifiedAt to be set when status=active")
+	}
+}
+
+// TestDomains_Verify_NXDOMAIN_Pending: the manual "Verify" button
+// (POST /domains/{id}/verify) hits the same verifyDomainDNS path.
+// Pre-v1.6.10 a click during the propagation window flipped a
+// previously-pending row to permanent-looking failed; this test
+// pins the post-fix behaviour so the dashboard's Verify button is
+// safe to click as often as the operator wants.
+func TestDomains_Verify_NXDOMAIN_Pending(t *testing.T) {
+	atomicErr := &atomic.Value{}
+	// Default: NXDOMAIN. Tests can swap behaviour mid-run if needed;
+	// this one keeps it constant.
+	atomicErr.Store(true)
+
+	stub := &stubLookupIPResolver{
+		err: &net.DNSError{Err: "no such host", IsNotFound: true},
+	}
+	h := SetupWithOpts(t, SetupOpts{
+		PublicIP:        "203.0.113.42",
+		DomainsResolver: stub,
+	})
+	f := newDomainsFixture(t, h, "dom-verify-nx", 3585)
+
+	var created domainResp
+	h.DoJSON(http.MethodPost, "/v1/deployments/"+f.deployment+"/domains",
+		f.owner.AccessToken,
+		map[string]any{"domain": "api.example.com", "role": "api"},
+		http.StatusCreated, &created)
+	if created.Status != "pending" {
+		t.Fatalf("preconditions: expected pending after create, got %q", created.Status)
+	}
+
+	var verified domainResp
+	h.DoJSON(http.MethodPost,
+		"/v1/deployments/"+f.deployment+"/domains/"+created.ID+"/verify",
+		f.owner.AccessToken, nil, http.StatusOK, &verified)
+	if verified.Status != "pending" {
+		t.Errorf("post-verify status: got %q want pending (manual Verify must mirror async semantics on NXDOMAIN)", verified.Status)
 	}
 }

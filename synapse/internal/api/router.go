@@ -99,6 +99,14 @@ type RouterDeps struct {
 	// falls back to net.DefaultResolver. See AdminHandler.dnsLookupA.
 	HostDomainResolver HostDomainResolver
 
+	// DomainsResolver lets the per-deployment custom-domain DNS
+	// preflight (DomainsHandler.verifyDomainDNS) be stubbed in tests.
+	// Production wiring leaves this nil and the handler falls back to
+	// synapsedns.ExternalResolver (1.1.1.1 → 8.8.8.8). Tests use it to
+	// exercise the propagation / mismatch / active flips without
+	// reaching the real internet.
+	DomainsResolver LookupIPResolver
+
 	// DNSEnvelope is the encrypt+decrypt envelope the DNS-credentials
 	// flow uses to protect the stored Cloudflare token. Same backing
 	// SecretBox as Crypto in the HA flow; the separate field exists
@@ -195,6 +203,7 @@ func NewRouter(d RouterDeps) http.Handler {
 		Logger:            d.Logger,
 		Crypto:            d.DNSEnvelope,
 		CloudflareFactory: d.CloudflareFactory,
+		Resolver:          d.DomainsResolver,
 	}
 	deploymentsH.Domains = domainsH
 	// teamsH + projectsH carry a *DeploymentsHandler reference so their
