@@ -38,3 +38,36 @@
         reverse_proxy synapse-api:8080
     }
 }
+
+# Catch-all for per-deployment custom domains (v1.6.8+).
+#
+# Operators add domains like "api.<their-client>.com" through the
+# dashboard. The backend creates a deployment_domains row, optionally
+# upserts the A record on Cloudflare via a stored credential, and
+# (since v1.6.7) flips the row to 'active' once DNS propagates.
+#
+# But until v1.6.8 the operator's Caddy still only knew about
+# {{DOMAIN}} and {{SYNAPSE_BASE_DOMAIN}}'s wildcard block — TLS
+# handshakes to "api.<client>.com" landed with no virtual host and
+# died with ERR_SSL_PROTOCOL_ERROR. This block fixes that: it accepts
+# any inbound :443 not already claimed by a more specific block,
+# gates Let's Encrypt issuance through /v1/internal/tls_ask (so only
+# hosts cadastrados em deployment_domains get certs), and forwards
+# everything to synapse-api:8080.
+#
+# synapse-api is the right upstream because the Synapse proxy
+# already routes by Host header (proxy.go::ResolveDomain): it looks
+# up the host in deployment_domains, picks the deployment by role
+# (api → backend container, dashboard → convex-dashboard sidecar),
+# and reverse-proxies internally. Caddy's job is purely TLS +
+# delivery to the right pod; routing brains stay in the backend.
+#
+# Caddy's longest-match wins, so {{DOMAIN}} above + the optional
+# *.{{SYNAPSE_BASE_DOMAIN}} block in caddy.wildcard always win over
+# this catch-all for the hosts they cover.
+:443 {
+    tls {
+        on_demand
+    }
+    reverse_proxy synapse-api:8080
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -207,23 +208,30 @@ func TestDNSVerifier_LookupError_RowStaysPending(t *testing.T) {
 	}
 }
 
-// 4) Old row: row pending + auto_configured, created_at older than
+// 4) Old row: row pending + auto_configured, updated_at older than
 // MaxAge. Tick flips to 'failed' with "DNS did not propagate" error.
 // No audit emitted.
+//
+// v1.6.8+: anchor is now updated_at (was created_at). The latter
+// punished operators who cadastraram a Cloudflare credential days
+// after adding the domain — auto_configure runs, bumps updated_at,
+// resets the deadline. See TestDNSVerifier_AutoConfiguredAfterStale.
 func TestDNSVerifier_AgedOut_FlipsToFailed(t *testing.T) {
 	h := Setup(t)
 	f := newDomainsFixture(t, h, "verifier-old-4444", 3604)
 	id := seedAutoConfiguredDomain(t, h, f.deploymentID, "old.example.com")
 
-	// Backdate the row's created_at so it looks 10 minutes old; the
+	// Backdate both timestamps so the row looks 10 minutes stale; the
 	// fixedClock leaves "now" at the wall clock so the diff exceeds
-	// MaxAge=1m.
+	// MaxAge=1m. We touch BOTH columns to make the test honest about
+	// what the new anchor measures.
 	if _, err := h.DB.Exec(h.rootCtx, `
 		UPDATE deployment_domains
-		   SET created_at = now() - interval '10 minutes'
+		   SET created_at = now() - interval '10 minutes',
+		       updated_at = now() - interval '10 minutes'
 		 WHERE id = $1
 	`, id); err != nil {
-		t.Fatalf("backdate created_at: %v", err)
+		t.Fatalf("backdate timestamps: %v", err)
 	}
 
 	resolver := &stubLookupResolver{
@@ -414,5 +422,62 @@ func TestDNSVerifier_NoExpectedIP_NoOp(t *testing.T) {
 	// Row should remain untouched (still pending).
 	if status, _, _ := readDomainStatus(t, h, id); status != "pending" {
 		t.Errorf("status: got %q want pending (verifier was a no-op)", status)
+	}
+}
+
+// TestDNSVerifier_AutoConfiguredAfterStale_DeadlineResets covers the
+// v1.6.8 fix for the surfaced-on-synapsepanel-com regression: a row
+// created days ago (created_at well past MaxAge) but auto-configured
+// just now (updated_at fresh) must NOT be marked failed for "did not
+// propagate within X". The deadline anchor is updated_at, not
+// created_at — the auto_configure UPDATE bumps it, resetting the
+// clock. Pre-1.6.8 the same input flipped to failed in seconds with a
+// misleading "did not propagate within 5m0s" message.
+func TestDNSVerifier_AutoConfiguredAfterStale_DeadlineResets(t *testing.T) {
+	h := Setup(t)
+	f := newDomainsFixture(t, h, "verifier-stale-9988", 3611)
+	id := seedAutoConfiguredDomain(t, h, f.deploymentID, "stale.example.com")
+
+	// Mimic the production scenario:
+	//   - row created days ago (without a credential, the row sat
+	//     FAILED for a long time)
+	//   - operator then cadastrou the credential and clicked
+	//     "Auto-configure DNS", which bumped updated_at to NOW and
+	//     reset status back to 'pending' (the existing auto_configure
+	//     handler does this — we just stamp the timestamps directly
+	//     here so the test stays focused on the verifier).
+	if _, err := h.DB.Exec(h.rootCtx, `
+		UPDATE deployment_domains
+		   SET created_at = now() - interval '10 days',
+		       updated_at = now()
+		 WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("simulate stale-create + fresh auto_configure: %v", err)
+	}
+
+	// Resolver returns no match — we want to confirm the row stays
+	// 'pending' (not flipped to failed), not that it goes 'active'.
+	// A different test (already exists) covers the active flip.
+	resolver := &stubLookupResolver{
+		fn: func(host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("198.51.100.99")}, nil // wrong IP
+		},
+	}
+	v := &synapsedns.Verifier{
+		DB:         h.DB,
+		Resolver:   resolver,
+		ExpectedIP: "203.0.113.10",
+		MaxAge:     1 * time.Minute,
+	}
+	v.Tick(context.Background())
+
+	status, _, lastErr := readDomainStatus(t, h, id)
+	if status != "pending" {
+		t.Errorf("status: got %q want pending — created_at is old but updated_at was just bumped, so the deadline must NOT have fired", status)
+	}
+	// The "did not propagate within Xm" message would be the
+	// regression signature — call it out specifically.
+	if strings.Contains(lastErr, "did not propagate") {
+		t.Errorf("regression: row flipped on deadline despite recent updated_at (lastErr=%q)", lastErr)
 	}
 }

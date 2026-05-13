@@ -90,13 +90,23 @@ type Verifier struct {
 // on. Kept tiny — we only need what's required to (a) decide whether
 // to flip to active, (b) decide whether the row has aged out, and
 // (c) emit an audit event with enough context.
+//
+// deadlineAnchor (v1.6.8+) is what we measure "did it propagate in
+// time" against. Pre-v1.6.8 we used created_at, which silently
+// punished operators who cadastraram a credential days after adding
+// the domain — the deadline was already blown the second they hit
+// "Auto-configure DNS", flipping the row to 'failed' immediately
+// with "did not propagate within 5m0s" even though Cloudflare had
+// just acknowledged the upsert. updated_at gets bumped on every
+// write to the row (auto_configure, verify, etc), so it tracks
+// "time since we last touched it" — exactly the right anchor.
 type pendingRow struct {
 	id             string
 	domain         string
 	deploymentID   string
 	deploymentName string
 	teamID         string
-	createdAt      time.Time
+	deadlineAnchor time.Time
 }
 
 // defaults applied via accessors so callers can leave fields zero.
@@ -220,11 +230,13 @@ func (v *Verifier) Tick(ctx context.Context) {
 	now := v.now()
 	for _, row := range rows {
 		// Aged-out path: if a row has been sitting pending past
-		// MaxAge, give up and surface a "didn't propagate" hint so
-		// the operator knows to investigate (forgot to set the IP,
+		// MaxAge since the last write (auto_configure, verify, etc.),
+		// give up and surface a "didn't propagate" hint so the
+		// operator knows to investigate (forgot to set the IP,
 		// Cloudflare proxied the record, registrar didn't apply NS,
-		// etc.). Manual /verify can still re-run any time.
-		if now.Sub(row.createdAt) > maxAge {
+		// etc.). Manual /verify can still re-run any time, which
+		// bumps updated_at and resets this deadline naturally.
+		if now.Sub(row.deadlineAnchor) > maxAge {
 			v.markFailed(ctx, row, "DNS did not propagate within "+maxAge.String())
 			continue
 		}
@@ -246,7 +258,7 @@ func (v *Verifier) Tick(ctx context.Context) {
 // round-trip; teams.id is derived via projects.team_id.
 func (v *Verifier) loadPending(ctx context.Context) ([]pendingRow, error) {
 	rs, err := v.DB.Query(ctx, `
-		SELECT dd.id, dd.domain, d.id, d.name, p.team_id, dd.created_at
+		SELECT dd.id, dd.domain, d.id, d.name, p.team_id, dd.updated_at
 		  FROM deployment_domains dd
 		  JOIN deployments d ON d.id = dd.deployment_id
 		  JOIN projects p ON p.id = d.project_id
@@ -263,7 +275,7 @@ func (v *Verifier) loadPending(ctx context.Context) ([]pendingRow, error) {
 	var out []pendingRow
 	for rs.Next() {
 		var r pendingRow
-		if err := rs.Scan(&r.id, &r.domain, &r.deploymentID, &r.deploymentName, &r.teamID, &r.createdAt); err != nil {
+		if err := rs.Scan(&r.id, &r.domain, &r.deploymentID, &r.deploymentName, &r.teamID, &r.deadlineAnchor); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

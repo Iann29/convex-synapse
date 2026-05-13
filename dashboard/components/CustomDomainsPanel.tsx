@@ -118,6 +118,17 @@ function CustomDomainsPanelExpanded({
     null,
   );
 
+  // v1.6.8+: belt-and-suspenders cleanup. The `verify` and
+  // `autoConfigure` handlers both clear their *ingId state in a
+  // finally block — but during a fast happy-path (auto-config → SWR
+  // mutate flips status to 'active' → React renders) there's a one-
+  // render window where the SWR cache says 'active' but the *ingId
+  // hasn't cleared yet, leaving the button stuck on "Verifying…".
+  // Observed on synapsepanel.com during the v1.6.7 smoke. The effect
+  // below catches every case: if the row whose id sits in *ingId is
+  // already active in the latest snapshot, the in-flight indicator
+  // can't possibly be meaningful, so we clear it.
+
   // Auto-config UI state. detection + autoConfigure are reset/refreshed
   // on every domain input change (debounced); selectedCredentialId
   // sticks across re-renders so the operator's pick survives a typo.
@@ -153,6 +164,24 @@ function CustomDomainsPanelExpanded({
   );
 
   const domains = useMemo(() => data ?? [], [data]);
+
+  // v1.6.8 cleanup effect. Mirrors verifyingId/autoConfiguringId
+  // against the latest SWR snapshot; if the row referenced by either
+  // is already active, no in-flight indicator should be showing.
+  useEffect(() => {
+    if (verifyingId) {
+      const row = domains.find((d) => d.id === verifyingId);
+      if (row && row.status === "active") {
+        setVerifyingId(null);
+      }
+    }
+    if (autoConfiguringId) {
+      const row = domains.find((d) => d.id === autoConfiguringId);
+      if (row && row.status === "active") {
+        setAutoConfiguringId(null);
+      }
+    }
+  }, [domains, verifyingId, autoConfiguringId]);
 
   // Debounced provider detection — fires 500ms after the operator
   // stops typing. Skips obviously-empty / invalid inputs to avoid
