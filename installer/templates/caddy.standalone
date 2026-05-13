@@ -24,12 +24,19 @@
 }
 
 {{DOMAIN}} {
-    # /v1/*   → Synapse REST API
-    # /d/*    → Convex backend reverse proxy (per-deployment routing)
-    # /health → Synapse healthcheck endpoint
-    # everything else → the dashboard
+    # /v1/*       → Synapse REST API
+    # /d/*        → Convex backend reverse proxy (per-deployment routing)
+    # /health     → Synapse healthcheck endpoint
+    # /__convex/* → Same-origin reverse proxy to the Convex Dashboard
+    #               image (v1.6.11+). The Next.js /embed/<name> page
+    #               iframes this path so the dashboard's postMessage
+    #               handshake runs same-origin — kills the pre-v1.6.11
+    #               Mixed-Content + :6791-TLS gap. synapse-api owns the
+    #               route and reverse-proxies internally to the
+    #               convex-dashboard-proxy Caddy sidecar.
+    # everything else → the Synapse Next.js dashboard
     @dashboard {
-        not path /v1/* /d/* /health
+        not path /v1/* /d/* /health /__convex/*
     }
     handle @dashboard {
         reverse_proxy synapse-dashboard:3000

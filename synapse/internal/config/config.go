@@ -130,15 +130,29 @@ type Config struct {
 	// (rows stay status='pending' with a helpful last_dns_error).
 	PublicIP string
 
-	// DashboardAddr is the upstream `host:port` the proxy forwards
-	// requests for `role='dashboard'` deployment_domains rows to —
-	// i.e. an operator who registered "admin.example.com" with role
-	// dashboard expects browser traffic to that host to land on the
-	// Synapse Convex Dashboard. Empty disables dashboard-role
-	// routing (the proxy emits 503 dashboard_not_configured).
-	// Default mirrors compose ("synapse-convex-dashboard-proxy:80");
-	// host-mode deployments can point at "127.0.0.1:6791".
+	// DashboardAddr is the upstream `host:port` of the open-source
+	// Convex Dashboard image (via the convex-dashboard-proxy Caddy
+	// sidecar that strips iframe-blocking headers). Used in two
+	// places: (1) the /__convex/* chi mount that the Synapse Next.js
+	// /embed/<name> iframes same-origin (v1.6.11+); (2) role=
+	// 'dashboard' custom domains as the convex image upstream. Empty
+	// disables both (503). Default mirrors compose
+	// ("synapse-convex-dashboard-proxy:80"); host-mode deployments can
+	// point at "127.0.0.1:6791".
 	DashboardAddr string
+
+	// DashboardShellAddr is the upstream `host:port` of the Synapse
+	// Next.js dashboard service (the chrome around the Convex
+	// iframe — /login, /teams/*, /embed/<name>, etc.). Used by
+	// role='dashboard' custom domains (v1.6.11+): when an operator
+	// hits dashboard.<custom>.com/login, that path proxies here so
+	// the full Synapse experience is served at the branded URL
+	// instead of the bare Convex login form. Empty disables the
+	// shell path (the dispatcher 503s unknown paths) but the API
+	// + /__convex/* still work. Default mirrors compose
+	// ("synapse-dashboard:3000"); host-mode deployments can point at
+	// "127.0.0.1:6790" (the dashboard container's published port).
+	DashboardShellAddr string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -213,7 +227,8 @@ func Load() (*Config, error) {
 		UpdaterToken:  os.Getenv("SYNAPSE_UPDATER_TOKEN"),
 		GitHubRepo:    getEnvDefault("SYNAPSE_GITHUB_REPO", "Iann29/convex-synapse"),
 		PublicIP:      strings.TrimSpace(os.Getenv("SYNAPSE_PUBLIC_IP")),
-		DashboardAddr: getEnvDefault("SYNAPSE_DASHBOARD_UPSTREAM", "synapse-convex-dashboard-proxy:80"),
+		DashboardAddr:      getEnvDefault("SYNAPSE_DASHBOARD_UPSTREAM", "synapse-convex-dashboard-proxy:80"),
+		DashboardShellAddr: getEnvDefault("SYNAPSE_DASHBOARD_SHELL_UPSTREAM", "synapse-dashboard:3000"),
 	}, nil
 }
 

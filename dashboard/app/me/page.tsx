@@ -82,8 +82,32 @@ function AboutSection() {
     "/v1/install_status",
     async () => {
       // Use raw fetch — install_status is anonymous, no Bearer needed.
-      const base =
-        process.env.NEXT_PUBLIC_SYNAPSE_URL || "http://localhost:8080";
+      // Same logic as lib/api.ts::resolveBaseURL: prefer the build-
+      // time env URL when it matches the current origin (or shares
+      // its hostname — the dev :6790/:8080 split), fall back to the
+      // page origin so custom dashboard domains stay same-origin.
+      // Inlined because lib/api.ts doesn't export the helper.
+      let base: string;
+      const envURL =
+        process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "") || "";
+      if (typeof window === "undefined") {
+        base = envURL || "http://localhost:8080";
+      } else {
+        base = window.location.origin;
+        if (envURL) {
+          try {
+            const env = new URL(envURL);
+            if (
+              env.origin === window.location.origin ||
+              env.hostname === window.location.hostname
+            ) {
+              base = envURL;
+            }
+          } catch {
+            /* malformed env — keep origin */
+          }
+        }
+      }
       const r = await fetch(`${base}/v1/install_status`, { cache: "no-store" });
       return r.ok ? r.json() : {};
     },

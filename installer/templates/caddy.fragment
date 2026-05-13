@@ -1,10 +1,13 @@
 {{DOMAIN}} {
-    # /v1/*  → Synapse REST API
-    # /d/*   → Convex backend reverse proxy (per-deployment routing)
-    # /health → Synapse healthcheck endpoint
+    # /v1/*       → Synapse REST API
+    # /d/*        → Convex backend reverse proxy (per-deployment routing)
+    # /health     → Synapse healthcheck endpoint
+    # /__convex/* → Same-origin Convex Dashboard proxy (v1.6.11+);
+    #               synapse-api owns the route and reverse-proxies
+    #               internally to the convex-dashboard-proxy sidecar.
     # everything else → the dashboard
     @dashboard {
-        not path /v1/* /d/* /health
+        not path /v1/* /d/* /health /__convex/*
     }
     handle @dashboard {
         reverse_proxy localhost:{{DASHBOARD_PORT}}
