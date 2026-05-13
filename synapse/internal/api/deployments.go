@@ -449,23 +449,42 @@ func postgresURLRequiresSSL(url string) bool {
 // stores "http://127.0.0.1:<port>" — fine for synapse-side healthchecks
 // but useless from outside the host.
 //
-// Decision matrix:
-//   - BaseDomain set (any other flag)      → "https://<name>.<BaseDomain>"
-//   - PublicURL empty                      → return d.DeploymentURL (legacy)
-//   - PublicURL set, ProxyEnabled true     → "<PublicURL>/d/<name>"
-//   - PublicURL set, ProxyEnabled false    → "<PublicURL>:<host_port>"
+// Decision matrix (first match wins):
+//   - Adopted                          → d.DeploymentURL (operator-supplied)
+//   - active custom domain api (v1.6.13+) → "https://<custom_domain>"
+//   - BaseDomain set                   → "https://<name>.<BaseDomain>"
+//   - PublicURL empty                  → return d.DeploymentURL (legacy)
+//   - PublicURL set, ProxyEnabled true → "<PublicURL>/d/<name>"
+//   - PublicURL set, ProxyEnabled false→ "<PublicURL>:<host_port>"
 //
-// Adopted deployments keep d.DeploymentURL — the operator already
-// supplied a public URL when they registered it.
+// The custom-domain branch matters for two reasons:
+//   1. Brand: operators who registered `api.<client>.com` (role=api,
+//      status=active) intend that URL to be THE public face of the
+//      deployment. The dashboard's deployment row should display it,
+//      "Copy URL" should copy it, the iframe's Convex Dashboard
+//      should call it for queries/mutations/files — everything.
+//   2. Consistency with cliDeploymentURL: that helper already picks
+//      the custom domain since v1.6.3. Pre-v1.6.13 the dashboard UI
+//      (publicDeploymentURL) and the CLI (cliDeploymentURL) returned
+//      DIFFERENT URLs for the same deployment, which surprised
+//      operators who copied one place and pasted into another. They
+//      now agree.
 //
-// BaseDomain wins over the path-based shape because if the operator
-// took the trouble to wire wildcard DNS + on-demand TLS, they want
-// Convex clients to see "<name>.<host>" — not "<host>/d/<name>"
-// which the dashboard's Convex Cloud-style UX assumes is the URL
-// scheme.
-func (h *DeploymentsHandler) publicDeploymentURL(d *models.Deployment) string {
+// BaseDomain still wins over the path-based shape when no custom
+// domain is configured: if the operator took the trouble to wire
+// wildcard DNS + on-demand TLS, they want Convex clients to see
+// "<name>.<host>" — not "<host>/d/<name>" which the dashboard's
+// Convex-Cloud-style UX assumes is the URL scheme.
+//
+// On db lookup failure (transient blip) we fall back to the legacy
+// decision tree — better to render a possibly-stale URL than 500 the
+// request.
+func (h *DeploymentsHandler) publicDeploymentURL(ctx context.Context, d *models.Deployment) string {
 	if d.Adopted {
 		return d.DeploymentURL
+	}
+	if domain := h.lookupActiveAPIDomain(ctx, d.ID); domain != "" {
+		return "https://" + domain
 	}
 	if h.BaseDomain != "" {
 		return "https://" + d.Name + "." + h.BaseDomain
@@ -1242,7 +1261,7 @@ func (h *DeploymentsHandler) createDeployment(w http.ResponseWriter, r *http.Req
 	// Rewrite DeploymentURL to the public-reachable form so the dashboard
 	// renders something the operator's browser can actually hit (PR #10
 	// added the helper but only wired it into /auth + /cli_credentials).
-	d.DeploymentURL = h.publicDeploymentURL(&d)
+	d.DeploymentURL = h.publicDeploymentURL(r.Context(), &d)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -1465,7 +1484,7 @@ func (h *DeploymentsHandler) adoptDeployment(w http.ResponseWriter, r *http.Requ
 	// Calling the helper anyway is the explicit contract: same code
 	// path as the other handlers so a future change to the rewrite
 	// rules doesn't accidentally diverge here.
-	d.DeploymentURL = h.publicDeploymentURL(&d)
+	d.DeploymentURL = h.publicDeploymentURL(r.Context(), &d)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -1590,7 +1609,7 @@ func (h *DeploymentsHandler) getProjectDeployment(w http.ResponseWriter, r *http
 	if creator != nil {
 		d.CreatorUserID = *creator
 	}
-	d.DeploymentURL = h.publicDeploymentURL(&d)
+	d.DeploymentURL = h.publicDeploymentURL(r.Context(), &d)
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -1612,7 +1631,7 @@ func (h *DeploymentsHandler) getDeployment(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	d.DeploymentURL = h.publicDeploymentURL(d)
+	d.DeploymentURL = h.publicDeploymentURL(r.Context(), d)
 	writeJSON(w, http.StatusOK, d)
 }
 

@@ -164,7 +164,7 @@ func (h *DashboardProxyHandler) listDeploymentsForDashboard(w http.ResponseWrite
 		}
 		publicURL := d.DeploymentURL
 		if h.Deployments != nil {
-			publicURL = h.Deployments.publicDeploymentURL(&d)
+			publicURL = h.Deployments.publicDeploymentURL(r.Context(), &d)
 		}
 		out = append(out, upstreamDeployment{
 			Name:     d.Name,

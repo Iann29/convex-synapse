@@ -266,6 +266,18 @@ export default function EmbedDashboardPage({
         )}
       </header>
       <iframe
+        // v1.6.13+: key={name} forces React to unmount + remount the
+        // iframe whenever the picker switches deployments. The src
+        // value is the same constant URL across deployments (the
+        // Convex Dashboard image at https://<host>:6791), so without
+        // a key React reconciles the iframe in place — same DOM
+        // node, same src, no reload. The postMessage handshake that
+        // injects adminKey + deploymentUrl only fires on iframe
+        // mount, so the Convex Dashboard kept using the previous
+        // deployment's creds from its own localStorage and surfaced
+        // "deployment URL or admin key is invalid" the moment the
+        // operator clicked a sibling in the picker.
+        key={name}
         ref={iframeRef}
         src={CONVEX_DASHBOARD_URL}
         title={`${name} — Convex Dashboard`}
