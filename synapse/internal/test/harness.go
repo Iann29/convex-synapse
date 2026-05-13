@@ -152,6 +152,12 @@ type SetupOpts struct {
 	// resolver. nil = use the system resolver (production wiring).
 	HostDomainResolver api.HostDomainResolver
 
+	// DomainsResolver lets per-deployment custom-domain tests inject
+	// a fake DNS resolver for verifyDomainDNS. nil = production wiring
+	// (synapsedns.ExternalResolver). Tests use it to deterministically
+	// exercise the active / pending / failed flips.
+	DomainsResolver api.LookupIPResolver
+
 	// DNSEnvelope opts the test into the DNS-credentials path. Pass
 	// a real *crypto.SecretBox to exercise encrypt+decrypt; leave
 	// nil to drive the "crypto_not_configured" 503 path.
@@ -264,6 +270,7 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		GitHubAPIBase:         opts.GitHubAPIBase,
 		PublicIP:              opts.PublicIP,
 		HostDomainResolver:    opts.HostDomainResolver,
+		DomainsResolver:       opts.DomainsResolver,
 		DNSEnvelope:           opts.DNSEnvelope,
 		CloudflareFactory:     opts.CloudflareFactory,
 		DNSProviderLookup:     opts.DNSProviderLookup,

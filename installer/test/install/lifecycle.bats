@@ -200,6 +200,122 @@ EOF
     assert_output ""
 }
 
+# ---- source_env_file -----------------------------------------------
+# Regression coverage for the v1.6.10 "daemon-driven upgrade rebuilds
+# with stale shell env" fix. The function MUST: (a) export every
+# well-formed KEY=VALUE pair, (b) overwrite any pre-existing shell
+# value (this is the whole point — daemon's snapshot is stale),
+# (c) strip surrounding quotes from values, (d) tolerate blank lines
+# and # comments, (e) silently skip malformed lines without failing,
+# (f) NEVER evaluate values as code (defense against a shell-meta
+# injection via .env).
+
+@test "source_env_file: exports every well-formed KEY=VALUE" {
+    cat >"$ENV_FILE" <<'EOF'
+FOO=bar
+BAZ=qux
+NUMERIC=42
+EOF
+    unset FOO BAZ NUMERIC
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$FOO" = "bar" ]
+    [ "$BAZ" = "qux" ]
+    [ "$NUMERIC" = "42" ]
+}
+
+@test "source_env_file: overrides stale shell value (the whole point)" {
+    cat >"$ENV_FILE" <<'EOF'
+PUBLIC_SYNAPSE_URL=https://synapsepanel.com
+EOF
+    # Simulate the daemon's stale snapshot — the bug we're fixing.
+    export PUBLIC_SYNAPSE_URL="http://72.60.3.159:8080"
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$PUBLIC_SYNAPSE_URL" = "https://synapsepanel.com" ]
+}
+
+@test "source_env_file: strips surrounding double quotes from value" {
+    cat >"$ENV_FILE" <<'EOF'
+QUOTED="hello world"
+EOF
+    unset QUOTED
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$QUOTED" = "hello world" ]
+}
+
+@test "source_env_file: strips surrounding single quotes from value" {
+    cat >"$ENV_FILE" <<'EOF'
+SQ='single-quoted'
+EOF
+    unset SQ
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$SQ" = "single-quoted" ]
+}
+
+@test "source_env_file: skips blank lines and # comments" {
+    cat >"$ENV_FILE" <<'EOF'
+# This is a comment that should never become a variable.
+
+KEPT=yes
+
+# Another comment.
+EOF
+    unset KEPT
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$KEPT" = "yes" ]
+    # The comment text mustn't end up as a variable name.
+    [ -z "${This:-}" ]
+}
+
+@test "source_env_file: skips malformed lines without failing" {
+    cat >"$ENV_FILE" <<'EOF'
+GOOD=value
+KEY WITH SPACES=bogus
+=missing_key
+123STARTS_WITH_DIGIT=nope
+GOOD_AFTER=also_ok
+EOF
+    unset GOOD GOOD_AFTER STARTS_WITH_DIGIT
+    run lifecycle::source_env_file "$ENV_FILE"
+    assert_success
+    # Re-source from the same shell so the assertions see the exports.
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$GOOD" = "value" ]
+    [ "$GOOD_AFTER" = "also_ok" ]
+    # Malformed entries must NOT pollute the env.
+    [ -z "${KEY:-}" ]
+    [ -z "${STARTS_WITH_DIGIT:-}" ]
+}
+
+@test "source_env_file: never executes shell metacharacters in values" {
+    # If we ever regressed to `source $file` or `eval`, the command
+    # substitution inside the value would run `touch $BATS_TEST_TMPDIR/pwned`.
+    # The safe parser must take the value as a literal string.
+    cat >"$ENV_FILE" <<EOF
+EVIL=\$(touch "$BATS_TEST_TMPDIR/pwned")
+EOF
+    unset EVIL
+    lifecycle::source_env_file "$ENV_FILE"
+    # The literal sub-shell expression survives as a string.
+    [[ "$EVIL" == "\$(touch \"$BATS_TEST_TMPDIR/pwned\")" ]]
+    # The dangerous side-effect must NOT have happened.
+    [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
+}
+
+@test "source_env_file: no-op on missing file (no error)" {
+    run lifecycle::source_env_file "$INSTALL_DIR/does-not-exist.env"
+    assert_success
+}
+
+@test "source_env_file: idempotent — second call doesn't drop values" {
+    cat >"$ENV_FILE" <<'EOF'
+FOO=bar
+EOF
+    unset FOO
+    lifecycle::source_env_file "$ENV_FILE"
+    lifecycle::source_env_file "$ENV_FILE"
+    [ "$FOO" = "bar" ]
+}
+
 # ---- upgrade: validation --------------------------------------------
 
 @test "upgrade: aborts with clear message when .env is missing" {
@@ -1915,6 +2031,81 @@ EOF2
 
     # Cleanup so subsequent tests don't inherit the export.
     unset SYNAPSE_VERSION
+}
+
+@test "upgrade phase B re-sources every .env key, overriding stale shell env" {
+    # v1.6.10 generalised the v1.5.7 SYNAPSE_VERSION re-export to ALL
+    # .env keys. The daemon-snapshot bug isn't unique to
+    # SYNAPSE_VERSION — anything an operator edits via --reconfigure
+    # (PUBLIC_SYNAPSE_URL after a domain switch, SYNAPSE_ALLOWED_ORIGINS,
+    # SYNAPSE_PUBLIC_IP after a VPS migration, etc.) has the same
+    # stale-snapshot risk. Without lifecycle::source_env_file, the
+    # compose build inherits the daemon's frozen value and bakes the
+    # wrong NEXT_PUBLIC_* into the dashboard image. Caught on
+    # synapsepanel.com after a `--reconfigure --domain=...` left the
+    # daemon snapshot stuck on the pre-reconfigure IP URL.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.6.9
+SYNAPSE_PORT=8080
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+PUBLIC_SYNAPSE_URL=https://synapsepanel.com
+EOF2
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+
+    # Capture compose's shell view of PUBLIC_SYNAPSE_URL at the moment
+    # of the build. With source_env_file this is the fresh .env value;
+    # without it, it's the simulated stale daemon snapshot.
+    cat >"$SYN_MOCK_BIN/docker" <<EOF2
+#!/usr/bin/env bash
+if [[ " \$* " == *" compose "* && " \$* " == *" up "* ]]; then
+    printf '%s\n' "\${PUBLIC_SYNAPSE_URL:-<unset>}" >"$BATS_TEST_TMPDIR/compose-saw-public-url"
+fi
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+
+    # Simulate the daemon's frozen, pre-reconfigure shell env. This is
+    # exactly the state synapsepanel.com was in: .env had the new
+    # https://... URL, but the daemon's snapshot still carried the
+    # old http://<ip>:8080 from the IP-only install.
+    export PUBLIC_SYNAPSE_URL="http://72.60.3.159:8080"
+
+    SYNAPSE_UPGRADE_NO_REEXEC=1 \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.6.10
+    assert_success
+
+    # The compose build saw the FRESH .env value, not the stale
+    # snapshot the test pre-exported.
+    [ -f "$BATS_TEST_TMPDIR/compose-saw-public-url" ]
+    run cat "$BATS_TEST_TMPDIR/compose-saw-public-url"
+    assert_output "https://synapsepanel.com"
+
+    # Cleanup.
+    unset PUBLIC_SYNAPSE_URL
 }
 
 @test "upgrade: re-exec falls through when \$install_dir/setup.sh isn't executable" {

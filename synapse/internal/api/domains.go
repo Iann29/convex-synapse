@@ -63,10 +63,18 @@ type DomainsHandler struct {
 	// router deps and both surfaces hit the stubbed Cloudflare API.
 	CloudflareFactory func(token string) *synapsedns.CloudflareClient
 
-	// resolver is overridable in tests so the DNS path doesn't reach
+	// Resolver is overridable in tests so the DNS path doesn't reach
 	// out to the real internet from the integration suite. nil =
-	// use net.DefaultResolver.
-	resolver *net.Resolver
+	// use synapsedns.ExternalResolver (1.1.1.1, 8.8.8.8 fallback)
+	// instead of net.DefaultResolver — the OS resolver inside our
+	// distroless container can't be relied on (see resolver.go).
+	//
+	// Interface-typed (not *net.Resolver) so tests can pass a tiny
+	// in-memory stub instead of stubbing a full *net.Resolver dial
+	// path. Production wiring leaves this nil; router_test +
+	// deployment_domains_test inject a fake when they need to
+	// exercise propagation / mismatch scenarios deterministically.
+	Resolver LookupIPResolver
 }
 
 // MountInDeploymentRoutes registers the /domains sub-routes on a
@@ -145,11 +153,33 @@ func validateRole(raw string) (string, string, string) {
 }
 
 // verifyDomainDNS resolves `domain` and reports whether any returned
-// IPv4 matches `expectedIP`. Returns (status, errMsg) — empty errMsg
-// only on a clean active match.
+// IPv4 matches `expectedIP`. Returns (status, errMsg).
+//
+// Status mapping:
+//
+//   - active: a returned IPv4 exactly matches expectedIP. errMsg "".
+//   - pending: the lookup couldn't see the record yet (NXDOMAIN /
+//     no-such-host / SERVFAIL / timeout / "no A records returned").
+//     This is a TRANSIENT failure — DNS propagation hasn't reached the
+//     resolver, OR the operator just minted the record and the world
+//     hasn't caught up. The dns.Verifier loop keeps retrying every
+//     15s; we mirror its semantics in the sync path so an impatient
+//     "Verify" click during the propagation window doesn't flip the
+//     row to a permanent-looking failed state. errMsg carries the
+//     lookup error so the dashboard can show "still propagating".
+//   - failed: the resolver returned IPv4s but NONE matched expectedIP.
+//     This is DETERMINISTIC — propagation completed and is pointing
+//     somewhere else (proxied through Cloudflare orange-cloud,
+//     pointing at a different host, etc.). The operator must act.
+//     errMsg has the "expected X, got Y" hint.
 //
 // `expectedIP` empty short-circuits to ('pending', publicIPNotConfiguredHint)
 // so callers don't have to special-case the unconfigured cluster.
+//
+// The resolver is ExternalResolver (1.1.1.1 with 8.8.8.8 fallback)
+// when the test seam isn't set — see internal/dns/resolver.go for
+// why we don't trust net.DefaultResolver inside the distroless
+// container.
 func (h *DomainsHandler) verifyDomainDNS(ctx context.Context, domain, expectedIP string) (string, string) {
 	if expectedIP == "" {
 		return models.DomainStatusPending, publicIPNotConfiguredHint
@@ -157,16 +187,17 @@ func (h *DomainsHandler) verifyDomainDNS(ctx context.Context, domain, expectedIP
 	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
 	defer cancel()
 
-	resolver := h.resolver
-	if resolver == nil {
-		resolver = net.DefaultResolver
-	}
+	resolver := h.dnsResolver()
 	ips, err := resolver.LookupIP(lookupCtx, "ip4", domain)
 	if err != nil {
-		return models.DomainStatusFailed, "lookup failed: " + err.Error()
+		// Lookup error → still propagating. Verifier loop retries
+		// until MaxAge ages the row out (5min after the last write).
+		return models.DomainStatusPending, "still propagating: " + err.Error()
 	}
 	if len(ips) == 0 {
-		return models.DomainStatusFailed, "no A records returned"
+		// Resolver returned cleanly with zero records. Same shape as
+		// NXDOMAIN semantically — record isn't visible yet.
+		return models.DomainStatusPending, "still propagating: no A records returned"
 	}
 	got := make([]string, 0, len(ips))
 	for _, ip := range ips {
@@ -178,6 +209,25 @@ func (h *DomainsHandler) verifyDomainDNS(ctx context.Context, domain, expectedIP
 	}
 	return models.DomainStatusFailed,
 		"expected " + expectedIP + ", got " + strings.Join(got, ", ")
+}
+
+// dnsResolver returns the test-injected resolver if set, otherwise
+// the production ExternalResolver. Centralised so the two call sites
+// (verifyDomainDNS + any future preflight) can't drift on the
+// default.
+func (h *DomainsHandler) dnsResolver() LookupIPResolver {
+	if h.Resolver != nil {
+		return h.Resolver
+	}
+	return synapsedns.ExternalResolver()
+}
+
+// LookupIPResolver is the minimal subset of *net.Resolver
+// verifyDomainDNS depends on. Lets dnsResolver return either an
+// injected test stub or the ExternalResolver helper behind one
+// interface.
+type LookupIPResolver interface {
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
 }
 
 // domainResponse is the shape returned by POST /domains, POST
