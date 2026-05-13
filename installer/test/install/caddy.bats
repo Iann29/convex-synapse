@@ -159,11 +159,17 @@ echo "reload-was-called" > "$BATS_TEST_TMPDIR/reload-marker"
 EOF
     chmod +x "$SYN_MOCK_BIN/fakereload"
     DOMAIN=synapse.example.com DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    CONVEX_DASHBOARD_PORT=6791 \
     CADDY_RELOAD="$SYN_MOCK_BIN/fakereload" \
         caddy::install_host_block "$CADDY_FILE"
     [ -f "$CADDY_FILE" ]
-    run grep -c "synapse.example.com" "$CADDY_FILE"
-    assert_output "1"
+    # v1.6.12+: the fragment renders TWO site blocks — the main
+    # {{DOMAIN}} { ... } and {{DOMAIN}}:6791 { ... } for the
+    # TLS-fronted Convex Dashboard iframe URL. Non-comment match
+    # only, so the comment-prose mention of the domain inside the
+    # :6791 block doesn't perturb the count.
+    run bash -c "grep -v '^[[:space:]]*#' '$CADDY_FILE' | grep -c 'synapse.example.com'"
+    assert_output "2"
     run grep -c "localhost:6790" "$CADDY_FILE"
     assert_output "1"
     [ -f "$BATS_TEST_TMPDIR/reload-marker" ]
@@ -176,17 +182,22 @@ exit 0
 EOF
     chmod +x "$SYN_MOCK_BIN/fakereload"
     DOMAIN=v1.example.com DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    CONVEX_DASHBOARD_PORT=6791 \
     CADDY_RELOAD="$SYN_MOCK_BIN/fakereload" \
         caddy::install_host_block "$CADDY_FILE"
     DOMAIN=v2.example.com DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    CONVEX_DASHBOARD_PORT=6791 \
     CADDY_RELOAD="$SYN_MOCK_BIN/fakereload" \
         caddy::install_host_block "$CADDY_FILE"
     run grep -c "^# BEGIN synapse" "$CADDY_FILE"
     assert_output "1"
     run grep -c "v1.example.com" "$CADDY_FILE"
     assert_output "0"
-    run grep -c "v2.example.com" "$CADDY_FILE"
-    assert_output "1"
+    # v1.6.12+: two site blocks per domain (main + :6791). Comment
+    # prose may also mention the domain inside the :6791 block, so
+    # filter comments to count only the load-bearing references.
+    run bash -c "grep -v '^[[:space:]]*#' '$CADDY_FILE' | grep -c 'v2.example.com'"
+    assert_output "2"
 }
 
 # ---- print_nginx_snippet -------------------------------------------
@@ -211,20 +222,28 @@ EOF
         caddy::write_standalone "$out"
     [ -f "$out" ]
     # Only count NON-COMMENT lines so a future template prose tweak
-    # mentioning the domain doesn't break the test. The site block
-    # header is the load-bearing part — that's exactly one.
+    # mentioning the domain doesn't break the test. v1.6.12+ renders
+    # TWO site blocks for the main domain: the :443 block and the
+    # :6791 TLS-fronted Convex Dashboard iframe block.
     run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse.example.com'"
-    assert_output "1"
+    assert_output "2"
     run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'ops@example.com'"
     assert_output "1"
     # Compose mode uses container names, not localhost — so the
     # Caddy container in synapse-network can reach the upstream
-    # services by service name. Three reverse_proxy directives in
+    # services by service name. Three synapse-api references in
     # v1.6.8+: main site + ask URL in global on_demand_tls + :443
     # catch-all for per-deployment custom domains.
     run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse-api:8080'"
     assert_output "3"
     run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse-dashboard:3000'"
+    assert_output "1"
+    # v1.6.12+: dedicated :6791 site block proxying the upstream
+    # Convex Dashboard image (via the convex-dashboard-proxy Caddy
+    # sidecar that strips X-Frame-Options).
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse.example.com:6791'"
+    assert_output "1"
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'convex-dashboard-proxy:80'"
     assert_output "1"
 }
 
@@ -308,10 +327,10 @@ EOF
     DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
     CADDY_FORCE_OVERWRITE=1 \
         caddy::write_standalone "$out"
-    # Non-comment match — the template's prose mentions the domain in
-    # a couple of comments but only one site block carries it.
+    # v1.6.12+: two non-comment matches — main {{DOMAIN}} + the
+    # {{DOMAIN}}:6791 TLS-fronted Convex Dashboard block.
     run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'fresh.example.com'"
-    assert_output "1"
+    assert_output "2"
     run grep -c "^old$" "$out"
     assert_output "0"
 }
