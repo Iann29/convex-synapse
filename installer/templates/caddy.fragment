@@ -1,13 +1,10 @@
 {{DOMAIN}} {
-    # /v1/*       → Synapse REST API
-    # /d/*        → Convex backend reverse proxy (per-deployment routing)
-    # /health     → Synapse healthcheck endpoint
-    # /__convex/* → Same-origin Convex Dashboard proxy (v1.6.11+);
-    #               synapse-api owns the route and reverse-proxies
-    #               internally to the convex-dashboard-proxy sidecar.
+    # /v1/*  → Synapse REST API
+    # /d/*   → Convex backend reverse proxy (per-deployment routing)
+    # /health → Synapse healthcheck endpoint
     # everything else → the dashboard
     @dashboard {
-        not path /v1/* /d/* /health /__convex/*
+        not path /v1/* /d/* /health
     }
     handle @dashboard {
         reverse_proxy localhost:{{DASHBOARD_PORT}}
@@ -15,4 +12,15 @@
     handle {
         reverse_proxy localhost:{{SYNAPSE_PORT}}
     }
+}
+
+# v1.6.12+: TLS-fronted port for the embedded Convex Dashboard. The
+# Synapse /embed/<name> page iframes `https://{{DOMAIN}}:6791`; the
+# operator's host Caddy needs to terminate TLS here and forward to
+# the convex-dashboard-proxy container, which the docker-compose
+# stack publishes on localhost:{{CONVEX_DASHBOARD_PORT}}. Without
+# this block the iframe stays black on HTTPS parent pages because
+# nothing answers TLS ClientHello on :6791.
+{{DOMAIN}}:6791 {
+    reverse_proxy localhost:{{CONVEX_DASHBOARD_PORT}}
 }

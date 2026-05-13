@@ -1,14 +1,41 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ApiError, api } from "@/lib/api";
 
+// safeReturnTo guards against open-redirect attacks: only accept
+// absolute paths on this origin (start with `/`, not `//`, no
+// scheme prefix). Anything else falls back to /teams. Matches the
+// pattern used by lib/api.ts's 401 handler.
+function safeReturnTo(raw: string | null): string {
+  if (!raw) return "/teams";
+  if (!raw.startsWith("/") || raw.startsWith("//")) return "/teams";
+  if (raw.startsWith("/login")) return "/teams";
+  return raw;
+}
+
+// useSearchParams() bails the static-prerender (Next.js 16 requires
+// a Suspense boundary around any client component that calls it).
+// Page entry wraps the form in <Suspense> so the build can statically
+// generate /login while the searchParams resolve client-side. The
+// fallback is invisible — we just need to satisfy the Suspense
+// requirement; the form mounts a tick later under the same layout.
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
+  const search = useSearchParams();
+  const returnTo = safeReturnTo(search.get("return_to"));
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +68,10 @@ export default function LoginPage() {
     setPending(true);
     try {
       await api.login(email, password);
-      router.push("/teams");
+      // v1.6.12+: honour ?return_to so post-login routes to wherever
+      // the operator was trying to go (e.g. /embed/<bound> after a
+      // custom dashboard domain bounced them through here).
+      router.push(returnTo);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Login failed");
     } finally {

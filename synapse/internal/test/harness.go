@@ -158,13 +158,6 @@ type SetupOpts struct {
 	// exercise the active / pending / failed flips.
 	DomainsResolver api.LookupIPResolver
 
-	// ConvexDashboardUpstream wires the /__convex/* chi mount in
-	// tests. Pass an httptest.Server's `Host` (e.g. "127.0.0.1:33421")
-	// to let the integration suite assert proxy behaviour without
-	// reaching the real Convex Dashboard image. nil = empty → 503
-	// path is exercised.
-	ConvexDashboardUpstream string
-
 	// DNSEnvelope opts the test into the DNS-credentials path. Pass
 	// a real *crypto.SecretBox to exercise encrypt+decrypt; leave
 	// nil to drive the "crypto_not_configured" 503 path.
@@ -278,7 +271,6 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		PublicIP:              opts.PublicIP,
 		HostDomainResolver:    opts.HostDomainResolver,
 		DomainsResolver:       opts.DomainsResolver,
-		ConvexDashboardUpstream: opts.ConvexDashboardUpstream,
 		DNSEnvelope:           opts.DNSEnvelope,
 		CloudflareFactory:     opts.CloudflareFactory,
 		DNSProviderLookup:     opts.DNSProviderLookup,

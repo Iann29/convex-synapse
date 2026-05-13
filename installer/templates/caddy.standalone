@@ -24,19 +24,12 @@
 }
 
 {{DOMAIN}} {
-    # /v1/*       → Synapse REST API
-    # /d/*        → Convex backend reverse proxy (per-deployment routing)
-    # /health     → Synapse healthcheck endpoint
-    # /__convex/* → Same-origin reverse proxy to the Convex Dashboard
-    #               image (v1.6.11+). The Next.js /embed/<name> page
-    #               iframes this path so the dashboard's postMessage
-    #               handshake runs same-origin — kills the pre-v1.6.11
-    #               Mixed-Content + :6791-TLS gap. synapse-api owns the
-    #               route and reverse-proxies internally to the
-    #               convex-dashboard-proxy Caddy sidecar.
+    # /v1/*   → Synapse REST API
+    # /d/*    → Convex backend reverse proxy (per-deployment routing)
+    # /health → Synapse healthcheck endpoint
     # everything else → the Synapse Next.js dashboard
     @dashboard {
-        not path /v1/* /d/* /health /__convex/*
+        not path /v1/* /d/* /health
     }
     handle @dashboard {
         reverse_proxy synapse-dashboard:3000
@@ -44,6 +37,26 @@
     handle {
         reverse_proxy synapse-api:8080
     }
+}
+
+# v1.6.12+: TLS-fronted port for the embedded Convex Dashboard.
+# The Synapse Next.js /embed/<name> page iframes
+# `https://{{DOMAIN}}:6791`. Cross-origin to the parent on :443
+# (different port = different origin per the same-origin policy),
+# but the postMessage handshake handles cross-origin and the
+# upstream Convex Dashboard image keeps its root-path assumption
+# (so its absolute /_next/static/ asset URLs resolve correctly
+# against the iframe's own URL).
+#
+# Pre-v1.6.12 :6791 was just a plain-HTTP docker-compose port
+# mapping straight into convex-dashboard-proxy. Under HTTPS parent
+# pages every iframe load died with Mixed-Content; under TLS-fronted
+# parent pages the TLS handshake on :6791 failed because nothing
+# answered ClientHello. Caddy now terminates TLS here with the same
+# Let's Encrypt cert it minted for the :443 site (Caddy auto-issues
+# per (host, port) pair from the same account).
+{{DOMAIN}}:6791 {
+    reverse_proxy convex-dashboard-proxy:80
 }
 
 # Catch-all for per-deployment custom domains (v1.6.8+).

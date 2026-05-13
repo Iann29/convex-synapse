@@ -104,18 +104,17 @@ func TestDashboardHostHandler_PathDispatch(t *testing.T) {
 			wantBodyMarker: "api:/health",
 		},
 		{
-			name:           "/__convex/ root strips prefix to /",
-			path:           "/__convex/",
-			wantStatus:     http.StatusOK,
-			wantUpstream:   "api",
-			wantBodyMarker: "api:/__convex/",
-		},
-		{
-			name:           "/__convex/asset strips prefix on the upstream",
+			// v1.6.12+: /__convex/* no longer has a dedicated chi mount;
+			// the iframe URL went back to a cross-origin {{DOMAIN}}:6791
+			// flow served directly by Caddy. /__convex/* on a custom
+			// dashboard domain therefore just falls through to the
+			// Next.js shell, which doesn't know that path and returns a
+			// 404 page — fine, no operator is supposed to type it.
+			name:           "/__convex/* on custom dashboard domain goes to shell (404 page)",
 			path:           "/__convex/_next/static/foo.js",
 			wantStatus:     http.StatusOK,
-			wantUpstream:   "api",
-			wantBodyMarker: "api:/__convex/_next/static/foo.js",
+			wantUpstream:   "shell",
+			wantBodyMarker: "shell:/__convex/_next/static/foo.js",
 		},
 		{
 			name:           "/login goes to Synapse Next.js shell",

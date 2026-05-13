@@ -487,7 +487,20 @@ async function requestWithHeaders<T>(
   if (res.status === 401 && auth) {
     clearAuth();
     if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
-      window.location.href = "/login";
+      // Carry the current path + search through to the login form so
+      // the operator lands back where they were after re-authenticating.
+      // Critical for v1.6.12 custom dashboard domains: visiting
+      // `dashboard.<your>.com` 302s to `/embed/<bound>`, which 401s
+      // pre-auth, which used to send the operator to `/login` →
+      // `/teams` (wrong page, the project picker). With return_to,
+      // post-login lands them at /embed/<bound> as intended.
+      const here =
+        window.location.pathname + window.location.search;
+      const safe =
+        here && here !== "/" && !here.startsWith("/login")
+          ? `?return_to=${encodeURIComponent(here)}`
+          : "";
+      window.location.href = `/login${safe}`;
     }
     throw new ApiError(401, "unauthorized", "Session expired");
   }
