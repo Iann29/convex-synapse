@@ -27,7 +27,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.6.7"
+readonly INSTALLER_VERSION="1.6.8"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"

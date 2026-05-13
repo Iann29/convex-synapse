@@ -210,19 +210,45 @@ EOF
     SYNAPSE_BASE_DOMAIN= \
         caddy::write_standalone "$out"
     [ -f "$out" ]
-    run grep -c "synapse.example.com" "$out"
+    # Only count NON-COMMENT lines so a future template prose tweak
+    # mentioning the domain doesn't break the test. The site block
+    # header is the load-bearing part — that's exactly one.
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse.example.com'"
     assert_output "1"
-    run grep -c "ops@example.com" "$out"
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'ops@example.com'"
     assert_output "1"
     # Compose mode uses container names, not localhost — so the
     # Caddy container in synapse-network can reach the upstream
-    # services by service name. Two matches now: one for the main
-    # site's reverse_proxy, one for the on_demand_tls ask URL in
-    # the global block (the ask hook is harmless when no
-    # on-demand site exists, so it stays on regardless).
-    run grep -c "synapse-api:8080" "$out"
-    assert_output "2"
-    run grep -c "synapse-dashboard:3000" "$out"
+    # services by service name. Three reverse_proxy directives in
+    # v1.6.8+: main site + ask URL in global on_demand_tls + :443
+    # catch-all for per-deployment custom domains.
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse-api:8080'"
+    assert_output "3"
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'synapse-dashboard:3000'"
+    assert_output "1"
+}
+
+# v1.6.8 catch-all block: enables per-deployment custom domains like
+# api.<client>.com to reach Synapse with on-demand Let's Encrypt
+# certs. Without this block, custom domains in deployment_domains
+# resolved DNS-wise but Caddy refused the TLS handshake (no virtual
+# host) — the smoke regression that motivated v1.6.8.
+@test "write_standalone (v1.6.8+): emits :443 catch-all with on_demand TLS" {
+    local out="$BATS_TEST_TMPDIR/Caddyfile.catchall"
+    DOMAIN=synapse.example.com ACME_EMAIL=ops@example.com \
+    DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
+    SYNAPSE_BASE_DOMAIN= \
+        caddy::write_standalone "$out"
+
+    # Catch-all site block keyed on :443 (no host = match any host).
+    run grep -cE '^:443\s*\{' "$out"
+    assert_output "1"
+
+    # tls { on_demand } directive (per-site, distinct from the global
+    # on_demand_tls{} block). The global block always renders; the
+    # per-site directive is the catch-all's contribution.
+    # Pattern matches the bare "on_demand" inside a tls{} block.
+    run bash -c "grep -E '^[[:space:]]*on_demand[[:space:]]*$' '$out' | wc -l"
     assert_output "1"
 }
 
@@ -247,9 +273,11 @@ EOF
     # actual directive, even if comments mention it)
     run grep -E "^\s*ask\s+http://synapse-api:8080/v1/internal/tls_ask" "$out"
     assert_success
-    # Wildcard reverse_proxy points at the synapse-api service
+    # Wildcard reverse_proxy points at the synapse-api service.
+    # Three matches in v1.6.8+: main site's reverse_proxy +
+    # *.<base> wildcard + :443 catch-all.
     run grep -c "reverse_proxy synapse-api:8080" "$out"
-    assert_output "2"  # one for the main site's catch-all, one for the wildcard
+    assert_output "3"
 }
 
 @test "write_standalone: NO wildcard block when SYNAPSE_BASE_DOMAIN empty" {
@@ -280,7 +308,9 @@ EOF
     DASHBOARD_PORT=6790 SYNAPSE_PORT=8080 \
     CADDY_FORCE_OVERWRITE=1 \
         caddy::write_standalone "$out"
-    run grep -c "fresh.example.com" "$out"
+    # Non-comment match — the template's prose mentions the domain in
+    # a couple of comments but only one site block carries it.
+    run bash -c "grep -v '^[[:space:]]*#' '$out' | grep -c 'fresh.example.com'"
     assert_output "1"
     run grep -c "^old$" "$out"
     assert_output "0"
