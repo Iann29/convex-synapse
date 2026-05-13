@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Iann29/synapse/internal/models"
@@ -16,7 +17,7 @@ func TestPublicDeploymentURL_LegacyShape(t *testing.T) {
 		HostPort:      3210,
 		DeploymentURL: "http://127.0.0.1:3210",
 	}
-	if got := h.publicDeploymentURL(d); got != "http://127.0.0.1:3210" {
+	if got := h.publicDeploymentURL(context.Background(), d); got != "http://127.0.0.1:3210" {
 		t.Errorf("legacy: got %q want http://127.0.0.1:3210", got)
 	}
 }
@@ -36,7 +37,7 @@ func TestPublicDeploymentURL_ProxyMode(t *testing.T) {
 		DeploymentURL: "http://127.0.0.1:3210",
 	}
 	want := "https://synapse.example.com/d/happy-cat-1234"
-	if got := h.publicDeploymentURL(d); got != want {
+	if got := h.publicDeploymentURL(context.Background(), d); got != want {
 		t.Errorf("proxy: got %q want %q", got, want)
 	}
 }
@@ -55,7 +56,7 @@ func TestPublicDeploymentURL_HostPortMode(t *testing.T) {
 		DeploymentURL: "http://127.0.0.1:3210",
 	}
 	want := "https://synapse.example.com:3210"
-	if got := h.publicDeploymentURL(d); got != want {
+	if got := h.publicDeploymentURL(context.Background(), d); got != want {
 		t.Errorf("host-port: got %q want %q", got, want)
 	}
 }
@@ -75,7 +76,7 @@ func TestPublicDeploymentURL_AdoptedKeepsOperatorURL(t *testing.T) {
 		Adopted:       true,
 		DeploymentURL: "https://convex.my-other-host.example/api",
 	}
-	if got := h.publicDeploymentURL(d); got != "https://convex.my-other-host.example/api" {
+	if got := h.publicDeploymentURL(context.Background(), d); got != "https://convex.my-other-host.example/api" {
 		t.Errorf("adopted: got %q (rewrite leaked into adopted path)", got)
 	}
 }
@@ -94,7 +95,7 @@ func TestPublicDeploymentURL_HostPortFallback(t *testing.T) {
 		HostPort:      0,
 		DeploymentURL: "http://127.0.0.1:3210",
 	}
-	if got := h.publicDeploymentURL(d); got != "http://127.0.0.1:3210" {
+	if got := h.publicDeploymentURL(context.Background(), d); got != "http://127.0.0.1:3210" {
 		t.Errorf("no host port: got %q want fallback to DeploymentURL", got)
 	}
 }
@@ -110,7 +111,7 @@ func TestPublicDeploymentURL_NoDoubleSlash(t *testing.T) {
 	}
 	d := &models.Deployment{Name: "happy-cat-1234"}
 	want := "https://synapse.example.com/d/happy-cat-1234"
-	if got := h.publicDeploymentURL(d); got != want {
+	if got := h.publicDeploymentURL(context.Background(), d); got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
 }

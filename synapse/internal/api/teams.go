@@ -1071,7 +1071,7 @@ func (h *TeamsHandler) listDeployments(w http.ResponseWriter, r *http.Request) {
 		// container-internal "http://127.0.0.1:<port>" into something
 		// the dashboard's browser can hit.
 		if h.Deployments != nil {
-			d.DeploymentURL = h.Deployments.publicDeploymentURL(&d)
+			d.DeploymentURL = h.Deployments.publicDeploymentURL(r.Context(), &d)
 		}
 		deployments = append(deployments, d)
 	}

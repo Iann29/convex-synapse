@@ -617,6 +617,69 @@ lifecycle::_upgrade_phase_b() {
     # are unquoted by secrets::env_get. See its doc comment.
     lifecycle::source_env_file "$env_file"
 
+    # --- 8.6. refresh compose-Caddy Caddyfile if template changed ---
+    # v1.6.13+: detect a Caddyfile that lags the current template and
+    # re-render. Pre-v1.6.13, every release bump pulled new code +
+    # rebuilt containers but LEFT the rendered Caddyfile untouched —
+    # the v1.6.12 standalone template's :6791 TLS-fronting block
+    # landed on disk only on fresh installs / explicit `--reconfigure`.
+    # Operators upgrading from v1.6.11 → v1.6.12 saw iframes go black
+    # because synapse-caddy bound :6791 (compose picked up the new
+    # docker-compose.yml port mapping) but rejected every TLS
+    # handshake to that port (no `{{DOMAIN}}:6791 { ... }` site
+    # block in the rendered Caddyfile). Caught manually on
+    # synapsepanel.com; this auto-heal closes the loop.
+    #
+    # Runs AFTER source_env_file so DOMAIN/ACME_EMAIL/SYNAPSE_BASE_DOMAIN
+    # are in the shell env that caddy::_render's template
+    # substitution consumes.
+    #
+    # Strategy: re-render the template into a temp file, compare
+    # byte-for-byte to the existing Caddyfile, replace only on diff
+    # (so a hand-edited Caddyfile that happens to match the new
+    # template isn't touched, and we don't spam the operator's data
+    # dir with spurious backups on no-op upgrades). On a real diff:
+    # stash the old file as Caddyfile.bak.<timestamp> in case the
+    # operator customized something, then write the new render. The
+    # `compose up --build` two steps below recreates synapse-caddy
+    # against the new file, so we don't need to issue an explicit
+    # reload here.
+    #
+    # Best-effort: any failure logs a warning and keeps the old
+    # file. Broken Caddyfile is worse than stale Caddyfile.
+    if declare -F caddy::write_standalone >/dev/null; then
+        local caddyfile_path="$install_dir/Caddyfile"
+        if [[ -f "$caddyfile_path" ]]; then
+            local caddyfile_new
+            caddyfile_new="$(mktemp "${caddyfile_path}.new.XXXXXX")" || \
+                caddyfile_new=""
+            if [[ -n "$caddyfile_new" ]]; then
+                if CADDY_FORCE_OVERWRITE=1 \
+                    caddy::write_standalone "$caddyfile_new" >/dev/null 2>&1; then
+                    if ! cmp -s "$caddyfile_path" "$caddyfile_new"; then
+                        local ts
+                        ts="$(date +%s)"
+                        if cp -p "$caddyfile_path" \
+                            "${caddyfile_path}.bak.${ts}" 2>/dev/null; then
+                            ui::info "Caddyfile drifted from template — old version saved as Caddyfile.bak.${ts}"
+                        fi
+                        if mv -f "$caddyfile_new" "$caddyfile_path"; then
+                            lifecycle::log "$log_file" \
+                                "regenerated Caddyfile from current template"
+                        else
+                            ui::warn "could not replace Caddyfile after regen — keeping previous"
+                            rm -f "$caddyfile_new"
+                        fi
+                    else
+                        rm -f "$caddyfile_new"
+                    fi
+                else
+                    rm -f "$caddyfile_new"
+                fi
+            fi
+        fi
+    fi
+
     # --- 9. compose up -d --build ----------------------------------
     local profile_args=()
     while IFS= read -r line; do
@@ -1790,15 +1853,17 @@ lifecycle::_reconfigure_inner() {
     fi
 
     # ---- 4. read current state ----------------------------------------
-    local cur_domain cur_base cur_public_url cur_acme cur_port cur_dashboard_port
+    local cur_domain cur_base cur_public_url cur_acme cur_port cur_dashboard_port cur_dashboard_port_convex
     cur_domain="$(secrets::env_get "$env_file" SYNAPSE_DOMAIN)"
     cur_base="$(secrets::env_get "$env_file" SYNAPSE_BASE_DOMAIN)"
     cur_public_url="$(secrets::env_get "$env_file" SYNAPSE_PUBLIC_URL)"
     cur_acme="$(secrets::env_get "$env_file" SYNAPSE_ACME_EMAIL)"
     cur_port="$(secrets::env_get "$env_file" SYNAPSE_PORT)"
     cur_dashboard_port="$(secrets::env_get "$env_file" DASHBOARD_PORT)"
+    cur_dashboard_port_convex="$(secrets::env_get "$env_file" CONVEX_DASHBOARD_PORT)"
     cur_port="${cur_port:-8080}"
     cur_dashboard_port="${cur_dashboard_port:-6790}"
+    cur_dashboard_port_convex="${cur_dashboard_port_convex:-6791}"
 
     # ---- 5. compute new state -----------------------------------------
     # Mode resolution:
@@ -1832,15 +1897,25 @@ lifecycle::_reconfigure_inner() {
 
     # Compose dependent URLs.
     local target_public_url="" target_allowed_origins="*"
+    local target_convex_dashboard_url=""
     if [[ -n "$target_domain" ]]; then
         target_public_url="https://$target_domain"
         target_allowed_origins="https://$target_domain"
+        # v1.6.12+ Caddy fronts {{DOMAIN}}:6791 with TLS, so the
+        # iframe URL the dashboard bakes into NEXT_PUBLIC_CONVEX_DASHBOARD_URL
+        # is the TLS form. Pre-v1.6.13 reconfigure only updated
+        # PUBLIC_SYNAPSE_URL, leaving PUBLIC_CONVEX_DASHBOARD_URL
+        # stale at "http://<vps-ip>:6791" — the dashboard rebuilt
+        # under any later upgrade then baked a Mixed-Content iframe
+        # URL. Caught on synapsepanel.com; this branch closes the loop.
+        target_convex_dashboard_url="https://${target_domain}:${cur_dashboard_port_convex:-6791}"
     elif (( set_no_tls )); then
         # Try to detect the public IP so the dashboard URL is reachable
         # from a remote browser. Best-effort — empty IP means "local-only".
         local detected_ip=""
         if detected_ip="$(detect::public_ip 2>/dev/null)" && [[ -n "$detected_ip" ]]; then
             target_public_url="http://${detected_ip}:${cur_port}"
+            target_convex_dashboard_url="http://${detected_ip}:${cur_dashboard_port_convex:-6791}"
         fi
     fi
 
@@ -1879,6 +1954,7 @@ lifecycle::_reconfigure_inner() {
         -v sa="SYNAPSE_ACME_EMAIL=$target_acme" \
         -v ao="SYNAPSE_ALLOWED_ORIGINS=$target_allowed_origins" \
         -v pu="PUBLIC_SYNAPSE_URL=$target_public_url" \
+        -v pd="PUBLIC_CONVEX_DASHBOARD_URL=$target_convex_dashboard_url" \
         -v na="NEXT_PUBLIC_API_URL=$target_public_url" \
         -v co="CORS_ALLOWED_ORIGINS=$target_allowed_origins" \
         '
@@ -1889,6 +1965,7 @@ lifecycle::_reconfigure_inner() {
             seen["SYNAPSE_ACME_EMAIL"]=0
             seen["SYNAPSE_ALLOWED_ORIGINS"]=0
             seen["PUBLIC_SYNAPSE_URL"]=0
+            seen["PUBLIC_CONVEX_DASHBOARD_URL"]=0
             seen["NEXT_PUBLIC_API_URL"]=0
             seen["CORS_ALLOWED_ORIGINS"]=0
         }
@@ -1898,18 +1975,20 @@ lifecycle::_reconfigure_inner() {
         /^SYNAPSE_ACME_EMAIL=/     { print sa; seen["SYNAPSE_ACME_EMAIL"]=1; next }
         /^SYNAPSE_ALLOWED_ORIGINS=/{ print ao; seen["SYNAPSE_ALLOWED_ORIGINS"]=1; next }
         /^PUBLIC_SYNAPSE_URL=/     { print pu; seen["PUBLIC_SYNAPSE_URL"]=1; next }
+        /^PUBLIC_CONVEX_DASHBOARD_URL=/ { print pd; seen["PUBLIC_CONVEX_DASHBOARD_URL"]=1; next }
         /^NEXT_PUBLIC_API_URL=/    { print na; seen["NEXT_PUBLIC_API_URL"]=1; next }
         /^CORS_ALLOWED_ORIGINS=/   { print co; seen["CORS_ALLOWED_ORIGINS"]=1; next }
         { print }
         END {
-            if (!seen["SYNAPSE_DOMAIN"])          print sd
-            if (!seen["SYNAPSE_PUBLIC_URL"])      print sp
-            if (!seen["SYNAPSE_BASE_DOMAIN"])     print sb
-            if (!seen["SYNAPSE_ACME_EMAIL"])      print sa
-            if (!seen["SYNAPSE_ALLOWED_ORIGINS"]) print ao
-            if (!seen["PUBLIC_SYNAPSE_URL"])      print pu
-            if (!seen["NEXT_PUBLIC_API_URL"])     print na
-            if (!seen["CORS_ALLOWED_ORIGINS"])    print co
+            if (!seen["SYNAPSE_DOMAIN"])              print sd
+            if (!seen["SYNAPSE_PUBLIC_URL"])          print sp
+            if (!seen["SYNAPSE_BASE_DOMAIN"])         print sb
+            if (!seen["SYNAPSE_ACME_EMAIL"])          print sa
+            if (!seen["SYNAPSE_ALLOWED_ORIGINS"])     print ao
+            if (!seen["PUBLIC_SYNAPSE_URL"])          print pu
+            if (!seen["PUBLIC_CONVEX_DASHBOARD_URL"]) print pd
+            if (!seen["NEXT_PUBLIC_API_URL"])         print na
+            if (!seen["CORS_ALLOWED_ORIGINS"])        print co
         }
         ' "$env_file" >"$env_tmp"
 
