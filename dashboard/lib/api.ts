@@ -3,30 +3,51 @@
 
 import { clearAuth, getAccessToken, saveAuth, type AuthBundle, type User } from "./auth";
 
-// Pre-v1.6.11: BASE_URL was a build-time-baked constant pointing at the
-// operator's main install URL (e.g. https://synapsepanel.com). That
-// broke as soon as v1.6.11+ landed `role='dashboard'` custom domains:
-// JS served from `dashboard.<your>.com` would still call the BAKED
-// URL, every /v1/* request went cross-origin, and the JWT cookie /
-// localStorage gymnastics got hairy.
+// Pre-v1.6.11: BASE_URL was a build-time-baked constant pointing at
+// the operator's main install URL (e.g. https://synapsepanel.com).
+// That broke when v1.6.11+ shipped role='dashboard' custom domains:
+// JS served from `dashboard.<your>.com` still called the baked URL,
+// every /v1/* request went cross-origin, and the cookie / CORS
+// story got hairy.
 //
-// v1.6.11+: resolve at call time. In the browser, always use the
-// current page origin — Caddy and synapse-api route /v1/* to the
-// API regardless of which host the request arrived on (main install
-// URL, wildcard `<name>.<base>`, or any active deployment_domain).
-// SSR and Node.js test runs still get the env-var path. Dev (no
-// Caddy in front of Next.js) sets NEXT_PUBLIC_SYNAPSE_URL via the
-// .env.local override and gets that explicitly; the next.config.ts
-// dev-mode rewrite forwards /v1/* to the API anyway, so even the
-// browser-on-localhost case works without manual config.
+// v1.6.11+: resolve at call time, with a rule that handles both
+// the "same hostname, different port" dev workflow AND the
+// "completely different host" custom-domain case:
+//
+//   1. SSR / Node tests (window undefined)
+//        → env var if set, else http://localhost:8080.
+//
+//   2. Browser, env var set, and the env URL's origin matches the
+//      current page origin (or the same hostname on a different
+//      port — dev's localhost:8080 vs localhost:6790)
+//        → env URL. Keeps existing dev + production-main-domain
+//          behaviour identical to pre-v1.6.11.
+//
+//   3. Browser, anything else (custom dashboard domain hits the
+//      operator's main-URL-baked env)
+//        → window.location.origin. Caddy + synapse-api route /v1/*
+//          to the API regardless of the host, so same-origin Just
+//          Works on any custom domain bound to the install.
 function resolveBaseURL(): string {
-  if (typeof window !== "undefined") {
-    return window.location.origin;
+  const envURL = process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "");
+  if (typeof window === "undefined") {
+    return envURL || "http://localhost:8080";
   }
-  return (
-    process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "") ||
-    "http://localhost:8080"
-  );
+  if (envURL) {
+    try {
+      const envParsed = new URL(envURL);
+      const here = window.location;
+      // Exact origin match — the conventional production install on
+      // the operator's main domain.
+      if (envParsed.origin === here.origin) return envURL;
+      // Same hostname, different port — `npm run dev` and CI
+      // (dashboard at :6790, API at :8080 on the same host).
+      if (envParsed.hostname === here.hostname) return envURL;
+    } catch {
+      // Malformed env URL — fall through to current origin.
+    }
+  }
+  return window.location.origin;
 }
 
 export type Team = {
