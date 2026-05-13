@@ -82,8 +82,14 @@ function AboutSection() {
     "/v1/install_status",
     async () => {
       // Use raw fetch — install_status is anonymous, no Bearer needed.
+      // Same-origin: synapse-api handles /v1/* on every host we serve
+      // the dashboard from (main install URL, wildcard subdomain, or
+      // a role='dashboard' custom domain post-v1.6.11). The env-var
+      // fallback only matters for SSR / Node tests.
       const base =
-        process.env.NEXT_PUBLIC_SYNAPSE_URL || "http://localhost:8080";
+        typeof window !== "undefined"
+          ? window.location.origin
+          : process.env.NEXT_PUBLIC_SYNAPSE_URL || "http://localhost:8080";
       const r = await fetch(`${base}/v1/install_status`, { cache: "no-store" });
       return r.ok ? r.json() : {};
     },

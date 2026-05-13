@@ -13,23 +13,23 @@ import {
   type Team,
 } from "@/lib/api";
 
-// Where the open-source Convex Dashboard is hosted. Synapse runs it
-// as the `convex-dashboard` service in docker-compose; setup.sh wires
-// this env var to http://<vps-ip>:6791 (or https://<domain>:6791).
-const CONVEX_DASHBOARD_URL =
-  process.env.NEXT_PUBLIC_CONVEX_DASHBOARD_URL?.replace(/\/$/, "") ||
-  "http://localhost:6791";
-
-// Origin used for the postMessage handshake — derived from the URL
-// above. Restricting the target origin prevents creds from leaking
-// to a different page if the operator misconfigures the var.
-const CONVEX_DASHBOARD_ORIGIN = (() => {
-  try {
-    return new URL(CONVEX_DASHBOARD_URL).origin;
-  } catch {
-    return "*";
-  }
-})();
+// Where the open-source Convex Dashboard is hosted, as seen by the
+// browser. Pre-v1.6.11 this was a cross-origin URL (e.g.
+// https://<domain>:6791) which broke under HTTPS pages because Caddy
+// fronted :443 with TLS but :6791 stayed plain HTTP — every iframe
+// load died with a Mixed Content block, leaving operators with a
+// black /embed/<name>.
+//
+// v1.6.11+: same-origin `/__convex/*` chi mount in synapse-api
+// reverse-proxies to the convex-dashboard-proxy sidecar. The iframe
+// targets that path so the parent + iframe agree on the same origin
+// for postMessage. Works on the operator's main install URL, on
+// wildcard subdomain hosts, and on role='dashboard' custom domains —
+// every one of those routes /__convex/* to the same handler.
+//
+// We resolve the URL lazily inside the component (window is undefined
+// at module-load during SSR/SSG). origin = page origin; path = /__convex.
+const CONVEX_DASHBOARD_PATH = "/__convex/";
 
 type Params = { name: string };
 
@@ -140,15 +140,19 @@ export default function EmbedDashboardPage({
   // Reply to the dashboard's handshake. The iframe sends the request
   // on mount, possibly multiple times until it hears back; we stay
   // subscribed for the lifetime of the page.
+  //
+  // The iframe runs the same-origin /__convex/* proxy (v1.6.11+), so
+  // `event.origin` equals our own origin. We could be strict and
+  // pin to window.location.origin literally, but during the embed-
+  // page-on-Synapse-vs-iframe-on-Convex transition the message is
+  // routed through the iframe's window, whose origin is whatever the
+  // proxy serves it at. window.location.origin matches that exactly
+  // because the iframe is same-origin.
   useEffect(() => {
     if (!auth) return;
+    const expectedOrigin = window.location.origin;
     function handleMessage(event: MessageEvent) {
-      if (
-        CONVEX_DASHBOARD_ORIGIN !== "*" &&
-        event.origin !== CONVEX_DASHBOARD_ORIGIN
-      ) {
-        return;
-      }
+      if (event.origin !== expectedOrigin) return;
       const data = event.data as { type?: string } | null;
       if (data?.type !== "dashboard-credentials-request") return;
       const target = iframeRef.current?.contentWindow;
@@ -160,7 +164,7 @@ export default function EmbedDashboardPage({
           deploymentUrl: auth!.deploymentUrl,
           deploymentName: auth!.deploymentName,
         },
-        CONVEX_DASHBOARD_ORIGIN,
+        expectedOrigin,
       );
     }
     window.addEventListener("message", handleMessage);
@@ -231,7 +235,7 @@ export default function EmbedDashboardPage({
       </header>
       <iframe
         ref={iframeRef}
-        src={CONVEX_DASHBOARD_URL}
+        src={CONVEX_DASHBOARD_PATH}
         title={`${name} — Convex Dashboard`}
         className="h-full w-full flex-1 border-0"
         // The dashboard makes XHR calls to the deployment URL; allow

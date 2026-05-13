@@ -3,8 +3,31 @@
 
 import { clearAuth, getAccessToken, saveAuth, type AuthBundle, type User } from "./auth";
 
-const BASE_URL =
-  process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "") || "http://localhost:8080";
+// Pre-v1.6.11: BASE_URL was a build-time-baked constant pointing at the
+// operator's main install URL (e.g. https://synapsepanel.com). That
+// broke as soon as v1.6.11+ landed `role='dashboard'` custom domains:
+// JS served from `dashboard.<your>.com` would still call the BAKED
+// URL, every /v1/* request went cross-origin, and the JWT cookie /
+// localStorage gymnastics got hairy.
+//
+// v1.6.11+: resolve at call time. In the browser, always use the
+// current page origin — Caddy and synapse-api route /v1/* to the
+// API regardless of which host the request arrived on (main install
+// URL, wildcard `<name>.<base>`, or any active deployment_domain).
+// SSR and Node.js test runs still get the env-var path. Dev (no
+// Caddy in front of Next.js) sets NEXT_PUBLIC_SYNAPSE_URL via the
+// .env.local override and gets that explicitly; the next.config.ts
+// dev-mode rewrite forwards /v1/* to the API anyway, so even the
+// browser-on-localhost case works without manual config.
+function resolveBaseURL(): string {
+  if (typeof window !== "undefined") {
+    return window.location.origin;
+  }
+  return (
+    process.env.NEXT_PUBLIC_SYNAPSE_URL?.replace(/\/$/, "") ||
+    "http://localhost:8080"
+  );
+}
 
 export type Team = {
   id: string;
@@ -430,7 +453,7 @@ async function requestWithHeaders<T>(
 
   let res: Response;
   try {
-    res = await fetch(`${BASE_URL}${path}`, {
+    res = await fetch(`${resolveBaseURL()}${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

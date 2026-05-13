@@ -125,6 +125,17 @@ type RouterDeps struct {
 	// /v1/internal/dns_provider delegates to the real DNS resolver.
 	// Tests can inject canned NS responses.
 	DNSProviderLookup func(ctx context.Context, domain string) (string, []string, error)
+
+	// ConvexDashboardUpstream is the host:port of the convex-dashboard-proxy
+	// Caddy sidecar that fronts the open-source Convex Dashboard image
+	// (the sidecar strips X-Frame-Options + CSP frame-ancestors so the
+	// /embed/<name> page can iframe it). Used by the `/__convex/*` chi
+	// mount (v1.6.11+): the iframe URL is same-origin, killing the
+	// pre-v1.6.11 Mixed-Content + :6791-TLS gap. Production wiring:
+	// "synapse-convex-dashboard-proxy:80" in compose, "127.0.0.1:6791"
+	// on host. Empty disables the route (503); the embed page degrades
+	// gracefully because its iframe load just fails.
+	ConvexDashboardUpstream string
 }
 
 // DomainCacheInvalidator is the subset of *proxy.Resolver the
@@ -173,6 +184,27 @@ func NewRouter(d RouterDeps) http.Handler {
 	r.Use(chimw.Timeout(30 * time.Second))
 
 	r.Method(http.MethodGet, "/health", &HealthHandler{DB: d.DB, Version: d.Version})
+
+	// /__convex/* — same-origin reverse proxy to the open-source
+	// Convex Dashboard image (via convex-dashboard-proxy Caddy
+	// sidecar that strips iframe-blocking headers). v1.6.11+: the
+	// Synapse Next.js /embed/<name> page iframes this path so the
+	// dashboard's postMessage handshake runs on the same origin as
+	// the parent. Mounting at the chi root (not under /v1) keeps
+	// the URL short and makes it work uniformly on the operator's
+	// main domain AND on custom dashboard-role domains (which use
+	// the host shim in cmd/server/main.go to fall through to chi
+	// for /__convex/*).
+	//
+	// chi's r.Mount doesn't strip the mounted prefix from
+	// r.URL.Path on its own — http.StripPrefix wraps the handler
+	// so the upstream sees the path as "/" + the rest. Without
+	// this, the Convex Dashboard image (which doesn't know about
+	// our /__convex prefix) would 404 every request.
+	r.Mount("/__convex", http.StripPrefix("/__convex", &ConvexDashboardProxy{
+		Upstream: d.ConvexDashboardUpstream,
+		Logger:   d.Logger,
+	}))
 
 	authH := &AuthHandler{DB: d.DB, JWT: d.JWT}
 	meH := &MeHandler{DB: d.DB}

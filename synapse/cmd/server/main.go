@@ -228,10 +228,11 @@ func run() error {
 	// invalidator; the resolver itself only does work if some path
 	// down below actually invokes it.
 	proxyResolver := &proxy.Resolver{
-		DB:            pool,
-		UseNetworkDNS: cfg.HealthcheckViaNetwork,
-		CacheTTL:      30 * time.Second,
-		DashboardAddr: cfg.DashboardAddr,
+		DB:                 pool,
+		UseNetworkDNS:      cfg.HealthcheckViaNetwork,
+		CacheTTL:           30 * time.Second,
+		DashboardAddr:      cfg.DashboardAddr,
+		DashboardShellAddr: cfg.DashboardShellAddr,
 	}
 
 	handler := api.NewRouter(api.RouterDeps{
@@ -268,6 +269,12 @@ func run() error {
 		// is unset, in which case /v1/admin/dns_credentials/cloudflare
 		// returns 503 crypto_not_configured.
 		DNSEnvelope: dnsEnvelope,
+		// /__convex/* same-origin reverse proxy (v1.6.11+) shares the
+		// same upstream address the proxy.Resolver uses for role=
+		// 'dashboard' fallback. Keeping a single source of truth means
+		// docker-compose only has to wire ONE env var
+		// (SYNAPSE_DASHBOARD_ADDR).
+		ConvexDashboardUpstream: cfg.DashboardAddr,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the
@@ -400,7 +407,26 @@ func run() error {
 			if host != "" && host != baseLower &&
 				!strings.HasPrefix(host, "127.") &&
 				host != "localhost" && host != "synapse-api" {
-				if _, _, derr := proxyResolver.ResolveDomain(r.Context(), host); derr == nil {
+				if dn, dr, derr := proxyResolver.ResolveDomain(r.Context(), host); derr == nil {
+					// role='dashboard' (v1.6.11+) splits the URL by
+					// path so the operator's branded URL surfaces the
+					// FULL Synapse experience (Next.js shell + auto-
+					// logged-in Convex iframe), not just the bare
+					// upstream image. /v1, /d, /health, /__convex
+					// stay on the chi router (`handler`); everything
+					// else reverse-proxies to the Next.js shell.
+					// role='api' keeps the v1.1 behaviour (proxy
+					// straight to the deployment's backend).
+					if dr == proxy.DomainRoleDashboard {
+						(&proxy.DashboardHostHandler{
+							APIHandler:     handler,
+							ConvexAddr:     proxyResolver.DashboardAddr,
+							ShellAddr:      proxyResolver.DashboardShellAddr,
+							DeploymentName: dn,
+							Logger:         logger,
+						}).ServeHTTP(w, r)
+						return
+					}
 					proxyH.ServeHTTP(w, r)
 					return
 				}

@@ -47,13 +47,32 @@ type Resolver struct {
 	// re-read the DB. Short enough to catch deletes, long enough that a
 	// chatty client doesn't hammer the DB on every request.
 	CacheTTL time.Duration
-	// DashboardAddr is the upstream address requests with role='dashboard'
-	// in deployment_domains forward to (the dashboard container's port).
-	// Empty disables dashboard-role routing — the lookup returns
-	// ErrNoReplicas so the proxy emits a 503. Defaults are wired in
+	// DashboardAddr is the upstream address of the open-source Convex
+	// Dashboard container (the image that renders data / functions /
+	// logs / schema for a specific deployment). Used in two places:
+	//   1. `/__convex/*` chi mount (v1.6.11+) — same-origin path that
+	//      the Next.js `/embed/<name>` page iframes, so the operator's
+	//      browser never has to cross-origin to a different :port.
+	//   2. role='dashboard' custom domains, via DashboardHostHandler
+	//      — when an operator hits `dashboard.<custom>.com/__convex/*`
+	//      directly, that path proxies to the same container.
+	// Empty disables both — the chi mount 503s and DashboardHostHandler
+	// surfaces dashboard_not_configured. Defaults are wired in
 	// cmd/server/main.go: "synapse-convex-dashboard-proxy:80" inside
 	// compose, "127.0.0.1:6791" on host. Test harness leaves it blank.
 	DashboardAddr string
+
+	// DashboardShellAddr is the upstream address of the Synapse
+	// dashboard Next.js app (the one that renders the chrome around
+	// the Convex iframe — login, /teams, /embed/<name>, etc.). Only
+	// consumed by DashboardHostHandler so v1.6.11+ role='dashboard'
+	// custom domains can serve the FULL Synapse experience, not just
+	// the bare Convex image. Empty falls back to serving the chi API
+	// for known paths and 404'ing the rest — better than crashing,
+	// worse than the intended UX. Defaults are wired in
+	// cmd/server/main.go: "synapse-dashboard:3000" inside compose,
+	// "127.0.0.1:6790" on host.
+	DashboardShellAddr string
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
