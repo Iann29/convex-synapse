@@ -25,18 +25,24 @@ import (
 // bound to this host):
 //
 //	"" or "/"                              -> 302 to /embed/<deployment>
-//	/v1/* /d/* /health /metrics            -> pass to APIHandler (the chi router)
-//	/__convex/*                            -> reverse-proxy to ConvexAddr, prefix stripped
+//	/v1/* /d/* /health                     -> pass to APIHandler (the chi router)
 //	anything else (/login /embed /teams …) -> reverse-proxy to ShellAddr
 //
-// APIHandler is the chi router that already owns /v1/*, /d/*, /health,
-// /__convex/*. We pass it in so this package doesn't have to import
-// internal/api (which would be an import cycle).
+// APIHandler is the chi router that owns /v1/*, /d/*, /health. We
+// pass it in so this package doesn't have to import internal/api
+// (which would be an import cycle).
 //
 // The struct is intentionally request-scoped: callers construct one
 // per request (the bound DeploymentName changes per host) and call
 // ServeHTTP once. ConvexAddr / ShellAddr / APIHandler are stable
 // across all requests so they're fine to share.
+//
+// ConvexAddr (formerly used by v1.6.11's same-origin /__convex/* mount)
+// is no longer consulted directly here — the embed iframe URL goes
+// to a TLS-fronted `{{DOMAIN}}:6791` block in Caddy that proxies to
+// convex-dashboard-proxy directly (see installer/templates/caddy.standalone).
+// The field is retained for backward compatibility / tests but is a
+// no-op in v1.6.12+.
 type DashboardHostHandler struct {
 	APIHandler     http.Handler
 	ConvexAddr     string
@@ -45,10 +51,10 @@ type DashboardHostHandler struct {
 	Logger         *slog.Logger
 }
 
-// ServeHTTP performs the path dispatch documented above. Errors that
-// indicate operator misconfiguration (ConvexAddr / ShellAddr empty)
-// surface as 503 so Caddy doesn't cache the route as healthy and the
-// operator notices in their logs.
+// ServeHTTP performs the path dispatch documented above. An empty
+// ShellAddr surfaces 503 dashboard_shell_not_configured so Caddy
+// doesn't cache the route as healthy and the operator notices it
+// in their logs.
 func (h *DashboardHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Logger == nil {
 		h.Logger = slog.Default()
@@ -70,15 +76,11 @@ func (h *DashboardHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	// chi-owned paths: hand back to the API router unchanged. The
-	// chi router has its own /__convex/* mount so we hit it via the
-	// same APIHandler — single source of truth for the upstream.
+	// chi router owns /v1/*, /d/*, /health on this host the same
+	// way it does on the operator's main install URL.
 	if path == "/health" ||
-		path == "/metrics" ||
 		strings.HasPrefix(path, "/v1/") ||
-		strings.HasPrefix(path, "/v1") && (len(path) == 3 || path[3] == '?') ||
-		strings.HasPrefix(path, "/d/") ||
-		strings.HasPrefix(path, "/__convex/") ||
-		path == "/__convex" {
+		strings.HasPrefix(path, "/d/") {
 		h.APIHandler.ServeHTTP(w, r)
 		return
 	}

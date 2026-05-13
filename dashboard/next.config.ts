@@ -22,38 +22,6 @@ const nextConfig: NextConfig = {
   // new chunks, browser fetches them, version chip updates.
   generateBuildId: async () =>
     process.env.NEXT_PUBLIC_DASHBOARD_VERSION || "dev",
-  // Same-origin proxy for /v1/* and /__convex/* during `npm run dev`.
-  //
-  // v1.6.11+: lib/api.ts uses window.location.origin in the browser
-  // (so role='dashboard' custom domains stay same-origin without
-  // CORS gymnastics). In production Caddy + synapse-api handle the
-  // routing. In dev, Next.js owns the operator's terminal port
-  // (typically 6790) and the API runs on a separate one (8080); the
-  // rewrites below let `fetch("/v1/...")` Just Work without
-  // requiring NEXT_PUBLIC_SYNAPSE_URL to be set.
-  //
-  // Production: Next.js rewrites still fire in `next start`, but
-  // Caddy never sends /v1/* to the dashboard container in the first
-  // place (the {{DOMAIN}} block routes it to synapse-api directly),
-  // so these are effectively dev-only.
-  async rewrites() {
-    const apiTarget =
-      process.env.SYNAPSE_DEV_API_URL?.replace(/\/$/, "") ||
-      "http://localhost:8080";
-    const convexTarget =
-      process.env.SYNAPSE_DEV_CONVEX_DASHBOARD_URL?.replace(/\/$/, "") ||
-      "http://localhost:6791";
-    return [
-      { source: "/v1/:path*", destination: `${apiTarget}/v1/:path*` },
-      { source: "/d/:path*", destination: `${apiTarget}/d/:path*` },
-      { source: "/health", destination: `${apiTarget}/health` },
-      // /__convex/* is the dashboard image proxy. In dev we bypass
-      // synapse-api and hit the convex-dashboard service directly
-      // because the dev workflow usually runs the dashboard image
-      // standalone (no convex-dashboard-proxy sidecar).
-      { source: "/__convex/:path*", destination: `${convexTarget}/:path*` },
-    ];
-  },
 };
 
 export default nextConfig;

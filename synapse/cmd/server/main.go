@@ -269,12 +269,6 @@ func run() error {
 		// is unset, in which case /v1/admin/dns_credentials/cloudflare
 		// returns 503 crypto_not_configured.
 		DNSEnvelope: dnsEnvelope,
-		// /__convex/* same-origin reverse proxy (v1.6.11+) shares the
-		// same upstream address the proxy.Resolver uses for role=
-		// 'dashboard' fallback. Keeping a single source of truth means
-		// docker-compose only has to wire ONE env var
-		// (SYNAPSE_DASHBOARD_ADDR).
-		ConvexDashboardUpstream: cfg.DashboardAddr,
 	})
 
 	// Provisioning worker — dequeues 'provision' jobs inserted by the

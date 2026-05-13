@@ -33,18 +33,6 @@ ENV NEXT_PUBLIC_CONVEX_DASHBOARD_URL=$NEXT_PUBLIC_CONVEX_DASHBOARD_URL
 # back always match in production.
 ARG NEXT_PUBLIC_DASHBOARD_VERSION=dev
 ENV NEXT_PUBLIC_DASHBOARD_VERSION=$NEXT_PUBLIC_DASHBOARD_VERSION
-# v1.6.11+: same-origin rewrites in next.config.ts forward /v1/* +
-# /__convex/* from the dashboard container to the right upstreams
-# when nothing fronts the dashboard (CI Playwright, `npm run dev`,
-# direct-port hits in dev). Next.js bakes the rewrites manifest at
-# build time, so the targets MUST be available as build args — a
-# runtime env on the standalone server can be too late depending on
-# the Next.js version. Defaults are local-dev-friendly; compose
-# overrides with the service-name URLs.
-ARG SYNAPSE_DEV_API_URL=http://localhost:8080
-ENV SYNAPSE_DEV_API_URL=$SYNAPSE_DEV_API_URL
-ARG SYNAPSE_DEV_CONVEX_DASHBOARD_URL=http://localhost:6791
-ENV SYNAPSE_DEV_CONVEX_DASHBOARD_URL=$SYNAPSE_DEV_CONVEX_DASHBOARD_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

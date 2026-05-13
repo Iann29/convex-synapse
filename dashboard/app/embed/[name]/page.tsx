@@ -14,22 +14,44 @@ import {
 } from "@/lib/api";
 
 // Where the open-source Convex Dashboard is hosted, as seen by the
-// browser. Pre-v1.6.11 this was a cross-origin URL (e.g.
-// https://<domain>:6791) which broke under HTTPS pages because Caddy
-// fronted :443 with TLS but :6791 stayed plain HTTP — every iframe
-// load died with a Mixed Content block, leaving operators with a
-// black /embed/<name>.
+// browser.
 //
-// v1.6.11+: same-origin `/__convex/*` chi mount in synapse-api
-// reverse-proxies to the convex-dashboard-proxy sidecar. The iframe
-// targets that path so the parent + iframe agree on the same origin
-// for postMessage. Works on the operator's main install URL, on
-// wildcard subdomain hosts, and on role='dashboard' custom domains —
-// every one of those routes /__convex/* to the same handler.
-//
-// We resolve the URL lazily inside the component (window is undefined
-// at module-load during SSR/SSG). origin = page origin; path = /__convex.
-const CONVEX_DASHBOARD_PATH = "/__convex/";
+// Architecture timeline:
+//   v1.x ... v1.6.10: `https://{{DOMAIN}}:6791` (cross-origin to
+//     the parent page on :443). Caddy did NOT front :6791 — the
+//     port was a plain-HTTP mapping into convex-dashboard-proxy.
+//     Under HTTPS parent pages every iframe load died with a
+//     Mixed-Content block and the iframe stayed black.
+//   v1.6.11: tried to fix by routing the iframe through a
+//     same-origin `/__convex/*` chi mount. Killed the cross-origin
+//     problem AND introduced a new one: the upstream Convex
+//     Dashboard image is a Next.js SPA that emits absolute
+//     `/_next/static/...` asset paths. Iframed at /__convex/, the
+//     browser resolved those against the page origin's root —
+//     fetched the Synapse Next.js shell's chunks instead of the
+//     Convex ones. Iframe stayed black for a different reason.
+//   v1.6.12+: revert to the cross-origin URL, but fix the actual
+//     gap — Caddy now fronts `{{DOMAIN}}:6791` with TLS so the
+//     iframe load succeeds end-to-end. The Convex Dashboard SPA
+//     keeps its root-path assumption. postMessage handshake is
+//     cross-origin (parent on :443, iframe on :6791) and uses the
+//     iframe's exact origin as targetOrigin.
+const CONVEX_DASHBOARD_URL =
+  process.env.NEXT_PUBLIC_CONVEX_DASHBOARD_URL?.replace(/\/$/, "") ||
+  "http://localhost:6791";
+
+// Origin used for the postMessage handshake. Derived from the
+// build-time URL above so a misconfigured PUBLIC_CONVEX_DASHBOARD_URL
+// can't leak creds to a different page. Falls back to "*" only when
+// the URL is unparseable (shouldn't happen in practice — setup.sh
+// always renders a valid URL).
+const CONVEX_DASHBOARD_ORIGIN = (() => {
+  try {
+    return new URL(CONVEX_DASHBOARD_URL).origin;
+  } catch {
+    return "*";
+  }
+})();
 
 type Params = { name: string };
 
@@ -150,9 +172,19 @@ export default function EmbedDashboardPage({
   // because the iframe is same-origin.
   useEffect(() => {
     if (!auth) return;
-    const expectedOrigin = window.location.origin;
     function handleMessage(event: MessageEvent) {
-      if (event.origin !== expectedOrigin) return;
+      // Iframe lives at CONVEX_DASHBOARD_ORIGIN (e.g.
+      // `https://synapsepanel.com:6791`). Parent could be at the
+      // same origin OR at a `role=dashboard` custom-domain origin
+      // (e.g. `https://dashboard.ingreis.com`). In both cases the
+      // iframe's messages arrive with origin = the iframe's URL
+      // origin, so we strictly compare against that.
+      if (
+        CONVEX_DASHBOARD_ORIGIN !== "*" &&
+        event.origin !== CONVEX_DASHBOARD_ORIGIN
+      ) {
+        return;
+      }
       const data = event.data as { type?: string } | null;
       if (data?.type !== "dashboard-credentials-request") return;
       const target = iframeRef.current?.contentWindow;
@@ -164,7 +196,7 @@ export default function EmbedDashboardPage({
           deploymentUrl: auth!.deploymentUrl,
           deploymentName: auth!.deploymentName,
         },
-        expectedOrigin,
+        CONVEX_DASHBOARD_ORIGIN,
       );
     }
     window.addEventListener("message", handleMessage);
@@ -235,7 +267,7 @@ export default function EmbedDashboardPage({
       </header>
       <iframe
         ref={iframeRef}
-        src={CONVEX_DASHBOARD_PATH}
+        src={CONVEX_DASHBOARD_URL}
         title={`${name} — Convex Dashboard`}
         className="h-full w-full flex-1 border-0"
         // The dashboard makes XHR calls to the deployment URL; allow
