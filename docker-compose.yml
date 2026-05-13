@@ -183,6 +183,15 @@ services:
       # reads them at runtime.
       NEXT_PUBLIC_SYNAPSE_URL: ${PUBLIC_SYNAPSE_URL:-http://localhost:8080}
       NEXT_PUBLIC_CONVEX_DASHBOARD_URL: ${PUBLIC_CONVEX_DASHBOARD_URL:-http://localhost:6791}
+      # v1.6.11+: targets for the next.config.ts rewrites that proxy
+      # /v1/*, /d/*, /health, /__convex/* from the dashboard container
+      # to the right upstream. Used when the dashboard is reachable
+      # directly (no Caddy in front — CI Playwright, npm run dev,
+      # operator hitting `:6790` directly). In compose the upstreams
+      # are reachable by service name; outside compose we fall back
+      # to the env-var defaults (localhost-based).
+      SYNAPSE_DEV_API_URL: http://synapse-api:8080
+      SYNAPSE_DEV_CONVEX_DASHBOARD_URL: http://convex-dashboard-proxy:80
     ports:
       - "${DASHBOARD_PORT:-6790}:3000"
     networks:
