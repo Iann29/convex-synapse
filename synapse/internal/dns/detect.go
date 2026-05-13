@@ -67,9 +67,23 @@ func Provider(ctx context.Context, domain string) (string, []string, error) {
 	return detect(ctx, defaultResolver, domain)
 }
 
+// maxLabelClimb caps how many parent zones we probe before giving up.
+// 8 is generous — the deepest realistic case in the wild
+// (sub.sub.sub.example.co.uk) needs about 5. The cap exists so a
+// pathologically long hostname can't fan out N synchronous queries
+// against a slow resolver.
+const maxLabelClimb = 8
+
 // detect is the test seam. Production callers go through Provider.
+//
+// NS records typically live only at the zone apex, so a direct query
+// for "api.example.com" returns nothing — the apex is "example.com".
+// We climb the labels one at a time until LookupNS yields records (or
+// we run out of labels worth probing). The first non-empty answer
+// wins; we don't keep climbing past it, because an explicit subzone
+// delegation should take precedence over the parent's nameservers.
 func detect(ctx context.Context, r resolver, domain string) (string, []string, error) {
-	domain = strings.TrimSpace(domain)
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 	if domain == "" {
 		return "unknown", nil, nil
 	}
@@ -77,16 +91,34 @@ func detect(ctx context.Context, r resolver, domain string) (string, []string, e
 	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
 
-	nss, err := r.LookupNS(lookupCtx, domain)
-	if err != nil {
-		return "unknown", nil, err
+	// Stop before querying a bare TLD: LookupNS("com") would return
+	// Verisign's nameservers, which is useless noise. The
+	// `strings.Contains(name, ".")` guard ensures we always keep at
+	// least one dot in `name`.
+	var firstErr error
+	name := domain
+	for i := 0; i < maxLabelClimb && strings.Contains(name, "."); i++ {
+		nss, err := r.LookupNS(lookupCtx, name)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else if len(nss) > 0 {
+			return classifyNS(nss)
+		}
+		idx := strings.Index(name, ".")
+		if idx < 0 {
+			break
+		}
+		name = name[idx+1:]
 	}
-	if len(nss) == 0 {
-		return "unknown", nil, nil
-	}
+	return "unknown", nil, firstErr
+}
 
-	// Build the lowercase, trailing-dot-normalised host list once so
-	// both the suffix match AND the returned slice see the same view.
+// classifyNS normalises the NS host list and runs it against the
+// provider-suffix table. Pulled out of detect() so the climb loop
+// stays focused on label arithmetic.
+func classifyNS(nss []*net.NS) (string, []string, error) {
 	hosts := make([]string, 0, len(nss))
 	for _, ns := range nss {
 		h := strings.ToLower(strings.TrimSpace(ns.Host))
@@ -98,7 +130,6 @@ func detect(ctx context.Context, r resolver, domain string) (string, []string, e
 		}
 		hosts = append(hosts, h)
 	}
-
 	for _, h := range hosts {
 		for suffix, name := range providerSuffixes {
 			if strings.Contains(h, suffix) {
