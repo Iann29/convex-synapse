@@ -28,6 +28,45 @@ secrets::gen_storage_key()   { "${SECRETS_OPENSSL:-openssl}" rand -hex 32; }
 secrets::gen_db_password()   { "${SECRETS_OPENSSL:-openssl}" rand -hex 16; }
 secrets::gen_updater_token() { "${SECRETS_OPENSSL:-openssl}" rand -hex 32; }
 
+# secrets::detect_public_ip → echo the host's public IPv4, or empty.
+#
+# Order:
+#   1. If $SYNAPSE_PUBLIC_IP is exported (operator override, CI flag),
+#      echo that — we trust the caller.
+#   2. If $SYNAPSE_DETECTED_PUBLIC_IP is set (wizard.sh stamps this
+#      during the interactive install), reuse it instead of probing
+#      ipify a second time.
+#   3. Live probe via api.ipify.org with a 5s timeout. The endpoint
+#      returns the bare IPv4 in the body — we validate the shape with
+#      a tiny IPv4 regex so a Cloudflare error page doesn't get
+#      mistaken for an address.
+#
+# Always returns 0; the caller checks for empty output. Override the
+# probe URL via $SECRETS_IPIFY_URL for tests.
+secrets::detect_public_ip() {
+    if [[ -n "${SYNAPSE_PUBLIC_IP:-}" ]]; then
+        printf '%s\n' "$SYNAPSE_PUBLIC_IP"
+        return 0
+    fi
+    if [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
+        printf '%s\n' "$SYNAPSE_DETECTED_PUBLIC_IP"
+        return 0
+    fi
+    local probe_url="${SECRETS_IPIFY_URL:-https://api.ipify.org}"
+    local probe
+    probe="$("${SECRETS_CURL:-curl}" -sf --max-time 5 "$probe_url" 2>/dev/null || true)"
+    # Trim whitespace + a trailing newline if the endpoint added one.
+    probe="${probe//[[:space:]]/}"
+    # IPv4 sanity check: 1-3 digit octets with three dots. We don't
+    # care about value-range correctness here — pgx / docker will
+    # reject "999.999.999.999" later if the probe ever returned junk.
+    if [[ "$probe" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        printf '%s\n' "$probe"
+        return 0
+    fi
+    return 0
+}
+
 # ---- atomic file write ---------------------------------------------
 
 # secrets::_write_atomic <dst>
@@ -230,6 +269,31 @@ secrets::ensure_env() {
     if [[ -z "$uurl" ]]; then
         secrets::ensure_env_var "$file" SYNAPSE_UPDATER_URL \
             "${SYNAPSE_UPDATER_URL:-http://host.docker.internal:${uport}}"
+    fi
+    # SYNAPSE_PUBLIC_IP (v1.6.6+). Required for the per-deployment
+    # custom-domain DNS verification + auto-config flow: without it,
+    # added domains silently stay 'pending' and the dashboard shows
+    # the "DNS verification disabled" banner. Pre-1.6.6 the wizard
+    # detected the IP for the summary screen but never wrote it to
+    # .env, so every install since v1.0 has been arriving here with
+    # the var unset. Top-up + auto-detect heals existing installs on
+    # the next setup.sh --upgrade (driven by the dashboard "update"
+    # button); fresh installs get it on first phase_secrets.
+    #
+    # Detection order (first non-empty wins):
+    #   1. operator-exported $SYNAPSE_PUBLIC_IP (e.g. via flag in CI)
+    #   2. live external probe (api.ipify.org, 5s timeout)
+    # Both can fail (offline VPS, ipify unreachable); on a miss we
+    # log + continue without writing a stub value — the operator
+    # then knows to set it manually.
+    local pub_ip
+    pub_ip="$(secrets::env_get "$file" SYNAPSE_PUBLIC_IP)"
+    if [[ -z "$pub_ip" ]]; then
+        local detected
+        detected="$(secrets::detect_public_ip)" || detected=""
+        if [[ -n "$detected" ]]; then
+            secrets::ensure_env_var "$file" SYNAPSE_PUBLIC_IP "$detected"
+        fi
     fi
     if (( ha )); then
         local sk

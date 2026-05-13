@@ -27,7 +27,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.6.5"
+readonly INSTALLER_VERSION="1.6.6"
 readonly INSTALL_DIR_DEFAULT="/opt/synapse"
 readonly LOG_FILE="${SYNAPSE_INSTALL_LOG:-/tmp/synapse-install.log}"
 readonly LOCK_FILE="/var/lock/synapse-installer.lock"
@@ -666,6 +666,23 @@ phase_secrets() {
         # who type ".synapse.example.com" by accident don't end up
         # with double dots in URLs.
         export SYNAPSE_BASE_DOMAIN="${BASE_DOMAIN#.}"
+        # SYNAPSE_PUBLIC_IP (v1.6.6+) — required for the per-deployment
+        # custom-domain DNS verification + auto-config flow. Reuse the
+        # IP we already detected above when --no-tls; otherwise probe
+        # via secrets::detect_public_ip (which honours an exported
+        # SYNAPSE_PUBLIC_IP from a CI flag, falls back to ipify).
+        # Empty on offline VPS — secrets::ensure_env retries on every
+        # subsequent setup.sh run so once the operator has internet
+        # the var lands on the next upgrade/reconfigure.
+        if [[ -z "${SYNAPSE_PUBLIC_IP:-}" ]]; then
+            if [[ -n "${detected_ip:-}" ]]; then
+                export SYNAPSE_PUBLIC_IP="$detected_ip"
+            else
+                local _ip_for_env
+                _ip_for_env="$(secrets::detect_public_ip)" || _ip_for_env=""
+                [[ -n "$_ip_for_env" ]] && export SYNAPSE_PUBLIC_IP="$_ip_for_env"
+            fi
+        fi
         local ha_flag="false"
         (( ENABLE_HA )) && ha_flag="true"
         export SYNAPSE_HA_ENABLED="$ha_flag"
