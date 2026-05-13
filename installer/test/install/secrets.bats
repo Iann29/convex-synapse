@@ -540,3 +540,117 @@ EOF2
     run grep -c '^SYNAPSE_BACKEND_POSTGRES_URL=' "$ENV_FILE"
     assert_output "1"
 }
+
+# ---- detect_public_ip + ensure_env: SYNAPSE_PUBLIC_IP ---------------
+#
+# Pre-v1.6.6 the wizard detected the host's public IP for the summary
+# screen but never wrote it to .env. Per-deployment custom domains
+# need it to enable DNS verification + auto-config; without it rows
+# stay 'pending' forever and the dashboard shows a yellow banner.
+# These tests cover the autodetect + idempotency contract that lets
+# `setup.sh --upgrade` heal existing installs on the next run.
+
+# Stub curl to control the ipify probe deterministically. Bats doesn't
+# have a per-test global; export SECRETS_CURL between tests.
+_install_ipify_stub() {
+    local body="$1"
+    local exit_code="${2:-0}"
+    cat >"$SYN_MOCK_BIN/curl-ipify" <<EOF
+#!/usr/bin/env bash
+# Fixture: SECRETS_CURL points at this. Echoes the seeded body and
+# exits with the seeded code so the regex check + return contract
+# can be exercised across success/failure paths.
+echo -n "$body"
+exit $exit_code
+EOF
+    chmod +x "$SYN_MOCK_BIN/curl-ipify"
+    SECRETS_CURL="$SYN_MOCK_BIN/curl-ipify"
+    export SECRETS_CURL
+}
+
+@test "detect_public_ip: honours operator-exported SYNAPSE_PUBLIC_IP" {
+    SYNAPSE_PUBLIC_IP="198.51.100.42" run secrets::detect_public_ip
+    assert_success
+    assert_output "198.51.100.42"
+}
+
+@test "detect_public_ip: reuses SYNAPSE_DETECTED_PUBLIC_IP from wizard" {
+    unset SYNAPSE_PUBLIC_IP
+    SYNAPSE_DETECTED_PUBLIC_IP="203.0.113.7" run secrets::detect_public_ip
+    assert_success
+    assert_output "203.0.113.7"
+}
+
+@test "detect_public_ip: probes ipify when nothing is exported" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    _install_ipify_stub "192.0.2.99"
+    run secrets::detect_public_ip
+    assert_success
+    assert_output "192.0.2.99"
+}
+
+@test "detect_public_ip: trims whitespace from the probe response" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    # Simulate ipify (or a proxy) appending a trailing newline.
+    _install_ipify_stub $'  192.0.2.10  \n'
+    run secrets::detect_public_ip
+    assert_success
+    assert_output "192.0.2.10"
+}
+
+@test "detect_public_ip: rejects non-IPv4 probe bodies" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    # Cloudflare error page or HTML — must NOT land in .env.
+    _install_ipify_stub "<html>cloudflare error</html>"
+    run secrets::detect_public_ip
+    assert_success
+    assert_output ""
+}
+
+@test "detect_public_ip: empty on probe failure (curl exit != 0)" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    _install_ipify_stub "" 1
+    run secrets::detect_public_ip
+    assert_success
+    assert_output ""
+}
+
+@test "ensure_env: adds SYNAPSE_PUBLIC_IP when missing and probe succeeds" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    _install_ipify_stub "203.0.113.20"
+    : >"$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    run secrets::ensure_env "$ENV_FILE"
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_PUBLIC_IP
+    assert_output "203.0.113.20"
+}
+
+@test "ensure_env: preserves operator-set SYNAPSE_PUBLIC_IP on re-run" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    # Operator hand-set a specific IP (e.g. floating IP, NAT VIP).
+    # autodetect must NOT clobber it on subsequent runs.
+    cat >"$ENV_FILE" <<EOF
+SYNAPSE_PUBLIC_IP=10.20.30.40
+EOF
+    chmod 0600 "$ENV_FILE"
+    _install_ipify_stub "203.0.113.99"
+    run secrets::ensure_env "$ENV_FILE"
+    assert_success
+    run secrets::env_get "$ENV_FILE" SYNAPSE_PUBLIC_IP
+    assert_output "10.20.30.40"
+}
+
+@test "ensure_env: skips silently when probe fails (no stub value written)" {
+    unset SYNAPSE_PUBLIC_IP SYNAPSE_DETECTED_PUBLIC_IP
+    : >"$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    _install_ipify_stub "" 1
+    run secrets::ensure_env "$ENV_FILE"
+    assert_success
+    # Key must be absent — operator can re-run on the next upgrade
+    # once internet/DNS to ipify is back. Writing an empty value
+    # would prevent the next ensure_env from healing it.
+    run grep -c '^SYNAPSE_PUBLIC_IP=' "$ENV_FILE"
+    assert_output "0"
+}

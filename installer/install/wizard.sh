@@ -370,10 +370,18 @@ wizard::run() {
 }
 
 # wizard::_detect_public_ip — best-effort IP probe via api.ipify.org.
-# Stamps SYNAPSE_DETECTED_PUBLIC_IP for the summary. Silent on failure
-# (the summary falls back to a placeholder URL, which is fine).
+# Stamps SYNAPSE_DETECTED_PUBLIC_IP for the summary AND seeds
+# SYNAPSE_PUBLIC_IP if the operator hasn't already set it. The latter
+# flows into env.tmpl rendering so the very first .env carries the
+# IP — without this the per-deployment custom-domain DNS verification
+# stays disabled and rows pile up in 'pending'. Silent on failure.
 wizard::_detect_public_ip() {
     if [[ -n "${SYNAPSE_DETECTED_PUBLIC_IP:-}" ]]; then
+        # Already detected this run; mirror to SYNAPSE_PUBLIC_IP so a
+        # late wizard step can still seed the install env.
+        if [[ -z "${SYNAPSE_PUBLIC_IP:-}" ]]; then
+            export SYNAPSE_PUBLIC_IP="$SYNAPSE_DETECTED_PUBLIC_IP"
+        fi
         return 0
     fi
     if ! command -v curl >/dev/null 2>&1; then
@@ -381,6 +389,9 @@ wizard::_detect_public_ip() {
     fi
     SYNAPSE_DETECTED_PUBLIC_IP="$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "")"
     export SYNAPSE_DETECTED_PUBLIC_IP
+    if [[ -n "$SYNAPSE_DETECTED_PUBLIC_IP" && -z "${SYNAPSE_PUBLIC_IP:-}" ]]; then
+        export SYNAPSE_PUBLIC_IP="$SYNAPSE_DETECTED_PUBLIC_IP"
+    fi
 }
 
 # wizard::_dont_know_domain_path — the "not sure" branch of the
