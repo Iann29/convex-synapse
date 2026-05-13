@@ -111,6 +111,12 @@ function CustomDomainsPanelExpanded({
   const [actionError, setActionError] = useState<string | null>(null);
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // v1.6.7+: per-row "Auto-configure DNS" retry button. Distinct from
+  // verifyingId so the operator can see one row in-flight while
+  // others still expose the action.
+  const [autoConfiguringId, setAutoConfiguringId] = useState<string | null>(
+    null,
+  );
 
   // Auto-config UI state. detection + autoConfigure are reset/refreshed
   // on every domain input change (debounced); selectedCredentialId
@@ -364,6 +370,60 @@ function CustomDomainsPanelExpanded({
       );
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  // v1.6.7+: manual auto-configure retry. Covers the common case where
+  // the operator added the domain BEFORE registering a Cloudflare
+  // credential covering the zone (the row landed FAILED because the A
+  // record didn't exist yet, and there was no credential to mint it).
+  // After cadastrar a credential they need a way to fire the
+  // auto-config without deleting + re-adding the domain. The backend
+  // endpoint already exists since v1.5.6 (POST /domains/{id}/auto_configure);
+  // this just wires the dashboard up to call it.
+  //
+  // No credentialId is passed: the backend auto-picks when exactly one
+  // project-scoped (or instance-wide) credential covers the zone. If
+  // multiple match, the response carries `credential_required` and we
+  // surface the message — user picks via... well, future work; for
+  // now they get a clear error and can delete the unwanted credential.
+  const autoConfigureRow = async (row: DeploymentDomain) => {
+    setActionError(null);
+    setAutoConfiguringId(row.id);
+    try {
+      const updated = await api.deployments.autoConfigureDomain(
+        deploymentName,
+        row.id,
+      );
+      // Successful auto-config flips the row to status='pending' with
+      // auto_configured=true; the dns.Verifier loop will pick it up
+      // once DNS propagates (usually <30s for Cloudflare). Patch the
+      // SWR cache so the badge + "auto" chip update without a refetch.
+      await mutate(
+        (current) =>
+          (current ?? []).map((d) => (d.id === row.id ? updated : d)),
+        { revalidate: false },
+      );
+    } catch (err) {
+      if (err instanceof ApiError) {
+        // Make the two common failure codes user-actionable. Anything
+        // else falls through to the raw backend message.
+        if (err.code === "no_credential_for_zone") {
+          setActionError(
+            `No DNS credential covers "${row.domain}". Add a Cloudflare credential covering the zone in the "DNS credentials" panel below, then retry.`,
+          );
+        } else if (err.code === "credential_required") {
+          setActionError(
+            `Multiple DNS credentials cover "${row.domain}". Remove the duplicate(s) in "DNS credentials" so the auto-pick has a unique match, then retry.`,
+          );
+        } else {
+          setActionError(err.message);
+        }
+      } else {
+        setActionError("Could not auto-configure DNS");
+      }
+    } finally {
+      setAutoConfiguringId(null);
     }
   };
 
@@ -665,6 +725,27 @@ function CustomDomainsPanelExpanded({
                     </span>
                   )}
                   <span className="ml-auto flex shrink-0 gap-2">
+                    {/* Auto-configure DNS retry. Only meaningful when
+                        the row isn't already 'active' — for 'active'
+                        rows the A record is already correct and re-
+                        upserting it would be a no-op. We hide the
+                        button rather than disable it because operators
+                        kept clicking the disabled state. */}
+                    {d.status !== "active" && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => autoConfigureRow(d)}
+                        disabled={autoConfiguringId === d.id}
+                        aria-label={`Auto-configure DNS for ${d.domain} via stored credential`}
+                        data-testid={`custom-domain-autoconfigure-${d.domain}`}
+                        title="Push the A record via a stored Cloudflare credential covering this zone"
+                      >
+                        {autoConfiguringId === d.id
+                          ? "Auto-configuring…"
+                          : "Auto-configure DNS"}
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"
