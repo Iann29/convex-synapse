@@ -126,6 +126,11 @@ type RouterDeps struct {
 	// Tests can inject canned NS responses.
 	DNSProviderLookup func(ctx context.Context, domain string) (string, []string, error)
 
+	// BackendProbe powers GET /v1/deployments/{name}/backend_version.
+	// Production leaves it nil and the handler defaults to the HTTP
+	// probe against `convex-<name>:3210/version`. Tests inject a
+	// deterministic fake here so they don't depend on a live container.
+	BackendProbe BackendProbe
 }
 
 // DomainCacheInvalidator is the subset of *proxy.Resolver the
@@ -191,6 +196,7 @@ func NewRouter(d RouterDeps) http.Handler {
 		ProxyEnabled:          d.ProxyEnabled,
 		HA:                    d.HA,
 		Crypto:                d.Crypto,
+		BackendProbe:          d.BackendProbe,
 	}
 	// Per-deployment custom domains (v1.1+). Sub-routes mount under
 	// /v1/deployments/{name}/domains; the handler reuses the

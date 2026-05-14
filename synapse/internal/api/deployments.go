@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/Iann29/synapse/internal/audit"
 	"github.com/Iann29/synapse/internal/auth"
 	synapsedb "github.com/Iann29/synapse/internal/db"
+	"github.com/Iann29/synapse/internal/deploymenturl"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
 	"github.com/Iann29/synapse/internal/provisioner"
@@ -100,6 +100,17 @@ type DeploymentsHandler struct {
 	// the deployments handler so the handler doesn't have to know the
 	// PublicIP env value directly.
 	Domains *DomainsHandler
+
+	// BackendProbe powers GET /v1/deployments/{name}/backend_version.
+	// nil falls back to the default HTTP probe against
+	// `http://convex-<name>:3210/version`; tests inject deterministic
+	// fakes via this hook.
+	BackendProbe BackendProbe
+
+	// versionCache memoises probe results per deployment for
+	// backendVersionCacheTTL so the dashboard's deployment-detail
+	// page doesn't hammer each backend on every render.
+	versionCache backendVersionCache
 }
 
 // rebuildCORSAndRestart recomputes CORS_ALLOWED_ORIGINS from the
@@ -198,12 +209,24 @@ func (h *DeploymentsHandler) rebuildCORSAndRestart(ctx context.Context, deployme
 		return false
 	}
 
+	// v1.6.15: pick up the current active api domain (if any) so the
+	// recreated container's CONVEX_CLOUD_ORIGIN / CONVEX_SITE_ORIGIN
+	// stay in sync with the operator-facing URL. Without this the
+	// origin would freeze at provision-time and an after-the-fact
+	// custom-domain attach would leave function-spec.url pointing
+	// at the old loopback or host:port form.
+	publicOrigin := h.urlComputer().CLI(&models.Deployment{
+		Name:     deploymentName,
+		HostPort: *hostPort,
+	}, h.lookupActiveAPIDomain(ctx, deploymentID))
+
 	spec := dockerprov.DeploymentSpec{
 		Name:                  deploymentName,
 		InstanceSecret:        instanceSecret,
 		HostPort:              *hostPort,
 		EnvVars:               envVars,
 		HealthcheckViaNetwork: h.HealthcheckViaNetwork,
+		PublicURL:             publicOrigin,
 	}
 
 	logger.Info("rebuild cors: recreating container",
@@ -296,6 +319,17 @@ func (h *DeploymentsHandler) rebuildHACORSAndRestart(ctx context.Context, deploy
 		return false
 	}
 
+	// v1.6.15: same active-domain lookup as the single-replica path;
+	// all replicas of an HA deployment advertise the same public origin.
+	primaryReplicaPort := 0
+	if len(replicas) > 0 && replicas[0].hostPort != nil {
+		primaryReplicaPort = *replicas[0].hostPort
+	}
+	publicOrigin := h.urlComputer().CLI(&models.Deployment{
+		Name:     deploymentName,
+		HostPort: primaryReplicaPort,
+	}, h.lookupActiveAPIDomain(ctx, deploymentID))
+
 	for _, r := range replicas {
 		spec := dockerprov.DeploymentSpec{
 			Name:                  deploymentName,
@@ -306,6 +340,7 @@ func (h *DeploymentsHandler) rebuildHACORSAndRestart(ctx context.Context, deploy
 			HAReplica:             true,
 			ReplicaIndex:          r.index,
 			Storage:               storage,
+			PublicURL:             publicOrigin,
 		}
 		logger.Info("rebuild cors: recreating HA replica",
 			"deployment_id", deploymentID, "name", deploymentName,
@@ -480,25 +515,17 @@ func postgresURLRequiresSSL(url string) bool {
 // decision tree — better to render a possibly-stale URL than 500 the
 // request.
 func (h *DeploymentsHandler) publicDeploymentURL(ctx context.Context, d *models.Deployment) string {
-	if d.Adopted {
-		return d.DeploymentURL
+	return h.urlComputer().Public(d, h.lookupActiveAPIDomain(ctx, d.ID))
+}
+
+// urlComputer snapshots the handler's URL config into a deploymenturl.Computer.
+// Cheap struct copy; safe to call per request.
+func (h *DeploymentsHandler) urlComputer() deploymenturl.Computer {
+	return deploymenturl.Computer{
+		PublicURL:    h.PublicURL,
+		ProxyEnabled: h.ProxyEnabled,
+		BaseDomain:   h.BaseDomain,
 	}
-	if domain := h.lookupActiveAPIDomain(ctx, d.ID); domain != "" {
-		return "https://" + domain
-	}
-	if h.BaseDomain != "" {
-		return "https://" + d.Name + "." + h.BaseDomain
-	}
-	if h.PublicURL == "" {
-		return d.DeploymentURL
-	}
-	if h.ProxyEnabled {
-		return h.PublicURL + "/d/" + d.Name
-	}
-	if d.HostPort == 0 {
-		return d.DeploymentURL
-	}
-	return fmt.Sprintf("%s:%d", h.PublicURL, d.HostPort)
 }
 
 // cliDeploymentURL returns a URL the official `npx convex` CLI can hit
@@ -529,27 +556,7 @@ func (h *DeploymentsHandler) publicDeploymentURL(ctx context.Context, d *models.
 // Better to emit a possibly-wrong URL than 500 the request that asks
 // for credentials.
 func (h *DeploymentsHandler) cliDeploymentURL(ctx context.Context, d *models.Deployment) string {
-	if d.Adopted {
-		return d.DeploymentURL
-	}
-	if domain := h.lookupActiveAPIDomain(ctx, d.ID); domain != "" {
-		return "https://" + domain
-	}
-	if h.BaseDomain != "" {
-		return "https://" + d.Name + "." + h.BaseDomain
-	}
-	if h.PublicURL == "" || d.HostPort == 0 {
-		return d.DeploymentURL
-	}
-	// Strip the synapse-api port (8080) from PublicURL and slap on the
-	// deployment's own host port. PublicURL parsing falls back to the
-	// raw deployment URL if it's malformed (shouldn't happen — the
-	// installer validates it — but better than emitting a broken URL).
-	u, err := url.Parse(h.PublicURL)
-	if err != nil || u.Hostname() == "" {
-		return d.DeploymentURL
-	}
-	return fmt.Sprintf("%s://%s:%d", u.Scheme, u.Hostname(), d.HostPort)
+	return h.urlComputer().CLI(d, h.lookupActiveAPIDomain(ctx, d.ID))
 }
 
 // lookupActiveAPIDomain returns the first active custom domain for this
@@ -562,26 +569,7 @@ func (h *DeploymentsHandler) cliDeploymentURL(ctx context.Context, d *models.Dep
 // helpers infallible — they can't 500 the operator's `synapse select`
 // just because the domains lookup hit a transient db blip.
 func (h *DeploymentsHandler) lookupActiveAPIDomain(ctx context.Context, deploymentID string) string {
-	if h.DB == nil || deploymentID == "" {
-		return ""
-	}
-	var domain string
-	err := h.DB.QueryRow(ctx, `
-		SELECT domain
-		  FROM deployment_domains
-		 WHERE deployment_id = $1
-		   AND role = $2
-		   AND status = $3
-		 ORDER BY created_at ASC
-		 LIMIT 1
-	`, deploymentID, models.DomainRoleAPI, models.DomainStatusActive).Scan(&domain)
-	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			logErr("lookup active api domain", err)
-		}
-		return ""
-	}
-	return domain
+	return deploymenturl.LookupActiveAPIDomain(ctx, h.DB, deploymentID)
 }
 
 // SecretEncrypter is the *crypto.SecretBox subset the handler needs.
@@ -600,6 +588,7 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/delete", h.deleteDeployment)
 		r.Get("/auth", h.deploymentAuth)
 		r.Get("/cli_credentials", h.deploymentCLICredentials)
+		r.Get("/backend_version", h.getBackendVersion)
 		r.Post("/upgrade_to_ha", h.upgradeToHA)
 		// Scoped access tokens (v1.0+). Created tokens carry
 		// scope=deployment + scope_id=<this deployment>; the auth
@@ -740,7 +729,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
 		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
-		       d.ha_enabled, d.replica_count,
+		       d.ha_enabled, d.replica_count, d.last_deploy_at,
 		       p.id, p.team_id, p.name, p.slug, p.is_demo, p.created_at,
 		       t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
 		  FROM deployments d
@@ -752,7 +741,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
 		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
-		&d.HAEnabled, &d.ReplicaCount,
+		&d.HAEnabled, &d.ReplicaCount, &d.LastDeployAt,
 		&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt,
 		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
 	)

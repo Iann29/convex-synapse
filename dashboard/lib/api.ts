@@ -164,6 +164,22 @@ export type DeployKey = {
   revokedAt?: string;
 };
 
+// Returned by GET /v1/deployments/{name}/backend_version. `version` is the
+// raw string emitted by the Convex backend's /version endpoint over the
+// docker network. `error` carries a short reason when the probe failed
+// (container down, DNS unresolved) so callers render a graceful empty
+// state instead of a broken "couldn't load" pill.
+export type BackendVersion = {
+  version?: string;
+  // ISO-8601; populated when this deployment's container was last
+  // (re)created. Lets the dashboard surface "running for N days" without
+  // shelling into the container.
+  lastDeployAt?: string;
+  fetchedAt: string;
+  fromCache: boolean;
+  error?: string;
+};
+
 // Returned by GET /v1/admin/version_check. `current` is always populated.
 // `latest` and the surrounding fields are filled when we successfully
 // reached the GitHub release stream (cached up to 15min); on failure
@@ -1052,6 +1068,16 @@ export const api = {
       return request<void>(
         `/v1/deployments/${encodeURIComponent(name)}/deploy_keys/${encodeURIComponent(keyId)}/revoke`,
         { method: "POST", body: {} },
+      );
+    },
+    // Backend version probe (v1.6.15+). Hits the deployment's Convex
+    // backend /version endpoint over the docker network and returns the
+    // raw string plus the row's last_deploy_at timestamp. Always 200 —
+    // probe failures land in the response body's `error` field so the
+    // caller can render a graceful empty state.
+    backendVersion(name: string): Promise<BackendVersion> {
+      return request<BackendVersion>(
+        `/v1/deployments/${encodeURIComponent(name)}/backend_version`,
       );
     },
     // Custom domains (PR #64+). Per-deployment domain registry — POST
