@@ -40,7 +40,14 @@ export function BackendVersionPill({
   }
 
   const probeFailed = !!data?.error || (!data?.version && !data);
-  const version = data?.version?.trim() || "—";
+  const rawVersion = data?.version?.trim() || "";
+  // Upstream Convex backend ships precompiled images that return the
+  // literal string "unknown" from /version (no semver, no build date).
+  // Rendering "convex unknown" reads like the probe failed even though
+  // it succeeded. Treat it as a probe success but hide the version
+  // segment — the operator sees "convex backend · 2d ago" which is
+  // honest about what we know.
+  const versionIsKnown = rawVersion !== "" && rawVersion !== "unknown";
   const ageLabel = relativeAge(data?.lastDeployAt);
   const tooltip = buildTooltip(data);
 
@@ -57,7 +64,13 @@ export function BackendVersionPill({
       <span aria-hidden className={probeFailed ? "text-neutral-600" : "text-emerald-500"}>
         ●
       </span>
-      <span>convex {version}</span>
+      <span>
+        {versionIsKnown ? (
+          <>convex {rawVersion}</>
+        ) : (
+          <>convex backend</>
+        )}
+      </span>
       {ageLabel && !probeFailed ? (
         <span className="text-neutral-500">· {ageLabel}</span>
       ) : null}
@@ -88,7 +101,11 @@ function relativeAge(iso?: string): string {
 function buildTooltip(data?: BackendVersion): string {
   if (!data) return "Loading backend version...";
   const parts: string[] = [];
-  if (data.version) parts.push(`Backend version: ${data.version}`);
+  if (data.version === "unknown") {
+    parts.push("Backend version: unknown (upstream precompiled images don't expose a build tag)");
+  } else if (data.version) {
+    parts.push(`Backend version: ${data.version}`);
+  }
   if (data.lastDeployAt) parts.push(`Last (re)deploy: ${new Date(data.lastDeployAt).toLocaleString()}`);
   if (data.fetchedAt) parts.push(`Checked: ${new Date(data.fetchedAt).toLocaleString()}`);
   if (data.fromCache) parts.push("(cached)");
