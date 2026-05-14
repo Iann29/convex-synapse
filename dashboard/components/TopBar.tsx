@@ -8,6 +8,7 @@ import clsx from "clsx";
 import { Avatar } from "@/components/ui/avatar";
 import { SynapseLogo } from "@/components/ui/logo";
 import { VersionStatusChip } from "@/components/VersionStatusChip";
+import { replayTour } from "@/components/WelcomeTour";
 import { api, type Team } from "@/lib/api";
 import { clearAuth, getCurrentUser, type User } from "@/lib/auth";
 
@@ -360,6 +361,17 @@ function ProfileMenu({ user, onLogout }: { user: User; onLogout: () => void }) {
               type="button"
               onClick={() => {
                 setOpen(false);
+                replayTour();
+              }}
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-neutral-200 transition-colors hover:bg-neutral-900"
+            >
+              <TourIcon />
+              Replay welcome tour
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
                 onLogout();
               }}
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-neutral-200 transition-colors hover:bg-neutral-900"
@@ -405,6 +417,16 @@ function UserIcon() {
     <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden className="text-neutral-400">
       <circle cx="8" cy="6" r="2.5" stroke="currentColor" strokeWidth="1.4" fill="none" />
       <path d="M3 13c.5-2.2 2.5-3.5 5-3.5s4.5 1.3 5 3.5" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function TourIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden className="text-neutral-400">
+      <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="1.4" fill="none" />
+      <path d="M8 5.5a1.5 1.5 0 0 1 1.5 1.5c0 .8-1.5 1-1.5 2" stroke="currentColor" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+      <circle cx="8" cy="11" r="0.6" fill="currentColor" />
     </svg>
   );
 }
