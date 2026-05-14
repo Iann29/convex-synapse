@@ -22,6 +22,11 @@ setup() {
     # detect.sh is needed for sudo_cmd / has_cmd inside lifecycle::upgrade.
     # shellcheck source=../../lib/detect.sh
     source "$INSTALLER_DIR/lib/detect.sh"
+    # caddy.sh exports caddy::_render + caddy::write_standalone, which
+    # lifecycle::_render_caddy (called by phase B's step 8.6 auto-regen
+    # in v1.6.14+) and the Caddyfile-drift bats tests both depend on.
+    # shellcheck source=../../install/caddy.sh
+    source "$INSTALLER_DIR/install/caddy.sh"
     # shellcheck source=../../install/lifecycle.sh
     source "$INSTALLER_DIR/install/lifecycle.sh"
     UI_NO_COLOR=1
@@ -29,6 +34,11 @@ setup() {
     mkdir -p "$INSTALL_DIR"
     ENV_FILE="$INSTALL_DIR/.env"
     COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
+    # INSTALLER_TEMPLATES is what caddy::_render reads templates
+    # from. setup.sh exports it; bats doesn't, so do it here so the
+    # auto-regen step in lifecycle::_upgrade_phase_b finds the
+    # standalone/fragment/wildcard templates.
+    export INSTALLER_TEMPLATES="$INSTALLER_DIR/templates"
 }
 
 # ---- resolve_target_ref ---------------------------------------------
@@ -2106,6 +2116,154 @@ EOF2
 
     # Cleanup.
     unset PUBLIC_SYNAPSE_URL
+}
+
+@test "upgrade phase B auto-regenerates a drifted Caddyfile with correct ACME email" {
+    # Regression for v1.6.13 → v1.6.14: phase B's auto-regen step
+    # called caddy::write_standalone, which expected the un-prefixed
+    # shell vars (DOMAIN, ACME_EMAIL) but the .env stores them under
+    # SYNAPSE_* keys. Result: ACME_EMAIL was empty, the rendered
+    # Caddyfile had a bare "email \n" token, and Caddy crash-looped
+    # on every restart. v1.6.14 swaps in lifecycle::_render_caddy,
+    # which bridges the prefix gap.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.6.13
+SYNAPSE_PORT=8080
+DASHBOARD_PORT=6790
+CONVEX_DASHBOARD_PORT=6791
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+SYNAPSE_DOMAIN=synapse.example.com
+SYNAPSE_ACME_EMAIL=ops@example.com
+SYNAPSE_BASE_DOMAIN=
+PUBLIC_SYNAPSE_URL=https://synapse.example.com
+EOF2
+    # Seed a "stale" Caddyfile that doesn't have the v1.6.12 :6791
+    # block — exactly the shape an operator upgrading from v1.6.11
+    # would have on disk.
+    cat >"$INSTALL_DIR/Caddyfile" <<EOF2
+synapse.example.com {
+    reverse_proxy synapse-api:8080
+}
+EOF2
+
+    # Mocks: git clone (no-op), docker (records compose interactions),
+    # jq + curl (no-op).
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+
+    SYNAPSE_UPGRADE_NO_REEXEC=1 \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.6.14
+    assert_success
+
+    # Caddyfile got regenerated — drifted from the seed, so we expect
+    # a fresh render that includes the v1.6.12 :6791 block from the
+    # current template.
+    run grep -c '^synapse.example.com:6791 {' "$INSTALL_DIR/Caddyfile"
+    assert_output "1"
+
+    # The regression that motivated v1.6.14: `email ops@example.com`
+    # MUST be present in the rendered global block. An empty value
+    # rendered as `email \n` is exactly the crash-loop shape we're
+    # guarding against.
+    run grep -c '^[[:space:]]*email ops@example.com$' "$INSTALL_DIR/Caddyfile"
+    assert_output "1"
+
+    # The old Caddyfile (drifted shape) MUST be stashed as a backup
+    # so an operator who had customizations can recover.
+    run bash -c "ls $INSTALL_DIR/Caddyfile.bak.* 2>/dev/null | wc -l"
+    assert_output "1"
+}
+
+@test "upgrade phase B leaves a matching Caddyfile untouched (no spurious backup)" {
+    # The auto-regen is supposed to be idempotent — if the operator's
+    # existing Caddyfile already byte-matches what the template would
+    # produce, we don't churn the file or spawn a Caddyfile.bak.*.
+    : >"$COMPOSE_FILE"
+    cat >"$ENV_FILE" <<EOF2
+SYNAPSE_VERSION=1.6.13
+SYNAPSE_PORT=8080
+DASHBOARD_PORT=6790
+CONVEX_DASHBOARD_PORT=6791
+SYNAPSE_JWT_SECRET=keep
+POSTGRES_PASSWORD=keep
+SYNAPSE_UPDATER_TOKEN=keep
+SYNAPSE_DOMAIN=synapse.example.com
+SYNAPSE_ACME_EMAIL=ops@example.com
+SYNAPSE_BASE_DOMAIN=
+EOF2
+
+    # Pre-render the EXACT bytes lifecycle::_render_caddy would emit
+    # for the env above. Using the same helper as the auto-regen
+    # guarantees byte-for-byte equality so the cmp -s in step 8.6
+    # short-circuits the backup path.
+    lifecycle::_render_caddy "$INSTALL_DIR" "$ENV_FILE" \
+        "$INSTALL_DIR/Caddyfile"
+    [ -f "$INSTALL_DIR/Caddyfile" ]
+
+    cat >"$SYN_MOCK_BIN/git" <<'EOF2'
+#!/usr/bin/env bash
+dest="${@: -1}"
+mkdir -p "$dest"
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/git"
+    cat >"$SYN_MOCK_BIN/docker" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/docker"
+    cat >"$SYN_MOCK_BIN/jq" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/jq"
+    cat >"$SYN_MOCK_BIN/curl_ok" <<'EOF2'
+#!/usr/bin/env bash
+exit 0
+EOF2
+    chmod +x "$SYN_MOCK_BIN/curl_ok"
+
+    SYNAPSE_UPGRADE_NO_REEXEC=1 \
+        LIFECYCLE_GIT="$SYN_MOCK_BIN/git" \
+        COMPOSE_CMD="$SYN_MOCK_BIN/docker" \
+        LIFECYCLE_JQ="$SYN_MOCK_BIN/jq" \
+        COMPOSE_CURL="$SYN_MOCK_BIN/curl_ok" \
+        COMPOSE_HEALTH_TIMEOUT_OVERRIDE=2 \
+        run lifecycle::upgrade "$INSTALL_DIR" --ref=v1.6.14
+    assert_success
+
+    # No backup file should have been created — the existing
+    # Caddyfile matched the template byte-for-byte.
+    run bash -c "ls $INSTALL_DIR/Caddyfile.bak.* 2>/dev/null | wc -l"
+    assert_output "0"
 }
 
 @test "upgrade: re-exec falls through when \$install_dir/setup.sh isn't executable" {
