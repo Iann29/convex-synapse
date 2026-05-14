@@ -169,6 +169,11 @@ type SetupOpts struct {
 	// DNSProviderLookup wires /v1/internal/dns_provider at a stubbed
 	// resolver so the test suite doesn't need real-internet DNS.
 	DNSProviderLookup func(ctx context.Context, domain string) (string, []string, error)
+
+	// BackendProbe stubs the Convex backend /version probe. Used by
+	// the backend_version tests so they don't need a live container
+	// over the Docker network.
+	BackendProbe api.BackendProbe
 }
 
 // stubResolverFunc adapts a closure to api.HostDomainResolver.
@@ -274,6 +279,7 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 		DNSEnvelope:           opts.DNSEnvelope,
 		CloudflareFactory:     opts.CloudflareFactory,
 		DNSProviderLookup:     opts.DNSProviderLookup,
+		BackendProbe:          opts.BackendProbe,
 	}
 
 	// HA wiring (only when SetupHA was called). The crypto box is a

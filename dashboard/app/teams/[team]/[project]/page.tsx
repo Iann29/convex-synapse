@@ -10,6 +10,7 @@ import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { BackendVersionPill } from "@/components/BackendVersionPill";
 import { CliCredentialsPanel } from "@/components/CliCredentialsPanel";
 import { CustomDomainsPanel } from "@/components/CustomDomainsPanel";
 import { ProjectDnsCredentialsPanel } from "@/components/ProjectDnsCredentialsPanel";
@@ -446,6 +447,11 @@ export default function ProjectPage({ params }: { params: Promise<Params> }) {
                         >
                           {copiedName === d.name ? "Copied!" : "Copy"}
                         </Button>
+                      </div>
+                    )}
+                    {d.status === "running" && (
+                      <div className="mt-2">
+                        <BackendVersionPill deploymentName={d.name} />
                       </div>
                     )}
                   </div>

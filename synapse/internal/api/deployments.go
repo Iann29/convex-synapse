@@ -100,6 +100,17 @@ type DeploymentsHandler struct {
 	// the deployments handler so the handler doesn't have to know the
 	// PublicIP env value directly.
 	Domains *DomainsHandler
+
+	// BackendProbe powers GET /v1/deployments/{name}/backend_version.
+	// nil falls back to the default HTTP probe against
+	// `http://convex-<name>:3210/version`; tests inject deterministic
+	// fakes via this hook.
+	BackendProbe BackendProbe
+
+	// versionCache memoises probe results per deployment for
+	// backendVersionCacheTTL so the dashboard's deployment-detail
+	// page doesn't hammer each backend on every render.
+	versionCache backendVersionCache
 }
 
 // rebuildCORSAndRestart recomputes CORS_ALLOWED_ORIGINS from the
@@ -577,6 +588,7 @@ func (h *DeploymentsHandler) Routes() chi.Router {
 		r.Post("/delete", h.deleteDeployment)
 		r.Get("/auth", h.deploymentAuth)
 		r.Get("/cli_credentials", h.deploymentCLICredentials)
+		r.Get("/backend_version", h.getBackendVersion)
 		r.Post("/upgrade_to_ha", h.upgradeToHA)
 		// Scoped access tokens (v1.0+). Created tokens carry
 		// scope=deployment + scope_id=<this deployment>; the auth
@@ -717,7 +729,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		SELECT d.id, d.project_id, d.name, d.deployment_type, d.status,
 		       d.deployment_url, d.is_default, d.reference, d.creator_user_id,
 		       d.created_at, d.admin_key, d.instance_secret, d.host_port, d.container_id, d.adopted,
-		       d.ha_enabled, d.replica_count,
+		       d.ha_enabled, d.replica_count, d.last_deploy_at,
 		       p.id, p.team_id, p.name, p.slug, p.is_demo, p.created_at,
 		       t.id, t.name, t.slug, t.creator_user_id, t.default_region, t.suspended, t.created_at
 		  FROM deployments d
@@ -729,7 +741,7 @@ func loadDeployment(ctx context.Context, db *pgxpool.Pool, name string) (*models
 		&d.ID, &d.ProjectID, &d.Name, &d.DeploymentType, &d.Status,
 		&url, &d.IsDefault, &ref, &creator,
 		&d.CreatedAt, &d.AdminKey, &d.InstanceSecret, &hostPort, &containerID, &d.Adopted,
-		&d.HAEnabled, &d.ReplicaCount,
+		&d.HAEnabled, &d.ReplicaCount, &d.LastDeployAt,
 		&p.ID, &p.TeamID, &p.Name, &p.Slug, &p.IsDemo, &p.CreatedAt,
 		&t.ID, &t.Name, &t.Slug, &t.CreatorUserID, &t.DefaultRegion, &t.Suspended, &t.CreatedAt,
 	)
