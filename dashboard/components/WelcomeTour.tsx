@@ -99,6 +99,17 @@ export function WelcomeTour() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // Skip the tour when running under WebDriver / Playwright /
+    // headless automation. The modal intercepts pointer events on a
+    // fresh registration, which blocks every dashboard e2e test —
+    // 49 specs went red on v1.6.15's CI because of this. Real users
+    // never see navigator.webdriver === true; the tour stays
+    // available via the "Replay welcome tour" profile menu entry
+    // either way.
+    if (window.navigator.webdriver) {
+      setPhase("closed");
+      return;
+    }
     const completed = window.localStorage.getItem(TOUR_KEY) === "1";
     setPhase(completed ? "closed" : "open");
   }, []);
