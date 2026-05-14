@@ -292,6 +292,13 @@ func run() error {
 				HealthcheckViaNetwork: cfg.HealthcheckViaNetwork,
 				PortRangeMin:          cfg.PortRangeMin,
 				PortRangeMax:          cfg.PortRangeMax,
+				// v1.6.15: bake the CLI-reachable URL into each
+				// new container's CONVEX_CLOUD_ORIGIN so
+				// function-spec.url / CONVEX_SITE_URL agree with
+				// what the dashboard hands to operators.
+				PublicURL:    cfg.PublicURL,
+				ProxyEnabled: cfg.ProxyEnabled,
+				BaseDomain:   cfg.BaseDomain,
 			},
 			Logger: logger,
 			Crypto: workerCrypto, // literal-nil interface when HA is off — single-replica jobs don't read it

@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Iann29/synapse/internal/deploymenturl"
 	dockerprov "github.com/Iann29/synapse/internal/docker"
 	"github.com/Iann29/synapse/internal/models"
 )
@@ -82,6 +83,18 @@ type Config struct {
 	// bounds here.
 	PortRangeMin int
 	PortRangeMax int
+
+	// PublicURL / ProxyEnabled / BaseDomain mirror the api.RouterDeps
+	// values. The worker plugs them into deploymenturl.Computer.CLI to
+	// compute the CONVEX_CLOUD_ORIGIN / CONVEX_SITE_ORIGIN baked into
+	// each container at create-time (v1.6.15). Without these the
+	// provisioner falls back to the legacy "http://127.0.0.1:<port>"
+	// form, which is correct from inside the container but causes
+	// `npx convex` to surface unreachable URLs in function-spec.url
+	// and breaks CONVEX_SITE_URL inside httpAction handlers.
+	PublicURL    string
+	ProxyEnabled bool
+	BaseDomain   string
 }
 
 func (c Config) sane() Config {
@@ -680,6 +693,7 @@ func (w *Worker) runJob(ctx context.Context, logger *slog.Logger, j claimedJob) 
 		HealthcheckViaNetwork: j.HealthcheckViaNetwork,
 		HAReplica:             j.HAEnabled,
 		ReplicaIndex:          j.ReplicaIndex,
+		PublicURL:             w.computePublicOrigin(ctx, j.DeploymentID, j.Name, j.HostPort),
 	}
 	if j.Storage != nil {
 		spec.Storage = &dockerprov.StorageEnv{
@@ -787,6 +801,11 @@ func (w *Worker) runUpgradeToHA(ctx context.Context, logger *slog.Logger, cfg Co
 		return
 	}
 
+	// All replicas of an HA deployment advertise the same public origin
+	// (they sit behind one logical address). Compute once outside the
+	// per-replica loop with the primary replica's host port so the env
+	// is stable across the pair.
+	publicOrigin := w.computePublicOrigin(ctx, j.DeploymentID, j.Name, ports[0])
 	replicas := make([]upgradeReplica, 0, 2)
 	for idx, port := range ports {
 		info, err := w.Docker.Provision(ctx, dockerprov.DeploymentSpec{
@@ -798,6 +817,7 @@ func (w *Worker) runUpgradeToHA(ctx context.Context, logger *slog.Logger, cfg Co
 			HAReplica:             true,
 			ReplicaIndex:          idx,
 			Storage:               storageToDocker(j.Storage),
+			PublicURL:             publicOrigin,
 		})
 		if err != nil {
 			logger.Error("provisioner: upgrade_to_ha provision replica failed",
@@ -1128,4 +1148,36 @@ func (w *Worker) markFailed(jobID int64, deploymentID, errStr string) {
 	`, deploymentID); err != nil {
 		slog.Default().Error("provisioner: mark deployment failed", "deployment_id", deploymentID, "err", err)
 	}
+}
+
+// computePublicOrigin returns the public-facing URL the freshly-provisioned
+// container should advertise via CONVEX_CLOUD_ORIGIN / CONVEX_SITE_ORIGIN.
+// Uses the same decision tree as the api handlers' cliDeploymentURL so the
+// CLI-reachable URL the dashboard hands out and the URL the backend bakes
+// into its function-spec stay consistent.
+//
+// Returns "" — which the docker provisioner reads as "fall back to the
+// loopback form" — when the worker has no public URL config wired at all
+// (CI/dev setups with neither PublicURL nor BaseDomain). Production
+// deployments always end up with at least PublicURL set, so this guard
+// only matters for tests.
+func (w *Worker) computePublicOrigin(ctx context.Context, deploymentID, name string, hostPort int) string {
+	cfg := w.Config
+	if cfg.PublicURL == "" && cfg.BaseDomain == "" {
+		return ""
+	}
+	computer := deploymenturl.Computer{
+		PublicURL:    cfg.PublicURL,
+		ProxyEnabled: cfg.ProxyEnabled,
+		BaseDomain:   cfg.BaseDomain,
+	}
+	// Worker-managed deployments are never adopted (adopt registers an
+	// existing backend without enqueuing a job). Synthesize the minimum
+	// fields the URL helper inspects.
+	d := &models.Deployment{
+		Name:     name,
+		HostPort: hostPort,
+	}
+	domain := deploymenturl.LookupActiveAPIDomain(ctx, w.DB, deploymentID)
+	return computer.CLI(d, domain)
 }

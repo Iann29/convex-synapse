@@ -52,6 +52,22 @@ type DeploymentSpec struct {
 	// the upstream image expects, and the SQLite data volume mount is
 	// dropped. Nil = SQLite + local volume (existing behavior).
 	Storage *StorageEnv
+
+	// PublicURL, when set, becomes the value of both CONVEX_CLOUD_ORIGIN
+	// and CONVEX_SITE_ORIGIN env vars on the container — overriding the
+	// legacy "http://127.0.0.1:<HostPort>" form. The Convex backend reads
+	// these to construct its function-spec.url field and to emit
+	// CONVEX_SITE_URL into running queries/mutations; baking the public
+	// URL in at create-time keeps `npx convex` output (URLs in
+	// function-spec, CONVEX_SITE_URL used by httpAction handlers)
+	// pointing at a reachable host instead of the synapse-internal
+	// loopback. The caller is expected to compute this with
+	// deploymenturl.Computer.CLI (host-anchored, no path prefix) — the
+	// Convex CLI parses it with new URL("/api/...", origin) which drops
+	// any path component, so the "<host>/d/<name>" path-proxy shape is
+	// incorrect here. Empty falls back to the loopback form (pre-v1.6.15
+	// behaviour).
+	PublicURL string
 }
 
 // StorageEnv carries the per-deployment Postgres + S3 configuration.
@@ -304,12 +320,22 @@ func (c *Client) Provision(ctx context.Context, spec DeploymentSpec) (*Deploymen
 	containerPort := nat.Port("3210/tcp")
 	hostBinding := nat.PortBinding{HostIP: "0.0.0.0", HostPort: strconv.Itoa(spec.HostPort)}
 
-	cloudOrigin := fmt.Sprintf("http://127.0.0.1:%d", spec.HostPort)
+	// internalURL is what THIS process polls for healthchecks (always
+	// loopback so we never depend on outbound DNS or Caddy being up).
+	// publicOrigin is what the running container advertises as its own
+	// URL via CONVEX_CLOUD_ORIGIN / CONVEX_SITE_ORIGIN — defaults to the
+	// loopback form (pre-v1.6.15 behaviour) and is overridden by
+	// spec.PublicURL when the caller has a real public address.
+	internalURL := fmt.Sprintf("http://127.0.0.1:%d", spec.HostPort)
+	publicOrigin := internalURL
+	if spec.PublicURL != "" {
+		publicOrigin = spec.PublicURL
+	}
 	env := []string{
 		"INSTANCE_NAME=" + spec.Name,
 		"INSTANCE_SECRET=" + spec.InstanceSecret,
-		"CONVEX_CLOUD_ORIGIN=" + cloudOrigin,
-		"CONVEX_SITE_ORIGIN=" + cloudOrigin,
+		"CONVEX_CLOUD_ORIGIN=" + publicOrigin,
+		"CONVEX_SITE_ORIGIN=" + publicOrigin,
 	}
 
 	// HA storage: append the env vars the upstream backend reads when
@@ -387,12 +413,14 @@ func (c *Client) Provision(ctx context.Context, spec DeploymentSpec) (*Deploymen
 	info := &DeploymentInfo{
 		ContainerID:   resp.ID,
 		HostPort:      spec.HostPort,
-		DeploymentURL: cloudOrigin,
+		DeploymentURL: internalURL,
 	}
 
-	// The DB-stored DeploymentURL is what API consumers see — always the
-	// host-port mapping. The internal URL is what THIS process polls.
-	healthURL := cloudOrigin
+	// The DB-stored DeploymentURL is always the loopback host:port shape;
+	// public consumers go through publicDeploymentURL / cliDeploymentURL
+	// which rewrite to the operator-facing URL. The internal URL is also
+	// what THIS process polls for healthchecks.
+	healthURL := internalURL
 	if spec.HealthcheckViaNetwork {
 		healthURL = fmt.Sprintf("http://%s:3210", cName)
 	}

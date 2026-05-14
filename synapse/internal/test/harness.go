@@ -336,6 +336,9 @@ func setup(t *testing.T, haEnabled bool, opts SetupOpts) *Harness {
 			PortRangeMin:          3210,
 			PortRangeMax:          3500,
 			HealthcheckViaNetwork: opts.HealthcheckViaNetwork,
+			PublicURL:             opts.PublicURL,
+			ProxyEnabled:          opts.ProxyEnabled,
+			BaseDomain:            opts.BaseDomain,
 		},
 		Logger: logger,
 	}
