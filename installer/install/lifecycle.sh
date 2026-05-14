@@ -630,32 +630,37 @@ lifecycle::_upgrade_phase_b() {
     # block in the rendered Caddyfile). Caught manually on
     # synapsepanel.com; this auto-heal closes the loop.
     #
-    # Runs AFTER source_env_file so DOMAIN/ACME_EMAIL/SYNAPSE_BASE_DOMAIN
-    # are in the shell env that caddy::_render's template
-    # substitution consumes.
+    # v1.6.14 follow-up: use lifecycle::_render_caddy (NOT
+    # caddy::write_standalone) because the .env's keys are namespaced
+    # — SYNAPSE_DOMAIN, SYNAPSE_ACME_EMAIL, SYNAPSE_BASE_DOMAIN —
+    # while caddy::_render's template uses the un-prefixed names
+    # ({{DOMAIN}}, {{ACME_EMAIL}}, {{SYNAPSE_BASE_DOMAIN}}). The
+    # _render_caddy helper bridges that: reads the SYNAPSE_-prefixed
+    # keys from .env and exports the matching un-prefixed shell vars
+    # before invoking caddy::_render. v1.6.13 went straight to
+    # caddy::write_standalone and ACME_EMAIL stayed empty → Caddyfile
+    # rendered with a bare `email \n` token → Caddy crash-looped on
+    # the first auto-upgrade and the operator's site went down.
+    # Real-VPS regression caught on synapsepanel.com 90s after the
+    # v1.6.13 dashboard banner clicked through.
     #
-    # Strategy: re-render the template into a temp file, compare
-    # byte-for-byte to the existing Caddyfile, replace only on diff
-    # (so a hand-edited Caddyfile that happens to match the new
-    # template isn't touched, and we don't spam the operator's data
-    # dir with spurious backups on no-op upgrades). On a real diff:
-    # stash the old file as Caddyfile.bak.<timestamp> in case the
-    # operator customized something, then write the new render. The
-    # `compose up --build` two steps below recreates synapse-caddy
-    # against the new file, so we don't need to issue an explicit
-    # reload here.
+    # Strategy: re-render the template via _render_caddy into a temp
+    # file, byte-compare to the existing Caddyfile, replace only on
+    # diff. On a real diff: stash old as Caddyfile.bak.<timestamp>,
+    # write the new render. `compose up --build` two steps below
+    # recreates synapse-caddy against the new file.
     #
     # Best-effort: any failure logs a warning and keeps the old
     # file. Broken Caddyfile is worse than stale Caddyfile.
-    if declare -F caddy::write_standalone >/dev/null; then
+    if declare -F lifecycle::_render_caddy >/dev/null; then
         local caddyfile_path="$install_dir/Caddyfile"
         if [[ -f "$caddyfile_path" ]]; then
             local caddyfile_new
             caddyfile_new="$(mktemp "${caddyfile_path}.new.XXXXXX")" || \
                 caddyfile_new=""
             if [[ -n "$caddyfile_new" ]]; then
-                if CADDY_FORCE_OVERWRITE=1 \
-                    caddy::write_standalone "$caddyfile_new" >/dev/null 2>&1; then
+                if lifecycle::_render_caddy "$install_dir" "$env_file" \
+                    "$caddyfile_new" >/dev/null 2>&1; then
                     if ! cmp -s "$caddyfile_path" "$caddyfile_new"; then
                         local ts
                         ts="$(date +%s)"
